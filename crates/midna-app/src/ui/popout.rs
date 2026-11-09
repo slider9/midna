@@ -87,7 +87,7 @@ impl PopOut {
 }
 
 impl Render for PopOut {
-    fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.global::<Theme>().clone();
         let tray = crate::ui::annotate::tray(&self.session, &t, cx, |p, _, w, cx| p.open_sheet(w, cx), |p, w, cx| p.focus_term(w, cx));
         let on = self.on_top;
@@ -117,7 +117,7 @@ impl Render for PopOut {
             .tooltip(crate::ui::header::tip_keys("Back to main window", "keys.pop_out"))
             .child(Icon::DockIn.el(13., t.dim))
             .on_click(cx.listener(|p, _, w, cx| p.dock(w, cx)));
-        div()
+        let root = div()
             .key_context(CTX_MAIN)
             .on_action(|_: &crate::actions::CloseWindow, window, _| window.remove_window())
             // the pop-out key toggles: here it docks back into the main window
@@ -152,7 +152,8 @@ impl Render for PopOut {
             .child(div().absolute().top(px(4.)).right(px(8.)).flex().items_center().gap(px(6.)).child(dock).child(pill))
             .when(self.queue.read(cx).is_open(), |d| d.child(self.queue.clone()))
             .when(self.annot.read(cx).is_open(), |d| d.child(self.annot.clone()))
-            .when_some(self.toast.clone(), |d, (msg, _)| d.child(super::toast(&t, msg).bottom(px(16.))))
+            .when_some(self.toast.clone(), |d, (msg, _)| d.child(super::toast(&t, msg).bottom(px(16.))));
+        super::caption::wrap(&t, w, root)
     }
 }
 

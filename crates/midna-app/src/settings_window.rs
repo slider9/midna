@@ -2235,7 +2235,7 @@ impl Render for SettingsWindow {
                 }
             }
         }
-        div()
+        let root = div()
             .id("settings-root")
             .track_focus(&self.focus)
             .key_context("MidnaSettings")
@@ -2276,7 +2276,8 @@ impl Render for SettingsWindow {
                     ))
                     .with_priority(1),
                 )
-            })
+            });
+        crate::ui::caption::wrap(&t, window, root)
     }
 }
 

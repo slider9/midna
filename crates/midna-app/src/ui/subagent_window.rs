@@ -111,7 +111,7 @@ pub fn elapsed(from: &str, to: Option<&str>) -> String {
 }
 
 impl Render for SubagentWindow {
-    fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.global::<Theme>().clone();
         let a = self.agent.as_ref();
         let kind = a.map(|a| a.agent_type.clone()).unwrap_or_default();
@@ -231,7 +231,7 @@ impl Render for SubagentWindow {
                     .on_click(cx.listener(|w, _, _, cx| w.show_parent(cx))),
             );
 
-        div()
+        let root = div()
             .key_context(crate::actions::CTX_MAIN)
             .on_action(|_: &crate::actions::CloseWindow, window, _| window.remove_window())
             .size_full()
@@ -244,7 +244,8 @@ impl Render for SubagentWindow {
             .line_height(px(20.))
             .child(header)
             .child(body)
-            .child(footer)
+            .child(footer);
+        super::caption::wrap(&t, w, root)
     }
 }
 

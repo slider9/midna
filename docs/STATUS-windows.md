@@ -47,6 +47,8 @@ would build them in with `\r\n`.
 | Installed binaries | `bin/current` symlink | `bin/current` is a text file naming the version dir |
 | In-place upgrade / restart | exec with the same pid, terminals kept | refused (`upgrade_windows.rs`): no exec on Windows. Stop the daemon and start the new one |
 | Codex `notify` | `sh -c` wrapper chains the previous notify | `midna.exe hook codex notify [--global] -- PREV…`; the CLI runs PREV with the payload |
+| Title bar | hidden; AppKit draws the traffic lights and drags by the top | hidden; `ui/caption.rs` draws a 32px row above each window: the caption (`WindowControlArea::Drag`: move, Snap, double-click) and minimise / maximise / close |
+| App icon | the bundle's `Midna.icns` | `packaging/assets/Midna.ico` (from `make-icon.py`) linked in as icon resource 1 by `midna-app/build.rs`, where GPUI loads the window icon from |
 
 Codex's notify can't go through a sh wrapper on Windows: Git Bash's runtime re-parses a native
 command line and mangles JSON (`{"type":"x"}` arrives empty, `a"b` turns into `a\b`).
@@ -67,7 +69,7 @@ Windows production paths (`midna_proto::paths::production_paths`): `%LOCALAPPDAT
   - A terminal's `PATH` is midna's shims dir followed by the inherited entries. `MIDNA_SESSION` and `TERM_PROGRAM=midna` are set.
   - `midna` run inside a terminal claims its terminal, and midnad checks the claim against the caller's pid and its ancestry.
   - `close` ends the terminal. Killing the daemon by PID leaves none of its descendants alive (conhost, the shells).
-- The app builds and draws through DirectX. It was run against the fake backend (`MIDNA_BACKEND=fake`, onboarding screen) but not yet against a real midnad.
+- The app builds and draws through DirectX, and it has started a dev midnad and connected to it. Its windows move, snap, minimise, maximise and close through the title row, which was checked with `WM_NCHITTEST`. The exe carries the icon, so the taskbar shows it.
 
 ## Not done yet
 

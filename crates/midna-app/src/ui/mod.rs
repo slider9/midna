@@ -4,6 +4,7 @@ pub mod ax_prompt;
 pub mod badge;
 pub mod banner;
 pub mod button_slots;
+pub mod caption;
 pub mod close_hold;
 pub mod update_banner;
 pub mod charts;
@@ -258,7 +259,7 @@ impl Render for MainWindow {
                     }
                 }))
                 .children(setup_screen::render(self, &t, window, cx));
-            return crate::composer::register(MainWindow::register_actions(root, cx), cx);
+            return caption::wrap(&t, window, crate::composer::register(MainWindow::register_actions(root, cx), cx));
         }
         twilight::sync_lights(self, window);
         crate::composer::sync(self, window, cx);
@@ -379,7 +380,7 @@ impl Render for MainWindow {
                     .with_priority(0),
                 )
             });
-        crate::composer::register(MainWindow::register_actions(root, cx), cx)
+        caption::wrap(&t, window, crate::composer::register(MainWindow::register_actions(root, cx), cx))
     }
 }
 

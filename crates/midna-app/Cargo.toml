@@ -20,6 +20,10 @@ snapshot = ["gpui-kit/test-support"]
 # human.
 dev-drivers = []
 
+# The app icon as a Windows resource (build.rs). Built only on a Windows host.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
 [dependencies]
 midna-proto.workspace = true
 serde.workspace = true

@@ -3969,6 +3969,7 @@ dependencies = [
  "base64",
  "block2 0.6.2",
  "core-foundation-sys",
+ "embed-resource",
  "gpui-kit",
  "image",
  "libc",

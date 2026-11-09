@@ -383,7 +383,7 @@ impl SystemWindow {
 }
 
 impl Render for SystemWindow {
-    fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.global::<Theme>().clone();
         let heading = match self.kind {
             Kind::UpgradePostponed => "Midna's update is waiting for a calmer moment",
@@ -394,7 +394,7 @@ impl Render for SystemWindow {
             Kind::UpgradePostponed => self.upgrade_body(&t, cx),
             Kind::Overloaded => self.overload_body(&t, cx),
         };
-        div()
+        let root = div()
             .key_context(crate::actions::CTX_MAIN)
             .on_action(|_: &crate::actions::CloseWindow, window, _| window.remove_window())
             .size_full()
@@ -419,7 +419,8 @@ impl Render for SystemWindow {
                     .child(div().flex_1().font_weight(FontWeight::BOLD).child(heading))
                     .children(aside.map(|a| div().text_color(t.dim).text_size(px(12.)).child(a))),
             )
-            .child(div().flex().flex_col().flex_1().min_h_0().child(body))
+            .child(div().flex().flex_col().flex_1().min_h_0().child(body));
+        super::caption::wrap(&t, w, root)
     }
 }
 
