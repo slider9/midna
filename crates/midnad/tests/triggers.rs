@@ -2,7 +2,9 @@
 //! port, file-backed secrets (never the real Keychain), and `/bin/echo` standing in for the
 //! agent binary so no real claude runs.
 mod common;
-use common::{call, call_err, wait_for};
+use common::{call, call_err, posix_bin, sh_word, tmp, wait_for};
+#[cfg(windows)]
+use common::send_line_exe;
 use midna_proto::Client;
 use midna_proto::error::{CONFLICT, HUMAN_ONLY};
 use serde_json::{Value, json};
@@ -20,14 +22,14 @@ struct D {
 
 impl D {
     fn start() -> D {
-        let home = PathBuf::from(format!("/tmp/midna-w-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let home = tmp().join(format!("midna-w-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&home);
         let mut cfg = midnad::Config::for_home(home.clone());
         cfg.app_path = Some(std::env::current_exe().unwrap().to_string_lossy().into_owned());
         cfg.webhooks.secrets = midnad::webhooks::secrets::Mode::File;
         cfg.webhooks.port_override = Some(0);
         cfg.webhooks.tailscale_bin = Some("/nonexistent/tailscale".into());
-        cfg.agent_bin = Some("/bin/echo".into());
+        cfg.agent_bin = Some(posix_bin("echo"));
         D { handle: Some(midnad::start(cfg).expect("start daemon")), home }
     }
     fn sock(&self) -> PathBuf {
@@ -92,7 +94,7 @@ fn pr(action: &str, number: u64) -> Value {
 }
 
 fn project(c: &mut Client) -> String {
-    call(c, "project.add", json!({ "path": "/tmp", "name": "tmp" }))["id"].as_str().unwrap().to_string()
+    call(c, "project.add", json!({ "path": tmp(), "name": "tmp" }))["id"].as_str().unwrap().to_string()
 }
 
 /// A human-made, secret-set, enabled "Review new PRs" trigger.
@@ -149,7 +151,7 @@ fn signed_github_delivery_starts_agent_with_rendered_prompt() {
     assert_eq!(s["name"], "PR #231 review");
     assert_eq!(s["project_id"], pid.as_str());
     let cmd: Vec<String> = serde_json::from_value(s["command"].clone()).unwrap();
-    assert_eq!(cmd[0], "/bin/echo");
+    assert_eq!(cmd[0], posix_bin("echo"));
     // Payload text is delimited as untrusted, with a note saying so.
     assert_eq!(
         cmd.last().unwrap(),
@@ -575,7 +577,7 @@ fn headless_run_command_gets_the_delivery_body() {
     // Each run writes what it got to out/<n>.{stdin,file,env}, n counting runs.
     let cmd = format!(
         "cd {} && n=$(ls | grep -c stdin); cat > $n.stdin; cp \"$MIDNA_PAYLOAD\" $n.file; printf '%s %s %s %s' \"$MIDNA_EVENT\" \"$MIDNA_ACTION\" \"$MIDNA_DELIVERY_GUID\" \"$MIDNA_DELIVERY\" > $n.env",
-        out.display()
+        sh_word(&out)
     );
     let t = call(
         &mut h,
@@ -610,13 +612,27 @@ fn headless_run_command_gets_the_delivery_body() {
     assert_eq!(read(2, "env"), format!("pull_request synchronize guid-body-2 {}", rec.id));
 }
 
-/// A shell line that sends one `session.open` (an agent with `--allowedTools Bash`, named
-/// `name`) to the socket in `$sock`, the way `midna open --agent claude` would.
-fn open_over_socket(pid: &str, name: &str, sock: &str) -> String {
+/// One `session.open` request (an agent with `--allowedTools Bash`, named `name`), the way
+/// `midna open --agent claude` would send it.
+fn open_request(pid: &str, name: &str) -> String {
     let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "session.open",
                       "params": { "project_id": pid, "kind": "agent", "agent": "claude", "name": name,
                                   "agent_args": ["--allowedTools", "Bash"], "caller": { "role": "agent" } } });
+    req.to_string()
+}
+
+/// A shell line that sends [`open_request`] to the socket in `$sock`.
+#[cfg(unix)]
+fn open_over_socket(pid: &str, name: &str, sock: &str) -> String {
+    let req = open_request(pid, name);
     format!("printf '%s\\n' '{req}' | nc -U \"{sock}\" -w 5")
+}
+
+/// `nc -U` on Windows (see `common::send_line_exe`).
+#[test]
+#[ignore]
+fn helper_send_line() {
+    common::send_line()
 }
 
 fn opened_by(c: &mut Client, name: &str) -> (Value, Value) {
@@ -635,7 +651,15 @@ fn a_headless_runs_calls_act_as_its_trigger() {
     call(&mut h, "settings.set", json!({ "key": "agents.shell_on_exit", "value": false }));
     let pid = project(&mut h);
     // The run claims a terminal too: it isn't in one, so the claim doesn't stick.
+    #[cfg(unix)]
     let cmd = format!("MIDNA_SESSION=s_nope {}", open_over_socket(&pid, "from-run", "$MIDNA_SOCKET"));
+    // Windows: Git's sh has no `nc -U`; the stand-in sends the line to $MIDNA_SOCKET.
+    #[cfg(windows)]
+    let cmd = format!(
+        "MIDNA_SESSION=s_nope MIDNA_TEST_LINE='{}' {} --exact helper_send_line --ignored --nocapture",
+        open_request(&pid, "from-run"),
+        sh_word(send_line_exe())
+    );
     let t = call(
         &mut h,
         "trigger.add",
@@ -654,9 +678,16 @@ fn a_headless_runs_calls_act_as_its_trigger() {
 
     // Setting MIDNA_TRIGGER (or claiming a trigger) outside a run makes nothing of the kind.
     let sock = d.sock().to_string_lossy().into_owned();
-    let out = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(open_over_socket(&pid, "outside", &sock).replace("\"caller\":{\"role\":\"agent\"}", &format!("\"caller\":{{\"role\":\"agent\",\"trigger\":\"{tid}\"}}")))
+    let claim = |s: String| s.replace("\"caller\":{\"role\":\"agent\"}", &format!("\"caller\":{{\"role\":\"agent\",\"trigger\":\"{tid}\"}}"));
+    #[cfg(unix)]
+    let mut c = std::process::Command::new("/bin/sh");
+    #[cfg(unix)]
+    c.arg("-c").arg(claim(open_over_socket(&pid, "outside", &sock)));
+    #[cfg(windows)]
+    let mut c = std::process::Command::new(send_line_exe());
+    #[cfg(windows)]
+    c.args(["--exact", "helper_send_line", "--ignored", "--nocapture"]).env("MIDNA_TEST_LINE", claim(open_request(&pid, "outside"))).env("MIDNA_TEST_SOCKET", &sock);
+    let out = c
         .env("MIDNA_TRIGGER", &tid)
         .env("MIDNA_DELIVERY", "d_fake")
         .output()

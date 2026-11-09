@@ -237,8 +237,14 @@ fn permissions_status_lists_the_three_panes() {
     let mut a = d.agent(None);
     let p = call(&mut a, "permissions.status", json!({}));
     let names: Vec<&str> = p["permissions"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["accessibility", "notifications", "login-items"]);
-    assert_eq!(p["permissions"][0]["open_cli"], "midna permissions open accessibility");
+    // Windows has no Accessibility grant to ask for.
+    if cfg!(windows) {
+        assert_eq!(names, ["notifications", "login-items"]);
+        assert_eq!(p["permissions"][0]["open_cli"], "midna permissions open notifications");
+    } else {
+        assert_eq!(names, ["accessibility", "notifications", "login-items"]);
+        assert_eq!(p["permissions"][0]["open_cli"], "midna permissions open accessibility");
+    }
 }
 
 #[test]

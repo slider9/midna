@@ -15,10 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn fake_agent(tag: &str) -> PathBuf {
-    let bin = PathBuf::from(format!("/tmp/midna-resume-{}-{tag}", std::process::id()));
-    std::fs::write(&bin, "#!/bin/sh\nexec cat\n").unwrap();
-    std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    bin
+    PathBuf::from(script(tmp().join(format!("midna-resume-{}-{tag}", std::process::id())), "exec cat\n"))
 }
 
 fn hook(a: &mut Client, event: &str, payload: Value) {
@@ -42,7 +39,7 @@ fn daemon(tag: &str) -> (TestDaemon, PathBuf, Arc<AtomicBool>) {
 
 /// An agent mid-turn whose turn then dies on `error_details`, with no sleep involved.
 fn fail_a_turn(d: &TestDaemon, h: &mut Client, error: &str, details: &str) -> String {
-    let sid = call(h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp" }))["id"].as_str().unwrap().to_string();
+    let sid = call(h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": tmp() }))["id"].as_str().unwrap().to_string();
     let mut a = d.agent(Some(&sid));
     hook(&mut a, "UserPromptSubmit", json!({ "prompt": "long task" }));
     hook(&mut a, "StopFailure", json!({ "error": error, "error_details": details }));
@@ -52,7 +49,7 @@ fn fail_a_turn(d: &TestDaemon, h: &mut Client, error: &str, details: &str) -> St
 
 /// An agent mid-turn, then a wake, then its turn dies on a connection error.
 fn sleep_through_a_turn(d: &TestDaemon, h: &mut Client) -> String {
-    let sid = call(h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp" }))["id"].as_str().unwrap().to_string();
+    let sid = call(h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": tmp() }))["id"].as_str().unwrap().to_string();
     let mut a = d.agent(Some(&sid));
     hook(&mut a, "UserPromptSubmit", json!({ "prompt": "long task" }));
     midnad::resume::on_wake(&d.daemon(), midna_proto::time::now_unix() - 600);
@@ -70,7 +67,7 @@ fn a_turn_that_died_in_sleep_is_continued() {
     assert_eq!((item["text"].as_str(), item["by"]["name"].as_str()), (Some("continue"), Some("resume after sleep")), "{item}");
     wait_for(15, "continue typed", || Some(read(&mut h, &sid)).filter(|t| t.contains("continue")));
     wait_for(5, "queue empty", || queued(&mut h, &sid).is_empty().then_some(()));
-    let _ = std::fs::remove_file(bin);
+    remove_script(&bin);
 }
 
 #[test]
@@ -89,7 +86,7 @@ fn a_failure_stays_pending_when_idle_prompt_marks_it_done_before_the_network_is_
     let item = wait_for(10, "continue queued", || queued(&mut h, &sid).first().cloned());
     assert_eq!(item["text"].as_str(), Some("continue"), "{item}");
     wait_for(15, "continue typed", || Some(read(&mut h, &sid)).filter(|t| t.contains("continue")));
-    let _ = std::fs::remove_file(bin);
+    remove_script(&bin);
 }
 
 #[test]
@@ -106,7 +103,7 @@ fn a_turn_finished_by_hand_after_a_failure_is_left_alone() {
     std::thread::sleep(std::time::Duration::from_secs(7));
     assert!(queued(&mut h, &sid).is_empty(), "the human already continued it");
     assert_eq!(midnad::resume::watching(&d.daemon()), 0);
-    let _ = std::fs::remove_file(bin);
+    remove_script(&bin);
 }
 
 #[test]
@@ -118,7 +115,7 @@ fn nothing_is_typed_when_the_setting_is_off() {
     let sid = sleep_through_a_turn(&d, &mut h);
     std::thread::sleep(std::time::Duration::from_secs(3));
     assert!(queued(&mut h, &sid).is_empty());
-    let _ = std::fs::remove_file(bin);
+    remove_script(&bin);
 }
 
 #[test]
@@ -133,7 +130,7 @@ fn a_turn_lost_to_the_network_is_continued_once_it_is_back() {
     let item = wait_for(10, "continue queued", || queued(&mut h, &sid).first().cloned());
     assert_eq!((item["text"].as_str(), item["by"]["name"].as_str()), (Some("continue"), Some("resume after network loss")), "{item}");
     wait_for(15, "continue typed", || Some(read(&mut h, &sid)).filter(|t| t.contains("continue")));
-    let _ = std::fs::remove_file(bin);
+    remove_script(&bin);
 }
 
 #[test]
@@ -142,7 +139,7 @@ fn a_turn_whose_connection_error_is_only_in_its_message_is_continued() {
     let (d, bin, online) = daemon("net-msg");
     let mut h = d.human();
     online.store(false, Ordering::Relaxed);
-    let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp" }))["id"].as_str().unwrap().to_string();
+    let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": tmp() }))["id"].as_str().unwrap().to_string();
     let mut a = d.agent(Some(&sid));
     hook(&mut a, "UserPromptSubmit", json!({ "prompt": "long task" }));
     let message = "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)";
@@ -151,7 +148,7 @@ fn a_turn_whose_connection_error_is_only_in_its_message_is_continued() {
     online.store(true, Ordering::Relaxed);
     let item = wait_for(10, "continue queued", || queued(&mut h, &sid).first().cloned());
     assert_eq!((item["text"].as_str(), item["by"]["name"].as_str()), (Some("continue"), Some("resume after network loss")), "{item}");
-    let _ = std::fs::remove_file(bin);
+    remove_script(&bin);
 }
 
 #[test]
@@ -159,13 +156,13 @@ fn a_failure_whose_message_only_mentions_the_network_is_left_alone() {
     // The last message is the agent's own prose, not an API error: no resume.
     let (d, bin, _) = daemon("net-prose");
     let mut h = d.human();
-    let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp" }))["id"].as_str().unwrap().to_string();
+    let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": tmp() }))["id"].as_str().unwrap().to_string();
     let mut a = d.agent(Some(&sid));
     hook(&mut a, "UserPromptSubmit", json!({ "prompt": "long task" }));
     hook(&mut a, "StopFailure", json!({ "error": "server_error", "error_details": "", "last_assistant_message": "I fixed the socket connection timeout." }));
     std::thread::sleep(std::time::Duration::from_secs(3));
     assert!(queued(&mut h, &sid).is_empty());
-    let _ = std::fs::remove_file(bin);
+    remove_script(&bin);
 }
 
 #[test]
@@ -178,7 +175,7 @@ fn other_failures_and_the_setting_off_are_left_alone() {
     std::thread::sleep(std::time::Duration::from_secs(3));
     assert!(queued(&mut h, &limited).is_empty());
     assert!(queued(&mut h, &off).is_empty());
-    let _ = std::fs::remove_file(bin);
+    remove_script(&bin);
 }
 
 #[test]
@@ -203,7 +200,7 @@ fn statusline(d: &TestDaemon, sid: &str, five: f64, resets_in: i64) {
 }
 
 fn open_agent(h: &mut Client) -> String {
-    call(h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp" }))["id"].as_str().unwrap().to_string()
+    call(h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": tmp() }))["id"].as_str().unwrap().to_string()
 }
 
 /// An agent whose turn dies on the usage limit.
@@ -236,7 +233,7 @@ fn a_turn_stopped_by_a_usage_limit_is_continued_once_it_resets() {
     assert_eq!((item["text"].as_str(), item["by"]["name"].as_str()), (Some("continue"), Some("resume after usage limit")), "{item}");
     assert!(queued_at(&item) >= now + 3, "queued once the window reset: {item}");
     wait_for(15, "continue typed", || Some(read(&mut h, &sid)).filter(|t| t.contains("continue")));
-    let _ = std::fs::remove_file(bin);
+    remove_script(&bin);
 }
 
 #[test]
@@ -252,7 +249,7 @@ fn the_reset_in_the_limit_error_is_used_when_no_status_line_reported_it() {
     let item = wait_for(10, "continue queued", || queued(&mut h, &sid).first().cloned());
     assert_eq!(item["by"]["name"].as_str(), Some("resume after usage limit"), "{item}");
     assert!(queued_at(&item) >= reset, "{item}");
-    let _ = std::fs::remove_file(bin);
+    remove_script(&bin);
 }
 
 #[test]
@@ -267,7 +264,7 @@ fn agents_one_limit_stopped_are_resumed_apart() {
     let a = wait_for(10, "first queued", || queued(&mut h, &one).first().cloned());
     let b = wait_for(10, "second queued", || queued(&mut h, &two).first().cloned());
     assert!((queued_at(&a) - queued_at(&b)).abs() >= 4, "{a} {b}");
-    let _ = std::fs::remove_file(bin);
+    remove_script(&bin);
 }
 
 #[test]
@@ -284,7 +281,7 @@ fn a_limited_agent_continued_by_hand_is_left_alone() {
     std::thread::sleep(std::time::Duration::from_secs(8));
     assert!(queued(&mut h, &sid).is_empty(), "the human already continued it");
     assert_eq!(midnad::resume::watching(&d.daemon()), 0);
-    let _ = std::fs::remove_file(bin);
+    remove_script(&bin);
 }
 
 #[test]
@@ -302,7 +299,7 @@ fn a_limit_with_no_reset_known_waits_and_the_setting_off_drops_it() {
     hit_the_limit(&d, &mut h, &off, "");
     std::thread::sleep(std::time::Duration::from_secs(2));
     assert_eq!(midnad::resume::watching(&d.daemon()), 0, "the setting is off");
-    let _ = std::fs::remove_file(bin);
+    remove_script(&bin);
 }
 
 #[test]

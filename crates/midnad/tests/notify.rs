@@ -19,9 +19,22 @@ fn wait_posted(h: &mut Client, n: usize) -> Vec<Value> {
     wait_for(5, &format!("{n} notifications"), || Some(posted(h)).filter(|p| p.len() >= n))
 }
 
-/// Give the notifier time to (not) act, then return what it posted.
+/// A path midna reported, to compare with one built here: Windows joins some with `\`.
+fn path(v: &Value) -> Option<&std::path::Path> {
+    v.as_str().map(std::path::Path::new)
+}
+
+/// A turn's "Finished" body. Windows: an agent call takes over 100 ms there, so a turn of two
+/// hooks may cross a second, and turns are timed in whole seconds ("Finished in 1s: …").
+fn finished(body: &Value) -> String {
+    let b = body.as_str().unwrap_or_default();
+    if cfg!(windows) { b.replacen("Finished in 1s:", "Finished:", 1) } else { b.to_string() }
+}
+
+/// Give the notifier time to (not) act, then return what it posted. Windows gets longer: an
+/// agent call alone takes over 100 ms there.
 fn settle(h: &mut Client) -> Vec<Value> {
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::thread::sleep(std::time::Duration::from_millis(if cfg!(windows) { 1000 } else { 300 }));
     posted(h)
 }
 
@@ -37,11 +50,11 @@ fn defaults_record_everything_important_but_push_only_what_needs_you() {
     let p = wait_posted(&mut h, 1);
     let n = &p[0]["data"];
     assert_eq!((n["category"].as_str(), n["via"].as_str()), (Some("turn_done"), Some("none")), "{n}");
-    assert_eq!(n["body"], "Finished: All 12 tests pass now.");
+    assert_eq!(finished(&n["body"]), "Finished: All 12 tests pass now.");
     // Recorded, but not a banner anywhere.
     assert_eq!((n["push"].as_bool(), n.get("push_focused")), (Some(false), None), "{n}");
     // Every kind plays one of midna's own (Twilight) sounds out of the box.
-    assert_eq!(n["sound_file"].as_str(), d.home.join("notify/twilight/Strum.wav").to_str(), "{n}");
+    assert_eq!(path(&n["sound_file"]), Some(d.home.join("notify/twilight/Strum.wav").as_path()), "{n}");
     assert_eq!(p[0]["session_id"].as_str(), Some(sid.as_str()));
 
     // A permission prompt is important (sound), pushed, and carries its needs-you id.
@@ -94,7 +107,7 @@ fn turns_that_leave_background_work_running_stay_quiet() {
     hook(&mut a, "UserPromptSubmit", json!({ "session_id": "c1", "prompt": "<task-notification>b1 completed</task-notification>" }));
     hook(&mut a, "Stop", json!({ "session_id": "c1", "last_assistant_message": "All tests pass.", "background_tasks": [] }));
     let p = wait_posted(&mut h, 1);
-    assert_eq!((p[0]["data"]["category"].as_str(), p[0]["data"]["body"].as_str()), (Some("turn_done"), Some("Finished: All tests pass.")), "{}", p[0]);
+    assert_eq!((p[0]["data"]["category"].as_str(), finished(&p[0]["data"]["body"]).as_str()), (Some("turn_done"), "Finished: All tests pass."), "{}", p[0]);
 }
 
 #[test]
@@ -167,7 +180,7 @@ fn each_kind_has_its_sound_and_volume() {
     hook(&mut a, "PermissionRequest", json!({ "session_id": "c1", "tool_name": "Bash", "tool_input": { "command": "ls" } }));
     let p = wait_posted(&mut h, 1);
     let n = &p[0]["data"];
-    assert_eq!((n["sound_file"].as_str(), n["volume"].as_u64()), (d.home.join("notify/twilight/Portal.wav").to_str(), Some(100)), "{n}");
+    assert_eq!((path(&n["sound_file"]), n["volume"].as_u64()), (Some(d.home.join("notify/twilight/Portal.wav").as_path()), Some(100)), "{n}");
 
     // Another sound, 50% of a 50% master: plays at 25.
     call(&mut h, "settings.set", json!({ "key": "notify.sound.turn_done", "value": "Submarine" }));
@@ -181,9 +194,14 @@ fn each_kind_has_its_sound_and_volume() {
     assert_eq!(n["sound_file"], "/System/Library/Sounds/Submarine.aiff");
     // What macOS plays with the banner: that sound rendered at 25%, named (a full path plays the
     // default sound). Tests keep it in the daemon's home rather than ~/Library/Sounds.
-    assert_eq!(n["notification_sound"], "Midna Submarine 25.wav", "{n}");
-    let file = d.home.join("notify/banner/Midna Submarine 25.wav");
-    assert!(std::fs::read(&file).is_ok_and(|b| b.starts_with(b"RIFF")), "{}", file.display());
+    // Windows has no Submarine (a macOS system sound) to render, so there's none.
+    if cfg!(windows) {
+        assert!(n["notification_sound"].is_null(), "{n}");
+    } else {
+        assert_eq!(n["notification_sound"], "Midna Submarine 25.wav", "{n}");
+        let file = d.home.join("notify/banner/Midna Submarine 25.wav");
+        assert!(std::fs::read(&file).is_ok_and(|b| b.starts_with(b"RIFF")), "{}", file.display());
+    }
 
     // Master at 0: silent everywhere.
     call(&mut h, "settings.set", json!({ "key": "notify.volume", "value": 0 }));
@@ -234,8 +252,10 @@ fn imported_sounds_and_images() {
     call(&mut h, "notify.test", json!({ "category": "failed" }));
     let p = wait_posted(&mut h, 2);
     let (t, f) = (&p[0]["data"], &p[1]["data"]);
-    assert_eq!((t["test"].as_bool(), t["sound_file"].as_str().is_some_and(|f| f.ends_with("notify/sounds/ding.wav"))), (Some(true), true), "{t}");
-    assert!(t["image"].as_str().is_some_and(|i| i.ends_with("notify/images/logo.png")), "{t}");
+    // Path::ends_with compares components: Windows joins some of these with `\`.
+    let ends = |v: &Value, tail: &str| v.as_str().is_some_and(|p| std::path::Path::new(p).ends_with(tail));
+    assert_eq!((t["test"].as_bool(), ends(&t["sound_file"], "notify/sounds/ding.wav")), (Some(true), true), "{t}");
+    assert!(ends(&t["image"], "notify/images/logo.png"), "{t}");
     assert_eq!(f.get("image"), None, "{f}");
 
     // Removing it puts its settings back.
@@ -257,7 +277,7 @@ fn agents_sound_only_when_they_ask() {
     call(&mut a, "notify.send", json!({ "title": "loud", "sound": true }));
     let p = posted(&mut h);
     assert_eq!(p[0]["data"]["sound"], false);
-    assert_eq!(p[1]["data"]["sound_file"].as_str(), d.home.join("notify/twilight/Hm.wav").to_str());
+    assert_eq!(path(&p[1]["data"]["sound_file"]), Some(d.home.join("notify/twilight/Hm.wav").as_path()));
 }
 
 #[test]
@@ -274,7 +294,7 @@ fn agents_play_sounds_by_kind_or_name() {
     call(&mut a, "notify.play", json!({ "sound": "glass", "volume": 40 }));
     let p = played(&mut h);
     let rise = d.home.join("notify/twilight/Rise.wav");
-    assert_eq!((p[0]["data"]["file"].as_str(), p[0]["data"]["volume"].as_u64(), p[0]["data"]["kind"].as_str()), (rise.to_str(), Some(50), Some("approved")));
+    assert_eq!((path(&p[0]["data"]["file"]), p[0]["data"]["volume"].as_u64(), p[0]["data"]["kind"].as_str()), (Some(rise.as_path()), Some(50), Some("approved")));
     assert_eq!((p[1]["data"]["sound"].as_str(), p[1]["data"]["volume"].as_u64(), p[1].get("session_id").and_then(Value::as_str)), (Some("Glass"), Some(20), Some(sid.as_str())));
 
     // A kind with no sound, unknown names, and the switches.

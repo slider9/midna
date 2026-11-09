@@ -2,14 +2,17 @@
 //! memory while a terminal prints 100 MB. One test in its own binary, so the process-wide
 //! counts it measures aren't disturbed by other tests running in parallel.
 mod common;
-use common::{TestDaemon, call, wait_for};
+use common::{TestDaemon, call, posix_bin, sh, tmp, wait_for};
 use serde_json::json;
 use std::time::{Duration, Instant};
 
+// The counts come from /dev/fd and libproc on macOS, and from Windows' own APIs below.
+#[cfg(unix)]
 fn fd_count() -> usize {
     std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0)
 }
 
+#[cfg(unix)]
 fn task_info() -> libc::proc_taskinfo {
     let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_taskinfo>() as i32;
@@ -18,16 +21,59 @@ fn task_info() -> libc::proc_taskinfo {
     info
 }
 
+#[cfg(unix)]
 fn threads() -> i32 {
     task_info().pti_threadnum
 }
 
+#[cfg(unix)]
 fn rss_mb() -> u64 {
     task_info().pti_resident_size / (1 << 20)
 }
 
+/// Windows: open handles stand for fds (a pseudoconsole, its pipes and the process are handles).
+#[cfg(windows)]
+fn fd_count() -> usize {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+    let mut n = 0u32;
+    unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) };
+    n as usize
+}
+
+#[cfg(windows)]
+fn threads() -> i32 {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut n = 0;
+        let mut more = Process32FirstW(snap, &mut e) != 0;
+        while more {
+            if e.th32ProcessID == std::process::id() {
+                n = e.cntThreads as i32;
+                break;
+            }
+            more = Process32NextW(snap, &mut e) != 0;
+        }
+        CloseHandle(snap);
+        n
+    }
+}
+
+#[cfg(windows)]
+fn rss_mb() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    c.WorkingSetSize as u64 / (1 << 20)
+}
+
 fn cycle(h: &mut midna_proto::Client) {
-    let s = call(h, "session.open", json!({ "kind": "shell", "cwd": "/tmp", "command": ["/bin/cat"] }));
+    let s = call(h, "session.open", json!({ "kind": "shell", "cwd": tmp(), "command": [posix_bin("cat")] }));
     let id = s["id"].as_str().unwrap().to_string();
     call(h, "session.input", json!({ "id": id, "text": "x" }));
     call(h, "session.close", json!({ "id": id, "force": true }));
@@ -67,10 +113,12 @@ fn terminals_do_not_leak_and_floods_stay_bounded() {
     // 100 MB through one terminal: memory stays bounded (scrollback is capped) and the
     // daemon keeps answering other calls while it runs.
     let rss0 = rss_mb();
+    // GNU base64 (Git for Windows') wraps with -w.
+    let wrap = if cfg!(windows) { "-w" } else { "-b" };
     let s = call(
         &mut h,
         "session.open",
-        json!({ "kind": "shell", "cwd": "/tmp", "command": ["/bin/sh", "-c", "head -c 75000000 /dev/urandom | base64 -b 120; echo FLOOD-DONE; exec cat"] }),
+        json!({ "kind": "shell", "cwd": tmp(), "command": [sh(), "-c", format!("head -c 75000000 /dev/urandom | base64 {wrap} 120; echo FLOOD-DONE; exec cat")] }),
     );
     let id = s["id"].as_str().unwrap().to_string();
     let mut peak = rss0;

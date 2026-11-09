@@ -4,7 +4,7 @@ use common::*;
 use serde_json::json;
 
 fn shell_in(h: &mut midna_proto::Client, dir: &std::path::Path) -> (String, String) {
-    let s = call(h, "session.open", json!({ "kind": "shell", "cwd": dir, "command": ["/bin/sh"], "name": "build" }));
+    let s = call(h, "session.open", json!({ "kind": "shell", "cwd": dir, "command": [sh()], "name": "build" }));
     (s["id"].as_str().unwrap().to_string(), s["project_id"].as_str().unwrap().to_string())
 }
 

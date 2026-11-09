@@ -5,15 +5,12 @@ use serde_json::{Value, json};
 
 /// A fake agent that prints whether midna added its own hooks, then waits.
 fn fake_agent(home: &std::path::Path) -> String {
-    let bin = home.with_extension("agent.sh");
-    std::fs::write(&bin, "#!/bin/sh\necho \"ARGS:$*\"\necho \"INJECTED:${MIDNA_HOOKS_INJECTED:-no}\"\nsleep 30\n").unwrap();
-    std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    bin.to_string_lossy().into_owned()
+    script(home.with_extension("agent.sh"), "echo \"ARGS:$*\"\necho \"INJECTED:${MIDNA_HOOKS_INJECTED:-no}\"\nsleep 30\n")
 }
 
 fn launch(d: &TestDaemon, agent: &str) -> String {
     let mut h = d.human();
-    let s = call(&mut h, "session.open", json!({ "kind": "agent", "agent": agent, "cwd": "/tmp", "cols": 1000 }));
+    let s = call(&mut h, "session.open", json!({ "kind": "agent", "agent": agent, "cwd": tmp(), "cols": 1000 }));
     let sid = s["id"].as_str().unwrap().to_string();
     wait_for(10, "fake agent output", || {
         let r = call(&mut h, "session.read", json!({ "id": sid }));
@@ -24,7 +21,7 @@ fn launch(d: &TestDaemon, agent: &str) -> String {
 
 #[test]
 fn install_flips_per_launch_hooks_and_uninstall_restores() {
-    let pre = std::path::PathBuf::from(format!("/tmp/midna-gh-{}", std::process::id()));
+    let pre = tmp().join(format!("midna-gh-{}", std::process::id()));
     let bin = fake_agent(&pre);
     let d = TestDaemon::start_with(move |c| c.agent_bin = Some(bin));
     let claude_dir = d.home.join("agent-config/claude");
@@ -65,7 +62,9 @@ fn install_flips_per_launch_hooks_and_uninstall_restores() {
     assert_eq!(written["hooks"]["Stop"][0]["hooks"][0]["command"], "/u/stop", "the user's hook stays first");
     assert!(claude_dir.join("settings.json.before-midna").exists());
     let toml = std::fs::read_to_string(codex_dir.join("config.toml")).unwrap();
-    assert!(toml.contains("midna-notify") && toml.contains("/apps/Other"), "{toml}");
+    // midna's notify: a sh wrapper named midna-notify; on Windows `midna hook codex notify --global -- PREV`.
+    let ours = |toml: &str| if cfg!(windows) { toml.contains("\"--global\"") } else { toml.contains("midna-notify") };
+    assert!(ours(&toml) && toml.contains("/apps/Other"), "{toml}");
 
     // Now midna-started agents rely on the global hooks: no second set.
     let out = launch(&d, "claude");
@@ -89,8 +88,8 @@ fn install_flips_per_launch_hooks_and_uninstall_restores() {
     let back: Value = serde_json::from_str(&std::fs::read_to_string(claude_dir.join("settings.json")).unwrap()).unwrap();
     assert_eq!(back, serde_json::from_str::<Value>(user).unwrap());
     let toml = std::fs::read_to_string(codex_dir.join("config.toml")).unwrap();
-    assert!(toml.contains("\"/apps/Other\"") && !toml.contains("midna-notify"), "{toml}");
-    let _ = std::fs::remove_file(pre.with_extension("agent.sh"));
+    assert!(toml.contains("\"/apps/Other\"") && !ours(&toml), "{toml}");
+    remove_script(pre.with_extension("agent.sh"));
 }
 
 #[test]

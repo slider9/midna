@@ -8,10 +8,7 @@ use serde_json::{Value, json};
 /// A fake agent that turns each line typed into it into terminal output (`\033]0;…\007` sets
 /// its title), like an agent rewriting its title as it works.
 fn fake_agent(tag: &str) -> String {
-    let bin = std::path::PathBuf::from(format!("/tmp/midna-an-{}-{tag}.sh", std::process::id()));
-    std::fs::write(&bin, "#!/bin/sh\nstty -echo\nwhile read -r l; do printf '%b' \"$l\"; done\n").unwrap();
-    std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    bin.to_string_lossy().into_owned()
+    script(tmp().join(format!("midna-an-{}-{tag}.sh", std::process::id())), "stty -echo\nwhile read -r l; do printf '%b' \"$l\"; done\n")
 }
 
 fn name(h: &mut Client, sid: &str) -> String {
@@ -28,7 +25,7 @@ fn prompt(d: &TestDaemon, sid: &str, text: &str) {
 }
 
 fn open_claude(h: &mut Client) -> String {
-    call(h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp" }))["id"].as_str().unwrap().to_string()
+    call(h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": tmp() }))["id"].as_str().unwrap().to_string()
 }
 
 #[test]
@@ -98,10 +95,10 @@ fn prompt_mode_ignores_the_title_and_context_mode_names_shells() {
     // Plain shells keep their names unless the mode is context; switching names open ones.
     let dir = std::env::temp_dir().join(format!("midna-an-{}-proj", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let sh = call(&mut h, "session.open", json!({ "kind": "shell", "cwd": dir, "command": ["/bin/sh"] }))["id"].as_str().unwrap().to_string();
+    let sh = call(&mut h, "session.open", json!({ "kind": "shell", "cwd": dir, "command": [sh()] }))["id"].as_str().unwrap().to_string();
     assert_eq!(name(&mut h, &sh), "sh");
     call(&mut h, "settings.set", json!({ "key": "terminal.auto_name", "value": "context" }));
     assert_eq!(name(&mut h, &sh), format!("midna-an-{}-proj", std::process::id()));
     // A name from a source the mode no longer uses gives way: the agent takes its folder's.
-    assert_eq!(name(&mut h, &sid), "tmp");
+    assert_eq!(name(&mut h, &sid), tmp().file_name().unwrap().to_str().unwrap());
 }

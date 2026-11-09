@@ -1,5 +1,6 @@
 //! CLI tests: the real `midna` binary against an in-process daemon on a temp MIDNA_HOME.
 //! The CLI is a different executable than the configured GUI, so it is an agent.
+mod common;
 use serde_json::{Value, json};
 use std::io::Write;
 use std::path::PathBuf;
@@ -18,7 +19,7 @@ impl D {
         D::start_with(|_| {})
     }
     fn start_with(tweak: impl FnOnce(&mut midnad::Config)) -> D {
-        let home = PathBuf::from(format!("/tmp/midna-c-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let home = common::tmp().join(format!("midna-c-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&home);
         let mut cfg = midnad::Config::for_home(home.clone());
         cfg.app_path = Some(std::env::current_exe().unwrap().to_string_lossy().into_owned());
@@ -104,7 +105,7 @@ fn exit_codes() {
 fn verbs_drive_a_session() {
     let d = D::start();
     let s = d.sock();
-    let o = midna(&s, &["open", "--cwd", "/tmp", "--name", "t1", "--", "/bin/sh"], None, None);
+    let o = midna(&s, &["open", "--cwd", &common::tmp_s(), "--name", "t1", "--", &common::sh()], None, None);
     assert_eq!(code(&o), 0, "{o:?}");
     let id = stdout(&o).trim().to_string();
     assert_eq!(code(&midna(&s, &["send", &id, "echo", "cli-$((1+1))"], None, None)), 0);
@@ -139,7 +140,7 @@ fn hook_bridge_prints_claude_decision() {
     let d = D::start();
     let s = d.sock();
     let mut h = d.human();
-    let sess = h.call_value("session.open", json!({ "kind": "shell", "cwd": "/tmp", "command": ["/bin/sh"] })).unwrap();
+    let sess = h.call_value("session.open", json!({ "kind": "shell", "cwd": common::tmp(), "command": [common::sh()] })).unwrap();
     let sid = sess["id"].as_str().unwrap();
     h.call_value("rule.add", json!({ "effect": "deny", "matcher": { "kind": "tool", "pattern": "Bash(rm -rf*)" } })).unwrap();
     h.call_value("rule.add", json!({ "effect": "allow", "matcher": { "kind": "tool", "pattern": "Bash(ls*)" } })).unwrap();
@@ -196,7 +197,7 @@ fn global_hook_stands_down_when_midna_injected_its_own() {
     let s = d.sock();
     let mut h = d.human();
     h.call_value("rule.add", json!({ "effect": "deny", "matcher": { "kind": "tool", "pattern": "Bash(rm -rf*)" } })).unwrap();
-    let sess = h.call_value("session.open", json!({ "kind": "shell", "cwd": "/tmp", "command": ["/bin/sh"] })).unwrap();
+    let sess = h.call_value("session.open", json!({ "kind": "shell", "cwd": common::tmp(), "command": [common::sh()] })).unwrap();
     let sid = sess["id"].as_str().unwrap();
     let pre = json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": { "command": "rm -rf /" } }).to_string();
     let run = |injected: bool| {
@@ -293,7 +294,7 @@ fn discoverability() {
 fn explain_and_guidance_against_a_daemon() {
     let d = D::start();
     let s = d.sock();
-    let o = midna(&s, &["open", "--cwd", "/tmp", "--name", "x", "--", "/bin/sh"], None, None);
+    let o = midna(&s, &["open", "--cwd", &common::tmp_s(), "--name", "x", "--", &common::sh()], None, None);
     let id = stdout(&o).trim().to_string();
     let o = midna(&s, &["explain", &id], None, None);
     assert_eq!(code(&o), 0, "{o:?}");
@@ -319,7 +320,7 @@ fn explain_and_guidance_against_a_daemon() {
 #[test]
 fn agents_get_mcp_skill_and_hint_without_global_config() {
     // Never launch a real agent in tests: the agent binary is /bin/echo.
-    let d = D::start_with(|c| c.agent_bin = Some("/bin/echo".into()));
+    let d = D::start_with(|c| c.agent_bin = Some(common::posix_bin("echo")));
     let mut h = d.human();
     let home = d.home.clone();
     let mcp: Value = serde_json::from_slice(&std::fs::read(home.join("hooks/mcp.json")).unwrap()).unwrap();
@@ -329,23 +330,23 @@ fn agents_get_mcp_skill_and_hint_without_global_config() {
     for (name, text) in midnad::hooks::SKILL_TOPICS {
         assert_eq!(std::fs::read_to_string(home.join(format!("hooks/skill-{name}.md"))).unwrap(), *text);
     }
-    let sess = h.call_value("session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp", "prompt": "hi" })).unwrap();
+    let sess = h.call_value("session.open", json!({ "kind": "agent", "agent": "claude", "cwd": common::tmp(), "prompt": "hi" })).unwrap();
     let cmd: Vec<String> = serde_json::from_value(sess["command"].clone()).unwrap();
     let pos = |f: &str| cmd.iter().position(|a| a == f).unwrap_or_else(|| panic!("{f} missing from {cmd:?}"));
-    assert_eq!(cmd[pos("--mcp-config") + 1], home.join("hooks/mcp.json").to_string_lossy());
+    assert_eq!(cmd[pos("--mcp-config") + 1], home.join("hooks").join("mcp.json").to_string_lossy());
     // --mcp-config is variadic in Claude: --settings must follow it before the prompt.
     assert_eq!(pos("--settings"), pos("--mcp-config") + 2);
     assert!(cmd[pos("--append-system-prompt") + 1].contains("midna capabilities"));
     assert_eq!(cmd.last().unwrap(), "hi");
     // `midna open --agent … --resume ID -- <agent args>`
-    let o = midna(&d.sock(), &["open", "--agent", "claude", "--cwd", "/tmp", "--resume", "c9", "--prompt", "go", "--json", "--", "--model", "opus"], None, None);
+    let o = midna(&d.sock(), &["open", "--agent", "claude", "--cwd", &common::tmp_s(), "--resume", "c9", "--prompt", "go", "--json", "--", "--model", "opus"], None, None);
     assert_eq!(code(&o), 0, "{o:?}");
     let v: Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(v["agent_args"], json!(["--model", "opus"]));
     let cmd: Vec<String> = serde_json::from_value(v["command"].clone()).unwrap();
     assert_eq!(&cmd[cmd.len() - 6..], ["--model", "opus", "--resume", "c9", "--", "go"], "{cmd:?}");
     assert_eq!(code(&midna(&d.sock(), &["open", "--resume", "c9"], None, None)), 2, "--resume without --agent");
-    let sess = h.call_value("session.open", json!({ "kind": "agent", "agent": "codex", "cwd": "/tmp" })).unwrap();
+    let sess = h.call_value("session.open", json!({ "kind": "agent", "agent": "codex", "cwd": common::tmp() })).unwrap();
     let cmd: Vec<String> = serde_json::from_value(sess["command"].clone()).unwrap();
     let joined = cmd.join(" ");
     assert!(joined.contains("mcp_servers.midna.command=") && joined.contains(r#"mcp_servers.midna.args=["mcp","--compact"]"#), "{joined}");
@@ -354,14 +355,14 @@ fn agents_get_mcp_skill_and_hint_without_global_config() {
     // Both settings off: none of it.
     h.call_value("settings.set", json!({ "key": "agents.mcp", "value": false })).unwrap();
     h.call_value("settings.set", json!({ "key": "agents.system_hint", "value": false })).unwrap();
-    let sess = h.call_value("session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp" })).unwrap();
+    let sess = h.call_value("session.open", json!({ "kind": "agent", "agent": "claude", "cwd": common::tmp() })).unwrap();
     let joined = serde_json::from_value::<Vec<String>>(sess["command"].clone()).unwrap().join(" ");
     assert!(!joined.contains("--mcp-config") && !joined.contains("--append-system-prompt") && joined.contains("--settings"), "{joined}");
     // Every terminal knows where the guide is.
-    let sh = h.call_value("session.open", json!({ "kind": "shell", "cwd": "/tmp", "command": ["/bin/sh"] })).unwrap();
+    let sh = h.call_value("session.open", json!({ "kind": "shell", "cwd": common::tmp(), "command": [common::sh()] })).unwrap();
     let sid = sh["id"].as_str().unwrap();
     h.call_value("session.input", json!({ "id": sid, "text": "echo skill=$MIDNA_SKILL", "enter": true })).unwrap();
-    let want = format!("skill={}", home.join("hooks/SKILL.md").display());
+    let want = format!("skill={}", home.join("hooks").join("SKILL.md").display());
     let t0 = std::time::Instant::now();
     while !h.call_value("session.read", json!({ "id": sid })).unwrap()["text"].as_str().unwrap().contains(&want) {
         assert!(t0.elapsed().as_secs() < 5, "MIDNA_SKILL not set");
@@ -373,10 +374,10 @@ fn agents_get_mcp_skill_and_hint_without_global_config() {
 fn queue_add_list_move_remove() {
     let d = D::start();
     let s = d.sock();
-    let o = midna(&s, &["open", "--cwd", "/tmp", "--name", "q", "--", "/bin/sh"], None, None);
+    let o = midna(&s, &["open", "--cwd", &common::tmp_s(), "--name", "q", "--", &common::sh()], None, None);
     assert_eq!(code(&o), 0, "{o:?}");
     let id = stdout(&o).trim().to_string();
-    let o = midna(&s, &["open", "--cwd", "/tmp", "--name", "other", "--", "/bin/sh"], None, None);
+    let o = midna(&s, &["open", "--cwd", &common::tmp_s(), "--name", "other", "--", &common::sh()], None, None);
     assert_eq!(code(&o), 0, "{o:?}");
     let other = stdout(&o).trim().to_string();
     let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), String::from_utf8_lossy(&o.stderr));
@@ -436,14 +437,14 @@ fn get_no_wait_and_needs_get() {
     let s = d.sock();
     let mut h = d.human();
     let open = |h: &mut midna_proto::Client| -> String {
-        let v = h.call_value("session.open", json!({ "kind": "shell", "cwd": "/tmp", "command": ["/bin/sh"] })).unwrap();
+        let v = h.call_value("session.open", json!({ "kind": "shell", "cwd": common::tmp(), "command": [common::sh()] })).unwrap();
         v["id"].as_str().unwrap().to_string()
     };
     let (me, target) = (open(&mut h), open(&mut h));
     // `get` = session.get.
     let o = midna(&s, &["get", &target], None, None);
     assert_eq!(code(&o), 0, "{o:?}");
-    assert!(stdout(&o).contains(&target) && stdout(&o).contains("/tmp"), "{}", stdout(&o));
+    assert!(stdout(&o).contains(&target) && stdout(&o).contains(&common::tmp_s()), "{}", stdout(&o));
     let o = midna(&s, &["get", &target, "--json"], None, None);
     assert_eq!(serde_json::from_str::<Value>(&stdout(&o)).unwrap()["id"], target.as_str());
 
@@ -475,7 +476,7 @@ fn notify_history_lists_unread_and_read_marks_them() {
     let s = d.sock();
     let mut h = d.human();
     h.call_value("settings.set", json!({ "key": "notify.bell.agent", "value": true })).unwrap();
-    let sess = h.call_value("session.open", json!({ "kind": "shell", "cwd": "/tmp", "command": ["/bin/sh"] })).unwrap();
+    let sess = h.call_value("session.open", json!({ "kind": "shell", "cwd": common::tmp(), "command": [common::sh()] })).unwrap();
     let sid = sess["id"].as_str().unwrap();
     // The first look starts the read marker: only what comes after is unread.
     assert_eq!(code(&midna(&s, &["notify", "history"], None, None)), 0);
@@ -514,7 +515,7 @@ fn notify_history_lists_unread_and_read_marks_them() {
 fn status_sets_shows_and_clears_a_label() {
     let d = D::start();
     let s = d.sock();
-    let o = midna(&s, &["open", "--cwd", "/tmp", "--name", "lbl", "--", "/bin/sh"], None, None);
+    let o = midna(&s, &["open", "--cwd", &common::tmp_s(), "--name", "lbl", "--", &common::sh()], None, None);
     assert_eq!(code(&o), 0, "{o:?}");
     let id = stdout(&o).trim().to_string();
     let json = |o: &Output| -> Value { serde_json::from_str(&stdout(o)).unwrap_or_else(|_| panic!("{o:?}")) };

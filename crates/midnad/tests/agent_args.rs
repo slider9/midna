@@ -6,10 +6,8 @@ use common::*;
 use serde_json::{Value, json};
 
 fn fake_agent(tag: &str) -> std::path::PathBuf {
-    let bin = std::path::PathBuf::from(format!("/tmp/midna-aa-{}-{tag}.sh", std::process::id()));
-    std::fs::write(&bin, "#!/bin/sh\nfor a; do echo \"ARG:$a\"; done\necho \"INJECTED:${MIDNA_HOOKS_INJECTED:-no}\"\nsleep 30\n").unwrap();
-    std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    bin
+    let bin = tmp().join(format!("midna-aa-{}-{tag}.sh", std::process::id()));
+    script(&bin, "for a; do echo \"ARG:$a\"; done\necho \"INJECTED:${MIDNA_HOOKS_INJECTED:-no}\"\nsleep 30\n").into()
 }
 
 /// The fake agent's argv and `MIDNA_HOOKS_INJECTED`, once it has printed them.
@@ -58,7 +56,7 @@ fn claude_gets_the_callers_arguments_with_midnas_hooks_kept() {
     assert_eq!(injected, "1");
     assert!(argv.iter().any(|a| a.starts_with("You work card 12.")), "{argv:?}");
     assert_eq!(&argv[argv.len() - 4..], ["--add-dir", "/tmp", "--resume", "conv-8"], "{argv:?}");
-    let _ = std::fs::remove_file(bin);
+    remove_script(bin);
 }
 
 #[test]
@@ -67,11 +65,13 @@ fn codex_resume_and_notify_override() {
     let b = bin.to_string_lossy().into_owned();
     let d = TestDaemon::start_with(move |c| c.agent_bin = Some(b));
     let mut h = d.human();
-    let s = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "codex", "cwd": "/tmp", "cols": 1000, "agent_args": ["-c", "notify=[\"/board/n\"]"], "resume": "th-1" }));
+    let s = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "codex", "cwd": tmp(), "cols": 1000, "agent_args": ["-c", "notify=[\"/board/n\"]"], "resume": "th-1" }));
     let (argv, injected) = launched(&mut h, s["id"].as_str().unwrap());
     assert_eq!(injected, "1", "{argv:?}");
     assert_eq!((argv[0].as_str(), argv.last().unwrap().as_str()), ("resume", "th-1"), "{argv:?}");
     let notify: Vec<&String> = argv.iter().filter(|a| a.starts_with("notify=")).collect();
-    assert!(notify.len() == 1 && notify[0].contains("midna-notify-launch") && notify[0].contains("/board/n"), "{argv:?}");
-    let _ = std::fs::remove_file(bin);
+    // Windows chains through `midna hook codex notify -- PREV` instead of a sh wrapper.
+    let chain = if cfg!(windows) { r#""hook","codex","notify","--""# } else { "midna-notify-launch" };
+    assert!(notify.len() == 1 && notify[0].contains(chain) && notify[0].contains("/board/n"), "{argv:?}");
+    remove_script(bin);
 }
