@@ -472,7 +472,7 @@ impl InsightsView {
                     v.ar.menu = false;
                     v.ar.renaming = None;
                     cx.notify();
-                } else if k.key == "z" && k.modifiers.platform && !k.modifiers.shift && v.ar.renaming.is_none() && v.ar.gallery.is_none() {
+                } else if k.key == "z" && k.modifiers.secondary() && !k.modifiers.shift && v.ar.renaming.is_none() && v.ar.gallery.is_none() {
                     cx.stop_propagation();
                     v.undo(cx);
                 } else if k.key == "enter" && v.ar.renaming.is_some() {
@@ -661,7 +661,7 @@ impl InsightsView {
                         v.undo(cx);
                     }))
                     .child(div().flex_1().child("Undo last change"))
-                    .child(div().text_color(t.dim).child("⌘Z")),
+                    .child(div().text_color(t.dim).child(crate::actions::glyph_keys("⌘Z"))),
             )
             .child(item("layout-reset".into()).pl(px(32.)).on_click(cx.listener(|v, _, _, cx| v.reset(cx))).child("Reset to default"));
         deferred(anchored().anchor(Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(list.mt(px(36.)))).with_priority(1)

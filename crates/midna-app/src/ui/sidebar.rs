@@ -812,7 +812,7 @@ fn rail_row(m: &MainWindow, s: &Session, project: &str, (grow, fade): (f32, f32)
 /// False for a click without ⌘ or ⇧.
 fn click_marks(m: &mut MainWindow, id: &str, ev: &ClickEvent, w: &mut Window, cx: &mut Context<MainWindow>) -> bool {
     let md = ev.modifiers();
-    match (md.platform, md.shift) {
+    match (md.secondary(), md.shift) {
         (_, true) => m.mark_range(id.to_string(), w, cx),
         (true, false) => m.toggle_mark(id.to_string(), w, cx),
         _ => return false,

@@ -322,7 +322,7 @@ fn on_key(m: &mut MainWindow, ev: &KeyDownEvent, window: &mut Window, cx: &mut C
     let rows = rows(m);
     let n = rows.len();
     match ks.key.as_str() {
-        "up" | "down" if !md.platform => {
+        "up" | "down" if !md.secondary() => {
             if n > 0 {
                 let cur = m.palette.sel.min(n - 1);
                 m.palette.sel = if ks.key == "down" { (cur + 1) % n } else { (cur + n - 1) % n };
@@ -332,7 +332,7 @@ fn on_key(m: &mut MainWindow, ev: &KeyDownEvent, window: &mut Window, cx: &mut C
                 m.palette.scroll.scroll_to_item(m.palette.sel);
             }
         }
-        "enter" if !md.platform => {
+        "enter" if !md.secondary() => {
             let q = m.palette.query.trim().to_string();
             if (folder_mode(m) || prompt_mode(m)) && (md.shift || n == 0) {
                 // nothing to hand to an agent here
@@ -797,7 +797,7 @@ pub fn render(m: &MainWindow, t: &Theme, _window: &mut Window, cx: &mut Context<
 
     let sel_danger = rows.get(sel).is_some_and(|r| r.cmd.danger.is_some());
     let sel_project = rows.get(sel).is_some_and(|r| matches!(r.cmd.run, Some(Run::OpenProject { path: Some(_) })));
-    let other_label = if m.empty_opens_agent() { "⌥↩ open terminal" } else { "⌥↩ open agent" };
+    let other_label = format!("{} open {}", crate::actions::glyph_keys("⌥↩"), if m.empty_opens_agent() { "terminal" } else { "agent" });
     let enter_label = if prompts_mode {
         "jump"
     } else if none {

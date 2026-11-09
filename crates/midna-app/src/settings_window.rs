@@ -2365,7 +2365,7 @@ impl SettingsWindow {
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         let m = &ks.modifiers;
-        if !m.platform || m.control || m.shift {
+        if !m.secondary() || (m.control && m.platform) || m.shift {
             return;
         }
         match (ks.key.as_str(), m.alt) {

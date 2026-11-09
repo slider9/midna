@@ -344,14 +344,14 @@ impl Render for MainWindow {
                     cx.stop_propagation();
                 }
             }))
-            // ⌘Q hold: releasing ⌘ (or Q, when macOS reports it) cancels
+            // ⌘Q hold: releasing ⌘ (or Q, when macOS reports it) cancels; Ctrl off macOS
             .on_modifiers_changed(cx.listener(|m, ev: &ModifiersChangedEvent, _, cx| {
-                if !ev.modifiers.platform {
+                if !ev.modifiers.secondary() {
                     quit_hold::cancel(m, "⌘ released", cx);
                 }
             }))
             .capture_key_up(cx.listener(|m, ev: &KeyUpEvent, _, cx| {
-                if ev.keystroke.key == "q" || !ev.keystroke.modifiers.platform {
+                if ev.keystroke.key == "q" || !ev.keystroke.modifiers.secondary() {
                     quit_hold::cancel(m, &format!("key up {}", ev.keystroke.unparse()), cx);
                 }
             }))

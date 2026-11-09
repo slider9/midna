@@ -272,7 +272,7 @@ impl TerminalView {
         let Some(s) = self.secret_sheet.as_mut() else { return };
         let mut inputs: Vec<&mut LineInput> = s.rows.iter_mut().map(|r| &mut r.input).chain(s.value.as_mut()).collect();
         let focused = inputs.iter().position(|i| i.focus.is_focused(window));
-        if ks.key == "tab" && !ks.modifiers.platform && !inputs.is_empty() {
+        if ks.key == "tab" && !ks.modifiers.secondary() && !inputs.is_empty() {
             let n = inputs.len();
             let i = match focused {
                 Some(i) if ks.modifiers.shift => (i + n - 1) % n,
@@ -283,7 +283,7 @@ impl TerminalView {
             cx.stop_propagation();
             return;
         }
-        if ks.key == "enter" && ks.modifiers.platform {
+        if ks.key == "enter" && ks.modifiers.secondary() {
             self.store_secrets(window, cx);
             cx.stop_propagation();
             return;

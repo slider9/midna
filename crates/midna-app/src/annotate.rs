@@ -805,7 +805,7 @@ impl AnnotateView {
     /// the note and add the image (it becomes the selected one).
     pub fn capture_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
-        if !(ks.modifiers.platform && ks.key == "v") || !self.field.read(cx).focus.is_focused(window) {
+        if !(ks.modifiers.secondary() && ks.key == "v") || !self.field.read(cx).focus.is_focused(window) {
             return;
         }
         let sources = clipboard_sources(cx);
@@ -823,7 +823,7 @@ impl AnnotateView {
         let md = &ks.modifiers;
         let in_field = self.field.read(cx).focus.is_focused(window);
         let n_images = self.draft(cx).map(|d| d.shots.len()).unwrap_or(0);
-        let handled = if md.platform {
+        let handled = if md.secondary() {
             match ks.key.as_str() {
                 "=" | "+" => {
                     self.zoom(Some(1.25), cx);

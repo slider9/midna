@@ -672,14 +672,16 @@ pub(super) fn relative(path: &str, base: Option<&str>) -> String {
     }
 }
 
-/// A shortcut as menus show it (`⌘C`, `⇧⌘C`, `⌥⌘D`), for keys with ⌘, ⌃ or ⌥ held.
+/// A shortcut as menus write it (`⌘C`, `⇧⌘C`, `⌥⌘D`), for keys with ⌘, ⌃ or ⌥ held. Off macOS
+/// Ctrl is the menus' ⌘ (they show it in words: `actions::glyph_keys`).
 pub(super) fn key_glyphs(ks: &Keystroke) -> Option<String> {
     let m = &ks.modifiers;
-    if !(m.platform || m.control || m.alt) || ks.key.chars().count() != 1 {
+    let (cmd, ctrl) = if cfg!(target_os = "macos") { (m.platform, m.control) } else { (m.control, false) };
+    if !(cmd || ctrl || m.alt) || ks.key.chars().count() != 1 {
         return None;
     }
     let mut out = String::new();
-    for (on, glyph) in [(m.control, "⌃"), (m.alt, "⌥"), (m.shift, "⇧"), (m.platform, "⌘")] {
+    for (on, glyph) in [(ctrl, "⌃"), (m.alt, "⌥"), (m.shift, "⇧"), (cmd, "⌘")] {
         if on {
             out.push_str(glyph);
         }
@@ -1123,7 +1125,7 @@ impl TerminalView {
                                     .text_color(if on { theme.accent_fg.opacity(0.75) } else { theme.dim })
                                     .text_size(px(11.5))
                                     .when(!it.detail.is_empty(), |d| d.max_w(px(130.)).overflow_hidden().text_ellipsis().whitespace_nowrap().font_family(theme.mono_font.clone()))
-                                    .child(SharedString::from(if it.detail.is_empty() { it.keys.clone() } else { it.detail.clone() })),
+                                    .child(SharedString::from(if it.detail.is_empty() { crate::actions::glyph_keys(&it.keys) } else { it.detail.clone() })),
                             ),
                     )
                 }
@@ -1445,7 +1447,13 @@ mod tests {
 
     #[test]
     fn shortcuts() {
-        let ks = |key: &str, platform, shift, alt| Keystroke { key: key.into(), modifiers: Modifiers { platform, shift, alt, ..Default::default() }, ..Default::default() };
+        // `cmd`: the menus' ⌘, which is Ctrl off macOS.
+        let mac = cfg!(target_os = "macos");
+        let ks = |key: &str, cmd: bool, shift, alt| Keystroke {
+            key: key.into(),
+            modifiers: Modifiers { platform: cmd && mac, control: cmd && !mac, shift, alt, ..Default::default() },
+            ..Default::default()
+        };
         assert_eq!(key_glyphs(&ks("c", true, false, false)).as_deref(), Some("⌘C"));
         assert_eq!(key_glyphs(&ks("c", true, true, false)).as_deref(), Some("⇧⌘C"));
         assert_eq!(key_glyphs(&ks("d", true, false, true)).as_deref(), Some("⌥⌘D"));

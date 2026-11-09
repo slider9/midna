@@ -2030,7 +2030,8 @@ impl MainWindow {
             return;
         }
         if self.split.as_ref().is_some_and(|s| s.view.read(cx).focus_handle().contains_focused(window, cx)) {
-            self.close_split_terminal("Press ⌘W", window, cx);
+            let again = format!("Press {}", crate::actions::label(cx, "keys.close"));
+            self.close_split_terminal(&again, window, cx);
             return;
         }
         let Some(s) = self.selected_session() else {
@@ -2039,7 +2040,8 @@ impl MainWindow {
         };
         let (id, name) = (s.id.clone(), s.name.clone());
         let busy = busy_phrase(self.effective_state(s));
-        if !self.close_confirmed(&id, &name, busy, "Press ⌘W", cx) {
+        let again = format!("Press {}", crate::actions::label(cx, "keys.close"));
+        if !self.close_confirmed(&id, &name, busy, &again, cx) {
             return;
         }
         crate::sounds::play("closed");
@@ -2127,7 +2129,8 @@ impl MainWindow {
         let confirmed = self.close_armed.as_ref().is_some_and(|(a, t)| *a == key && t.elapsed() < Duration::from_secs(2));
         if let Some(why) = busy_count_phrase(&states).filter(|_| !confirmed) {
             self.close_armed = Some((key, Instant::now()));
-            self.toast(format!("Closing {} terminals: {why}. Press ⌘W again to close them.", ids.len()), cx);
+            let keys = crate::actions::label(cx, "keys.close");
+            self.toast(format!("Closing {} terminals: {why}. Press {keys} again to close them.", ids.len()), cx);
             return;
         }
         self.close_armed = None;

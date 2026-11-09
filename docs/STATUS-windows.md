@@ -51,6 +51,7 @@ would build them in with `\r\n`.
 | Codex `notify` | `sh -c` wrapper chains the previous notify | `midna.exe hook codex notify [--global] -- PREV…`; the CLI runs PREV with the payload |
 | Title bar | hidden; AppKit draws the traffic lights and drags by the top | hidden; `ui/caption.rs` draws a 32px row above each window: the caption (`WindowControlArea::Drag`: move, Snap, double-click) and minimise / maximise / close |
 | App icon | the bundle's `Midna.icns` | `packaging/assets/Midna.ico` (from `make-icon.py`) linked in as icon resource 1 by `midna-app/build.rs`, where GPUI loads the window icon from |
+| Shortcuts | ⌘ | Ctrl+Shift in the terminal's place, plain Ctrl where there's no terminal (see Shortcuts below) |
 
 Codex's notify can't go through a sh wrapper on Windows: Git Bash's runtime re-parses a native
 command line and mangles JSON (`{"type":"x"}` arrives empty, `a"b` turns into `a\b`).
@@ -58,14 +59,54 @@ command line and mangles JSON (`{"type":"x"}` arrives empty, `a"b` turns into `a
 Windows production paths (`midna_proto::paths::production_paths`): `%LOCALAPPDATA%\com.mrgnhnt.midna`,
 `%LOCALAPPDATA%\Programs\Midna`, `~\.local\bin\midna.exe`. Nothing is installed there yet.
 
+## Shortcuts
+
+GPUI's `cmd` is the Windows key off macOS, and Windows keeps most Win+key combinations for itself,
+so the defaults differ there. In a terminal a plain Ctrl+letter belongs to the shell and the agents
+(^C, ^R, ^T, ^W, ^K), so midna's own shortcuts work like Windows Terminal's: they add Shift.
+
+- Settings (`keys.*`): `midna-proto/src/settings.rs` gives each a second default (`keys(mac, other)`),
+  used everywhere but macOS. ⌘X → Ctrl+Shift+X; ⇧⌘X, which would clash with it, → Ctrl+Alt+X; ⌥⌘X
+  → Alt+Shift+X; ⌥⇧⌘X → Ctrl+Alt+Shift+X. Some follow Windows instead: Settings Ctrl+, · next and
+  previous terminal Ctrl+Tab / Ctrl+Shift+Tab · new window Ctrl+Shift+N · mute Ctrl+Shift+M · focus
+  the other split Ctrl+] · approve and deny Ctrl+Enter / Ctrl+Backspace (both fall through to the
+  terminal when nothing is waiting, as ⌘↩ does).
+- The terminal's own keys (`actions::term_keys`, `TerminalView::own_key`): copy Ctrl+Shift+C, and
+  Ctrl+C when something is selected (with nothing selected, or a second time on the same selection,
+  it's ^C); paste Ctrl+V or Ctrl+Shift+V; cut Ctrl+Shift+X; select all Ctrl+Shift+A; paste as secret
+  Alt+Shift+V; find Ctrl+Shift+F (F3 / Shift+F3 in it); scroll Ctrl+Shift+Home, End, PgUp, PgDn;
+  undo and redo in Claude's input Ctrl+Z / Ctrl+Shift+Z (not Ctrl+Y, Claude Code's yank). Projects
+  1–9 are Ctrl+1–9. `terminal.cmd_enter_sends` sends on Ctrl+↩.
+- Overlays, text fields, Settings and clicks use plain Ctrl (`Modifiers::secondary()`, which is ⌘ on
+  macOS): Ctrl+Z / Ctrl+Y, Ctrl+A/C/X/V, Ctrl+←/→ by words in text fields, Ctrl+click opens a
+  link, Ctrl+K in Settings searches.
+- Labels say "Ctrl+Shift+T" (`actions::pretty`); hints written in glyphs go through
+  `actions::glyph_keys` (⌘ read as Ctrl).
+- Hide (⌘H) and the composer's keys are macOS only. The macOS editing layer in the terminal (⌘← ⌘→
+  ⌘⌫, ⌘↑ ⌘↓ in Claude's input) has no Windows twin: Ctrl+←/→, Home and End go to the shell or the
+  agent as they are.
+- AltGr is Ctrl+Alt to Windows. GPUI types the AltGr character when the focused view takes text, so
+  a Ctrl+Alt shortcut on a key with an AltGr character (Ctrl+Alt+E is € on a German layout) types
+  the character there instead.
+
+Checked in the real app (temp home, keys sent with `SendInput`): Ctrl+Alt+T opened a terminal,
+Ctrl+C with nothing selected stopped `ping`, Ctrl+Shift+K opened the command bar (its hints read
+Ctrl+Shift+J, Ctrl+Alt+T …), Ctrl+, opened Settings, Ctrl+] stepped to Shortcuts (which lists the
+Windows keys), and Ctrl+Shift+W closed Settings and then the terminal. Not checked by hand yet:
+copying with Ctrl+C, pasting, Ctrl+Tab.
+
+Still in macOS wording: setting descriptions in the catalog, the Settings blurbs, the setup screen
+and most of the remaining hints (about 450 strings with ⌘ or ⌥, a third of them in tests). The
+shortcut list and the menus and hints you see most are done.
+
 ## What works (verified on Windows 10 19045)
 
 - `cargo build --workspace`, with no warnings.
 - Tests:
-  - `midna-proto`: 103/103.
-  - `midnad --lib`: 223 pass, 1 ignored. This includes ConPTY (`a_console_app_runs_in_the_pseudoconsole`), MSVC argument quoting, `which` with PATHEXT, the process table, a TCP listener lookup and the socket peer pid.
+  - `midna-proto`: 105/105.
+  - `midnad --lib`: 224 pass, 1 ignored. This includes ConPTY (`a_console_app_runs_in_the_pseudoconsole`), MSVC argument quoting, `which` with PATHEXT, the process table, a TCP listener lookup and the socket peer pid.
   - `midna-cli`: all 51 unit tests pass. The integration tests that need no POSIX shell pass: `secrets_cli` 6/6 (including `secret exec` masking), `system_wait` 1/1, `triggers_cli` 3/3, and in `cli.rs` `exit_codes`, `discoverability`, `mcp_exposes_catalog_as_tools` and `codex_notify_runs_the_previous_command`.
-  - `midna-app`: 349 unit tests.
+  - `midna-app`: 350 unit tests, including key dispatch through GPUI with this platform's defaults.
 - End to end, with `midnad.exe --foreground` on a temp `MIDNA_HOME` and the real `midna.exe`:
   - Terminals open and run commands for Windows PowerShell 5.1 (the default shell), cmd and Git Bash. `send` and `read --screen` work, `list` shows the console titles, and cwd is honoured.
   - A terminal's `PATH` is midna's shims dir followed by the inherited entries. `MIDNA_SESSION` and `TERM_PROGRAM=midna` are set.
@@ -77,7 +118,8 @@ Windows production paths (`midna_proto::paths::production_paths`): `%LOCALAPPDAT
 
 In rough order of how much they matter:
 
-1. **Keyboard shortcuts.** GPUI's `cmd` is the Windows key, so the app's 114 `cmd-…` bindings and the `keys.*` defaults in `midna-proto/src/settings.rs` need `ctrl` variants (with care for terminal Ctrl keys). There are also about 57 `modifiers.platform` checks.
+1. **macOS wording.** The shortcuts work (see Shortcuts), but setting descriptions, blurbs, the setup
+   screen and many hints still say ⌘ and ⌥.
 2. **Integration tests.** 18 of the 31 `crates/midnad/tests/*.rs` files, plus `cli.rs` and `mcp.rs` in midna-cli, open `/bin/sh` in `/tmp` or use `libc` / `std::os::unix`. They need a portable shell and temp-dir helper (`midnad::sys::posix_sh()` exists). `midna-cli/tests/adopt.rs` is `cfg(unix)` until the shims below exist.
 3. **Typed agents in PowerShell and cmd.** The adopt shims are sh scripts without an extension, which only Git Bash runs. PowerShell and cmd need `claude.cmd` / `codex.cmd` (`midna.exe shim claude %*`; `is_shim` already recognises them).
 4. **Shell integration.** `init.bash`, zsh and fish are wired up by shell name (`/`-separated, no `.exe`), so Git Bash terminals get none yet. PowerShell has no integration (prompt marks, cwd reports) at all.

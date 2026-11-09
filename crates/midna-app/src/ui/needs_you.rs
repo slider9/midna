@@ -377,7 +377,7 @@ fn on_key(m: &mut MainWindow, ev: &KeyDownEvent, window: &mut Window, cx: &mut C
         cx.stop_propagation();
         return;
     }
-    if !md.platform {
+    if !md.secondary() {
         return;
     }
     match ks.key.as_str() {
@@ -608,7 +608,7 @@ fn list(m: &MainWindow, t: &Theme, order: &[&NeedsYou], cur: usize, approve_key:
                 .child(hint(t, "↑↓", "move"))
                 .when_some(approve_hint, |d, l| d.child(hint(t, approve_key, &l)))
                 .when_some(deny_hint, |d, l| d.child(hint(t, deny_key, &l)))
-                .child(hint(t, "⌘O", "terminal")),
+                .child(hint(t, &crate::actions::glyph_keys("⌘O"), "terminal")),
         )
 }
 
@@ -717,7 +717,7 @@ fn card(m: &MainWindow, t: &Theme, n: &NeedsYou, cx: &mut Context<MainWindow>) -
                     .hover(|s| s.bg(t.accent_soft))
                     .on_click(cx.listener(|m, _, _, cx| approve_all(m, cx)))
                     .child(format!("Approve all {} once", group.len()))
-                    .child(kbd(t, "⌘⇧↩")),
+                    .child(kbd(t, crate::actions::glyph_keys("⌘⇧↩"))),
             )
     });
 
@@ -938,7 +938,7 @@ fn actions(m: &MainWindow, t: &Theme, n: &NeedsYou, approve_key: &str, deny_key:
                 .on_click(cx.listener(|m, _, w, cx| open_terminal(m, w, cx)))
                 .child(Icon::PopOut.el(13., t.fg))
                 .child("Open terminal")
-                .child(kbd(t, "⌘O").text_color(t.dim)),
+                .child(kbd(t, crate::actions::glyph_keys("⌘O")).text_color(t.dim)),
         );
     }
     actions

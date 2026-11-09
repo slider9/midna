@@ -59,9 +59,10 @@ pub fn start(m: &mut MainWindow, window: &mut Window, cx: &mut Context<MainWindo
 /// Windows: GPUI's `cmd` is the Windows key.
 #[cfg(windows)]
 fn cmd_down() -> bool {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LWIN, VK_RWIN};
-    // SAFETY: plain reads of the keyboard state; the high bit is "down now".
-    unsafe { GetAsyncKeyState(VK_LWIN as i32) < 0 || GetAsyncKeyState(VK_RWIN as i32) < 0 }
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL};
+    // Quit is Ctrl+Shift+Q here. SAFETY: a plain read of the keyboard state; the high bit is
+    // "down now".
+    unsafe { GetAsyncKeyState(VK_CONTROL as i32) < 0 }
 }
 
 /// No keyboard state to read: a hold only quits through its events.
@@ -149,7 +150,7 @@ pub fn render(m: &MainWindow, t: &Theme) -> Option<AnyElement> {
         .flex()
         .items_center()
         .justify_center()
-        .child(div().font_family(t.mono_font.clone()).text_size(px(22. + 4. * p)).font_weight(FontWeight::BOLD).text_color(fg.opacity(0.7 + 0.3 * p)).child("⌘Q"));
+        .child(div().font_family(t.mono_font.clone()).text_size(px(22. + 4. * p)).font_weight(FontWeight::BOLD).text_color(fg.opacity(0.7 + 0.3 * p)).child(crate::actions::pretty(crate::actions::default_key("keys.quit"))));
     Some(
         div()
             .id("quit-hold")

@@ -101,6 +101,10 @@ pub fn image_paste_inline() -> bool {
 
 type StreamSlot = Rc<RefCell<Option<Arc<dyn TermStream>>>>;
 
+/// A selection as it stands: the engine's rows, the keyboard selection's anchor (and whether
+/// it's all of an agent's box), and the cursor.
+type SelMark = (Vec<(u16, u16, u16)>, Option<(term_edit::Pos, bool)>, Option<(u16, u16)>);
+
 /// ⌘F find bar state.
 #[derive(Clone, Debug, Default)]
 struct FindBar {
@@ -198,6 +202,9 @@ pub struct TerminalView {
     /// Claude's input text before each ⌘Z, latest last: ⇧⌘Z / ⌘Y types it back (Claude Code
     /// has undo but no redo). Any other input empties it.
     redo: Vec<String>,
+    /// Off macOS: the selection Ctrl+C last copied. Ctrl+C on it again is ^C, as when there's
+    /// no selection (Windows Terminal drops the selection on copy instead).
+    ctrl_c_copied: Option<SelMark>,
     font_family: SharedString,
     /// Prompt fast travel (agent terminals): the pinned bar, the rail, ⌥⌘↑ ⌥⌘↓.
     nav: prompt_nav::PromptNav,
@@ -253,17 +260,32 @@ fn key_msg(ks: &Keystroke, held: bool, option_as_meta: bool) -> Option<KeyMsg> {
     Some(KeyMsg { action: if held { KeyAction::Repeat } else { KeyAction::Press }, mods, key: ks.key.clone(), text })
 }
 
+/// ⌘Z (undo, `Some(true)`) and ⇧⌘Z or ⌘Y (redo, `Some(false)`) in Claude's input. Off macOS
+/// Ctrl+Z and Ctrl+Shift+Z; not Ctrl+Y, which is Claude Code's yank.
+fn undo_key(ks: &Keystroke) -> Option<bool> {
+    let m = &ks.modifiers;
+    let k = ks.key.as_str();
+    if cfg!(target_os = "macos") {
+        (m.platform && !m.alt && !m.control && matches!((k, m.shift), ("z", _) | ("y", false))).then(|| k == "z" && !m.shift)
+    } else {
+        (m.control && !m.alt && !m.platform && k == "z").then_some(!m.shift)
+    }
+}
+
 /// `terminal.cmd_enter_sends` for a key pressed in an agent's terminal: ⌘↩ becomes ↩, and ↩
 /// in the input box (`in_input`) becomes ⇧↩. Elsewhere, as in a menu, ↩ stays ↩. None leaves
 /// the key as it is.
 fn swap_enter(ks: &Keystroke, in_input: bool) -> Option<Keystroke> {
     let m = &ks.modifiers;
-    if ks.key != "enter" || m.shift || m.alt || m.control || m.function {
+    // The key that sends: ⌘↩, or Ctrl+↩ off macOS.
+    let (send, other) = if cfg!(target_os = "macos") { (m.platform, m.control) } else { (m.control, m.platform) };
+    if ks.key != "enter" || m.shift || m.alt || other || m.function {
         return None;
     }
     let mut out = ks.clone();
-    if m.platform {
+    if send {
         out.modifiers.platform = false;
+        out.modifiers.control = false;
     } else if in_input {
         out.modifiers.shift = true;
     } else {
@@ -512,6 +534,7 @@ impl TerminalView {
             erase_gen: 0,
             notice: None,
             redo: Vec::new(),
+            ctrl_c_copied: None,
             menu: None,
             link_menu: Default::default(),
             marked: None,
@@ -829,8 +852,7 @@ impl TerminalView {
         let swapped = self.enter_swap(ks);
         let ks = swapped.as_ref().unwrap_or(ks);
         let m = &ks.modifiers;
-        let undo_key = m.platform && !m.alt && !m.control && matches!((ks.key.as_str(), m.shift), ("z", _) | ("y", false));
-        if !undo_key {
+        if undo_key(ks).is_none() {
             self.redo.clear();
         }
         if self.erasing.is_some() && !m.platform {
@@ -853,34 +875,17 @@ impl TerminalView {
         }
         if m.platform {
             // ⌘-shortcuts are actions, except the terminal's own scrolling and find.
-            let handled = match (ks.key.as_str(), m.shift || m.alt || m.control) {
-                ("up" | "home", false) => {
-                    self.scroll(ScrollKind::Top, 0);
-                    true
-                }
-                ("down" | "end", false) => {
-                    self.scroll(ScrollKind::Bottom, 0);
-                    true
-                }
-                ("pageup", false) => {
-                    self.scroll(ScrollKind::Pages, -1);
-                    true
-                }
-                ("pagedown", false) => {
-                    self.scroll(ScrollKind::Pages, 1);
-                    true
-                }
-                ("f", false) => {
-                    self.open_find(cx);
-                    true
-                }
-                _ if undo_key => self.undo_input(ks.key == "z" && !m.shift, cx),
-                _ => false,
-            };
-            if handled {
+            if self.own_key(ks, cx) {
                 cx.stop_propagation();
                 cx.notify();
             }
+            return;
+        }
+        // Off macOS the terminal's own keys are Ctrl+Shift ones (and Ctrl+Z in Claude's
+        // input); any other Ctrl key goes to the terminal below.
+        if !cfg!(target_os = "macos") && self.own_key(ks, cx) {
+            cx.stop_propagation();
+            cx.notify();
             return;
         }
         if m.function && ks.key.len() == 1 {
@@ -915,6 +920,39 @@ impl TerminalView {
             self.deliver(ClientMsg::Key(k));
             cx.stop_propagation();
             cx.notify();
+        }
+    }
+
+    /// The terminal's own keys: scrolling, find, and undo in Claude's input. ⌘↑ ⌘Home, ⌘↓ ⌘End,
+    /// ⌘PgUp ⌘PgDn and ⌘F; off macOS, Ctrl+Shift+Home, End, PgUp, PgDn and F, as in Windows
+    /// Terminal. True when the key was used.
+    fn own_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) -> bool {
+        let m = &ks.modifiers;
+        let own = if cfg!(target_os = "macos") {
+            m.platform && !(m.shift || m.alt || m.control)
+        } else {
+            m.control && m.shift && !(m.alt || m.platform)
+        };
+        let scroll = match ks.key.as_str() {
+            "up" | "home" if own && cfg!(target_os = "macos") => Some((ScrollKind::Top, 0)),
+            "down" | "end" if own && cfg!(target_os = "macos") => Some((ScrollKind::Bottom, 0)),
+            "home" if own => Some((ScrollKind::Top, 0)),
+            "end" if own => Some((ScrollKind::Bottom, 0)),
+            "pageup" if own => Some((ScrollKind::Pages, -1)),
+            "pagedown" if own => Some((ScrollKind::Pages, 1)),
+            _ => None,
+        };
+        if let Some((kind, n)) = scroll {
+            self.scroll(kind, n);
+            return true;
+        }
+        if own && ks.key == "f" {
+            self.open_find(cx);
+            return true;
+        }
+        match undo_key(ks) {
+            Some(undo) => self.undo_input(undo, cx),
+            None => false,
         }
     }
 
@@ -1980,6 +2018,29 @@ impl TerminalView {
         self.copy_selection(window, cx);
     }
 
+    /// What's selected now, mouse and keyboard, to tell whether Ctrl+C copied it already.
+    fn sel_mark(&self) -> SelMark {
+        (self.ext.selection.clone(), self.kbd_sel.map(|k| (k.anchor, k.all)), self.live_cursor())
+    }
+
+    /// Something to copy: a mouse selection, or a keyboard one (`copy_selection`'s cases).
+    fn has_selection(&self) -> bool {
+        self.kbd_sel.is_some_and(|k| k.all) || self.long_selected() || self.kbd_range().is_some() || !self.ext.selection.is_empty()
+    }
+
+    /// Off macOS, Ctrl+C copies the selection, as in Windows Terminal. With nothing selected,
+    /// or on a selection it copied already, the key goes on to the terminal as ^C.
+    fn on_copy_or_interrupt(&mut self, _: &TermCopyOrInterrupt, window: &mut Window, cx: &mut Context<Self>) {
+        let mark = self.sel_mark();
+        if !self.has_selection() || self.ctrl_c_copied.as_ref() == Some(&mark) {
+            self.ctrl_c_copied = None;
+            cx.propagate();
+            return;
+        }
+        self.copy_selection(window, cx);
+        self.ctrl_c_copied = Some(mark);
+    }
+
     /// ⌘X: copy the selection, then erase it as ⌫ would. Outside the input line (output, a
     /// full-screen app) there's nothing to erase, so it only copies.
     fn on_cut(&mut self, _: &TermCut, window: &mut Window, cx: &mut Context<Self>) {
@@ -2131,7 +2192,7 @@ impl TerminalView {
         if self.menu.take().is_some() {
             cx.notify();
         }
-        if ev.modifiers.platform && ev.button == MouseButton::Left {
+        if ev.modifiers.secondary() && ev.button == MouseButton::Left {
             self.open_link_at(x, y, window, cx);
             return;
         }
@@ -2163,7 +2224,7 @@ impl TerminalView {
         let Some((x, y)) = self.cell_pos(ev.position) else {
             return;
         };
-        let cmd = ev.modifiers.platform;
+        let cmd = ev.modifiers.secondary();
         if (cmd || link_preview::mode(cx) == link_preview::Mode::Hover) && inside && over_grid && self.pressed == 0 && self.link_menu.menu.is_none() {
             if self.hover_cmd != cmd {
                 self.hover_cmd = cmd;
@@ -2407,6 +2468,7 @@ impl TerminalView {
     }
 
     fn render_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::actions::{pretty, term_keys};
         let pos = self.menu?;
         let has_sel = !self.ext.selection.is_empty();
         let clear_keys = crate::actions::label(cx, "keys.clear");
@@ -2442,11 +2504,11 @@ impl TerminalView {
                 t.menu = None;
                 cx.notify();
             }))
-            .child(item("copy", "Copy", "⌘C", has_sel, cx))
-            .child(item("paste", "Paste", "⌘V", true, cx))
-            .child(item("paste_secret", "Paste as Secret", "⌥⌘V", true, cx))
+            .child(item("copy", "Copy", &pretty(term_keys::COPY), has_sel, cx))
+            .child(item("paste", "Paste", &pretty(term_keys::PASTE), true, cx))
+            .child(item("paste_secret", "Paste as Secret", &pretty(term_keys::PASTE_SECRET), true, cx))
             .child(sep())
-            .child(item("select_all", "Select All", "⌘A", true, cx))
+            .child(item("select_all", "Select All", &pretty(term_keys::SELECT_ALL), true, cx))
             .child(item("clear", "Clear", &clear_keys, true, cx));
         Some(deferred(anchored().position(pos).snap_to_window_with_margin(px(8.)).child(menu)).with_priority(2).into_any_element())
     }
@@ -2480,13 +2542,17 @@ impl TerminalView {
                 self.run_find(!m.shift, false, window, cx);
                 true
             }
-            "g" if m.platform => {
+            "g" if m.secondary() => {
+                self.run_find(!m.shift, false, window, cx);
+                true
+            }
+            "f3" if !cfg!(target_os = "macos") => {
                 self.run_find(!m.shift, false, window, cx);
                 true
             }
             "backspace" => {
                 if let Some(f) = self.find.as_mut() {
-                    if m.alt || m.platform {
+                    if m.alt || m.secondary() {
                         f.query.clear();
                     } else {
                         f.query.pop();
@@ -2495,9 +2561,9 @@ impl TerminalView {
                 self.run_find(true, true, window, cx);
                 true
             }
-            "f" if m.platform => true,
-            "v" if m.platform => false, // TermPaste appends to the query
-            _ if m.platform => false,
+            "f" if m.secondary() => true,
+            "v" if m.secondary() => false, // TermPaste appends to the query
+            _ if m.secondary() => false,
             _ => {
                 // Text keys type into the query; other keys are swallowed while finding.
                 if let Some(t) = ks.key_char.as_ref().filter(|t| !m.control && !t.is_empty() && t.chars().all(|c| !c.is_control())) {
@@ -2799,7 +2865,7 @@ impl Render for TerminalView {
                 CursorStyle::IBeam
             })
             .on_modifiers_changed(cx.listener(|t, ev: &ModifiersChangedEvent, _, cx| {
-                if ev.modifiers.platform || !t.hover_cmd {
+                if ev.modifiers.secondary() || !t.hover_cmd {
                     return;
                 }
                 t.hover_cmd = false;
@@ -2824,6 +2890,7 @@ impl Render for TerminalView {
                     .on_action(cx.listener(Self::on_paste_image_inline))
                     .on_action(cx.listener(|t, _: &TermPasteSecret, w, cx| t.paste_as_secret(w, cx)))
                     .on_action(cx.listener(Self::on_copy))
+                    .on_action(cx.listener(Self::on_copy_or_interrupt))
                     .on_action(cx.listener(Self::on_cut))
                     .on_action(cx.listener(Self::on_select_all))
                     .on_action(cx.listener(|t, _: &TermClear, w, cx| t.menu_action("clear", w, cx)))
@@ -2894,7 +2961,7 @@ impl Render for TerminalView {
             .children(pill)
             .children(preview)
             .when(!at_bottom && below > 0 && overlay.is_none(), |d| {
-                d.child(chip(div().absolute().bottom(px(10.)).right(px(18.))).text_color(dim).child(format!("↓ {below} line{} below · ⌘↓", if below == 1 { "" } else { "s" })))
+                d.child(chip(div().absolute().bottom(px(10.)).right(px(18.))).text_color(dim).child(format!("↓ {below} line{} below · {}", if below == 1 { "" } else { "s" }, crate::actions::pretty(crate::actions::term_keys::TO_BOTTOM))))
             })
             .when_some(self.find.clone(), |d, f| {
                 let count = if f.query.is_empty() {
@@ -3233,13 +3300,16 @@ mod tests {
     #[test]
     fn cmd_enter_sends_swaps_enter() {
         let swap = |s: &str, in_input: bool| super::swap_enter(&ks(s, None), in_input).map(|k| k.unparse());
+        // ⌘↩ sends; Ctrl+↩ off macOS.
+        let send = crate::actions::pick("cmd", "ctrl");
         assert_eq!(swap("enter", true).as_deref(), Some("shift-enter"), "in the input ↩ starts a new line");
         assert_eq!(swap("enter", false), None, "in a menu ↩ still confirms");
-        assert_eq!(swap("cmd-enter", true).as_deref(), Some("enter"), "⌘↩ sends");
-        assert_eq!(swap("cmd-enter", false).as_deref(), Some("enter"), "and confirms a menu");
+        assert_eq!(swap(&format!("{send}-enter"), true).as_deref(), Some("enter"), "⌘↩ sends");
+        assert_eq!(swap(&format!("{send}-enter"), false).as_deref(), Some("enter"), "and confirms a menu");
         assert_eq!(swap("shift-enter", true), None, "⇧↩ is already a new line");
         assert_eq!(swap("alt-enter", true), None);
-        assert_eq!(swap("cmd-shift-enter", true), None);
+        assert_eq!(swap(&format!("{send}-shift-enter"), true), None);
+        assert_eq!(swap(&format!("{}-enter", crate::actions::pick("ctrl", "cmd")), true), None, "the other one is left alone");
         assert_eq!(swap("a", true), None);
     }
 

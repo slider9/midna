@@ -469,7 +469,7 @@ pub fn build(s: &Snapshot) -> Vec<Command> {
             .sub(if slot.is_some() { tilde(&p.path) } else { format!("{} · closed, opens a terminal", tilde(&p.path)) })
             .kw("jump switch project open")
             .project(&p.name)
-            .keys(slot.filter(|i| *i < 9).map(|i| format!("⌘{}", i + 1)).unwrap_or_default());
+            .keys(slot.filter(|i| *i < 9).map(|i| crate::actions::pretty(&format!("{}-{}", crate::actions::pick("cmd", "ctrl"), i + 1))).unwrap_or_default());
         out.push(featured(c, &p.path));
     }
     for c in s.discovered.iter().filter(|c| c.project_id.is_none() && !in_temp_dir(&c.path)) {
@@ -1518,7 +1518,8 @@ mod tests {
             cmds.into_iter().find(|c| c.id == "project:p1").map(|c| (c.sub, c.keys)).unwrap()
         };
         assert_eq!(sub(vec![&bg]), ("/src/api · closed, opens a terminal".to_string(), None));
-        assert_eq!(sub(vec![&bg, &fg]), ("/src/api".to_string(), Some("⌘1".to_string())));
+        let p1 = crate::actions::pretty(crate::actions::pick("cmd-1", "ctrl-1"));
+        assert_eq!(sub(vec![&bg, &fg]), ("/src/api".to_string(), Some(p1)));
     }
 
     #[test]
@@ -1545,7 +1546,7 @@ mod tests {
         assert_eq!(get("new.terminal").keys.as_deref(), Some("⌘T"));
         assert!(get("new.terminal").title.ends_with("in midna"));
         assert!(get("close:s2").danger.is_some());
-        assert_eq!(get("project:p_api").keys.as_deref(), Some("⌘2"));
+        assert_eq!(get("project:p_api").keys, Some(crate::actions::pretty(crate::actions::pick("cmd-2", "ctrl-2"))));
 
         let run = get("run:p_midna:test");
         assert!(run.approval.is_some(), "policy ask becomes a needs-approval badge");

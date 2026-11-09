@@ -248,7 +248,7 @@ impl SettingsWindow {
                     .text_size(px(12.))
                     .cursor_pointer()
                     .map(|d| if recording { d.border_color(t.accent).bg(t.accent_soft).text_color(t.fg) } else { d.border_color(t.line).bg(t.panel).text_color(t.dim).hover(|s| s.text_color(t.fg)) })
-                    .tooltip(crate::ui::header::tip_fixed(if recording { "Stop recording keys" } else { "Find a shortcut by pressing it" }, "⌥⌘K"))
+                    .tooltip(crate::ui::header::tip_fixed(if recording { "Stop recording keys" } else { "Find a shortcut by pressing it" }, crate::actions::pick("⌥⌘K", "Ctrl+Alt+K")))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|s, _, window, cx| s.toggle_recording(window, cx)))
                     .child(Icon::Keyboard.el(14., if recording { t.accent } else { t.dim }))

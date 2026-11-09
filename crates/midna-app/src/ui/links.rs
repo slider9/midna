@@ -155,14 +155,14 @@ fn on_key(m: &mut MainWindow, ev: &KeyDownEvent, window: &mut Window, cx: &mut C
     let rows = rows(m);
     let n = rows.len();
     match ks.key.as_str() {
-        "up" | "down" if !md.platform => {
+        "up" | "down" if !md.secondary() => {
             if n > 0 {
                 let cur = m.links.sel.min(n - 1);
                 m.links.sel = if ks.key == "down" { (cur + 1) % n } else { (cur + n - 1) % n };
                 m.links.scroll.scroll_to_item(m.links.sel);
             }
         }
-        "enter" if !md.platform => {
+        "enter" if !md.secondary() => {
             let Some(l) = rows.get(m.links.sel.min(n.saturating_sub(1))).cloned() else { return };
             if md.shift {
                 pin(m, &l, cx);
@@ -172,7 +172,7 @@ fn on_key(m: &mut MainWindow, ev: &KeyDownEvent, window: &mut Window, cx: &mut C
                 open(m, &l, window, cx);
             }
         }
-        "z" if md.platform && !md.shift => {
+        "z" if md.secondary() && !md.shift => {
             if !undo_remove(m, cx) {
                 return;
             }
@@ -419,9 +419,9 @@ pub fn popover(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> impl 
         .text_size(px(11.5))
         .text_color(t.dim)
         .child(key("↩", "open"))
-        .child(key("⌥↩", "find in terminal"))
+        .child(key(&crate::actions::glyph_keys("⌥↩"), "find in terminal"))
         .child(key("⇧↩", "pin"))
-        .when(m.selected.as_ref().is_some_and(|s| m.links.undo.iter().any(|(u, _)| u == s)), |d| d.child(key("⌘Z", "undo remove")))
+        .when(m.selected.as_ref().is_some_and(|s| m.links.undo.iter().any(|(u, _)| u == s)), |d| d.child(key(&crate::actions::glyph_keys("⌘Z"), "undo remove")))
         .child(div().flex_1())
         .child(key("⇥", "kind"));
 

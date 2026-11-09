@@ -47,6 +47,9 @@ actions!(
         ShowAll,
         // terminal
         TermCopy,
+        /// Off macOS, Ctrl+C: copy the selection when there is one, else ^C to the terminal, as
+        /// in Windows Terminal (`Terminal::on_copy_or_interrupt`).
+        TermCopyOrInterrupt,
         /// ⌘X: copy the selection, and erase it when it's in the input line.
         TermCut,
         TermPaste,
@@ -406,27 +409,59 @@ const fn fixed(keys: &'static [&'static str], title: &'static str, when: When) -
     Fixed { keys, label: None, title, when }
 }
 
+/// `mac` on macOS, `other` elsewhere: for keys that aren't settings. Off macOS GPUI's `cmd` is
+/// the Windows key, and a plain Ctrl+letter in a terminal belongs to the shell and the agents,
+/// so the terminal's keys take Ctrl+Shift, as Windows Terminal's do. Places with no terminal
+/// in them (overlays, text fields, Settings) use plain Ctrl, as Windows apps do.
+pub const fn pick(mac: &'static str, other: &'static str) -> &'static str {
+    if cfg!(target_os = "macos") { mac } else { other }
+}
+
+/// [`pick`] for a list of keys.
+pub const fn pick_all(mac: &'static [&'static str], other: &'static [&'static str]) -> &'static [&'static str] {
+    if cfg!(target_os = "macos") { mac } else { other }
+}
+
+/// The terminal's own keys that aren't settings, as bound on this platform (labels in menus
+/// and hints come from these too).
+pub mod term_keys {
+    use super::pick;
+    pub const COPY: &str = pick("cmd-c", "ctrl-shift-c");
+    pub const CUT: &str = pick("cmd-x", "ctrl-shift-x");
+    pub const PASTE: &str = pick("cmd-v", "ctrl-v");
+    pub const PASTE_SECRET: &str = pick("cmd-alt-v", "alt-shift-v");
+    pub const SELECT_ALL: &str = pick("cmd-a", "ctrl-shift-a");
+    pub const TO_BOTTOM: &str = pick("cmd-down", "ctrl-shift-end");
+}
+
 pub const FIXED: &[Fixed] = &[
     Fixed {
-        keys: &["cmd-1", "cmd-2", "cmd-3", "cmd-4", "cmd-5", "cmd-6", "cmd-7", "cmd-8", "cmd-9"],
-        label: Some("⌘1–9"),
+        keys: pick_all(
+            &["cmd-1", "cmd-2", "cmd-3", "cmd-4", "cmd-5", "cmd-6", "cmd-7", "cmd-8", "cmd-9"],
+            &["ctrl-1", "ctrl-2", "ctrl-3", "ctrl-4", "ctrl-5", "ctrl-6", "ctrl-7", "ctrl-8", "ctrl-9"],
+        ),
+        label: Some(pick("⌘1–9", "Ctrl+1–9")),
         title: "Jump to project 1–9",
         when: WINDOW,
     },
     fixed(&["escape"], "Close the overlay, or go back to the terminal", Some(CTX_OVERLAY)),
+    #[cfg(target_os = "macos")]
     fixed(&["cmd-h"], "Hide midna", ANYWHERE),
+    #[cfg(target_os = "macos")]
     fixed(&["cmd-alt-h"], "Hide other apps", ANYWHERE),
-    fixed(&["cmd-c"], "Copy the selection", TERM),
-    fixed(&["cmd-v"], "Paste (an image on the clipboard opens the image sheet, or pastes its path with terminal.image_paste = inline; a secret pasted into an agent asks to store it)", TERM),
-    fixed(&["cmd-alt-v"], "Paste as Secret: store the clipboard in the Keychain, paste [secret:NAME]", TERM),
-    fixed(&["cmd-a"], "Select all", TERM),
-    fixed(&["cmd-z", "cmd-shift-z", "cmd-y"], "Undo / redo in Claude Code's input", TERM),
-    fixed(&["cmd-f"], "Find in the terminal", TERM),
-    fixed(&["cmd-g", "enter"], "Find: older match", TERM),
-    fixed(&["cmd-shift-g", "shift-enter"], "Find: newer match", TERM),
-    fixed(&["cmd-up", "cmd-home"], "Scroll to the top", TERM),
-    fixed(&["cmd-down", "cmd-end"], "Scroll to the bottom", TERM),
-    fixed(&["cmd-pageup", "cmd-pagedown"], "Scroll a page", TERM),
+    fixed(pick_all(&["cmd-c"], &["ctrl-shift-c"]), "Copy the selection", TERM),
+    #[cfg(not(target_os = "macos"))]
+    fixed(&["ctrl-c"], "Copy the selection when there is one (again, or with none: ^C to the terminal)", TERM),
+    fixed(pick_all(&["cmd-v"], &["ctrl-v", "ctrl-shift-v"]), "Paste (an image on the clipboard opens the image sheet, or pastes its path with terminal.image_paste = inline; a secret pasted into an agent asks to store it)", TERM),
+    fixed(pick_all(&["cmd-alt-v"], &["alt-shift-v"]), pick("Paste as Secret: store the clipboard in the Keychain, paste [secret:NAME]", "Paste as Secret: store the clipboard in Credential Manager, paste [secret:NAME]"), TERM),
+    fixed(pick_all(&["cmd-a"], &["ctrl-shift-a"]), "Select all", TERM),
+    fixed(pick_all(&["cmd-z", "cmd-shift-z", "cmd-y"], &["ctrl-z", "ctrl-shift-z"]), "Undo / redo in Claude Code's input", TERM),
+    fixed(pick_all(&["cmd-f"], &["ctrl-shift-f"]), "Find in the terminal", TERM),
+    fixed(pick_all(&["cmd-g", "enter"], &["f3", "enter"]), "Find: older match", TERM),
+    fixed(pick_all(&["cmd-shift-g", "shift-enter"], &["shift-f3", "shift-enter"]), "Find: newer match", TERM),
+    fixed(pick_all(&["cmd-up", "cmd-home"], &["ctrl-shift-home"]), "Scroll to the top", TERM),
+    fixed(pick_all(&["cmd-down", "cmd-end"], &["ctrl-shift-end"]), "Scroll to the bottom", TERM),
+    fixed(pick_all(&["cmd-pageup", "cmd-pagedown"], &["ctrl-shift-pageup", "ctrl-shift-pagedown"]), "Scroll a page", TERM),
     fixed(&["up", "down"], "Move the selection", Some("Popover")),
     fixed(&["enter"], "Run the selected command", Some("overlay == command_bar")),
     fixed(&["shift-enter"], "Ask an agent instead", Some("overlay == command_bar")),
@@ -440,23 +475,25 @@ pub const FIXED: &[Fixed] = &[
     fixed(&["alt-up", "alt-down"], "Move the selected message", Some("overlay == queue")),
     fixed(&["alt-backspace"], "Remove the selected message", Some("overlay == queue")),
     fixed(&["tab"], "Change when it goes in", Some("overlay == queue")),
-    fixed(&["cmd-o"], "Open the card's terminal", Some("overlay == needs_you")),
-    fixed(&["cmd-shift-enter"], "Approve all", Some("overlay == needs_you")),
+    fixed(pick_all(&["cmd-o"], &["ctrl-o"]), "Open the card's terminal", Some("overlay == needs_you")),
+    fixed(pick_all(&["cmd-shift-enter"], &["ctrl-shift-enter"]), "Approve all", Some("overlay == needs_you")),
     fixed(&["enter"], "Edit the selected note", Some("overlay == annotate")),
     fixed(&["backspace"], "Remove the selected note", Some("overlay == annotate")),
-    fixed(&["cmd-z", "cmd-shift-z"], "Undo / redo in the note being edited", Some("overlay == annotate")),
-    fixed(&["cmd-z"], "Put back the last removed note or image", Some("overlay == annotate")),
-    fixed(&["cmd-up", "cmd-down"], "Previous / next image", Some("overlay == annotate")),
-    fixed(&["cmd-w"], "Remove the image, or close the sheet when there's none", Some("overlay == annotate")),
-    fixed(&["cmd-=", "cmd--", "cmd-0"], "Zoom in / out / fit", Some("overlay == annotate")),
-    Fixed { keys: &["cmd"], label: Some("⌘ scroll · pinch"), title: "Zoom about the pointer", when: Some("overlay == annotate") },
-    Fixed { keys: &["alt"], label: Some("⌥ drag · scroll"), title: "Pan the image (a middle-drag too)", when: Some("overlay == annotate") },
-    fixed(&["cmd-v"], "Add the image on the clipboard", Some("overlay == annotate")),
+    fixed(pick_all(&["cmd-z", "cmd-shift-z"], &["ctrl-z", "ctrl-shift-z"]), "Undo / redo in the note being edited", Some("overlay == annotate")),
+    fixed(pick_all(&["cmd-z"], &["ctrl-z"]), "Put back the last removed note or image", Some("overlay == annotate")),
+    fixed(pick_all(&["cmd-up", "cmd-down"], &["ctrl-up", "ctrl-down"]), "Previous / next image", Some("overlay == annotate")),
+    fixed(pick_all(&["cmd-w"], &["ctrl-shift-w"]), "Remove the image, or close the sheet when there's none", Some("overlay == annotate")),
+    fixed(pick_all(&["cmd-=", "cmd--", "cmd-0"], &["ctrl-=", "ctrl--", "ctrl-0"]), "Zoom in / out / fit", Some("overlay == annotate")),
+    Fixed { keys: pick_all(&["cmd"], &["ctrl"]), label: Some(pick("⌘ scroll · pinch", "Ctrl scroll · pinch")), title: "Zoom about the pointer", when: Some("overlay == annotate") },
+    Fixed { keys: &["alt"], label: Some(pick("⌥ drag · scroll", "Alt drag · scroll")), title: "Pan the image (a middle-drag too)", when: Some("overlay == annotate") },
+    fixed(pick_all(&["cmd-v"], &["ctrl-v"]), "Add the image on the clipboard", Some("overlay == annotate")),
+    #[cfg(target_os = "macos")]
     fixed(&["enter"], "Send to the terminal", Some(crate::composer::CTX_COMPOSER)),
+    #[cfg(target_os = "macos")]
     fixed(&["cmd-z", "cmd-shift-z"], "Undo / redo", Some(crate::composer::CTX_COMPOSER)),
-    fixed(&["cmd-k", "cmd-f"], "Search settings (↩ asks an agent instead)", Some(CTX_SETTINGS)),
-    fixed(&["cmd-[", "cmd-]"], "Previous / next section", Some(CTX_SETTINGS)),
-    fixed(&["cmd-alt-k"], "Record keys: find a shortcut by pressing it", Some(CTX_SETTINGS)),
+    fixed(pick_all(&["cmd-k", "cmd-f"], &["ctrl-k", "ctrl-f"]), "Search settings (↩ asks an agent instead)", Some(CTX_SETTINGS)),
+    fixed(pick_all(&["cmd-[", "cmd-]"], &["ctrl-[", "ctrl-]"]), "Previous / next section", Some(CTX_SETTINGS)),
+    fixed(pick_all(&["cmd-alt-k"], &["ctrl-alt-k"]), "Record keys: find a shortcut by pressing it", Some(CTX_SETTINGS)),
 ];
 
 /// The keys bound to each `keys.*` setting right now (normalized), for tooltips and labels.
@@ -536,16 +573,24 @@ pub fn bind_keys(cx: &mut App, get: impl Fn(&str) -> Option<String>, when: &[Str
     }
     b.extend(crate::composer::bindings());
     for i in 1..=9 {
-        b.push(KeyBinding::new(&format!("cmd-{i}"), SelectProject(i - 1), WINDOW));
+        b.push(KeyBinding::new(&format!("{}-{i}", pick("cmd", "ctrl")), SelectProject(i - 1), WINDOW));
     }
     b.push(KeyBinding::new("escape", Dismiss, Some(CTX_OVERLAY)));
-    b.push(KeyBinding::new("cmd-c", TermCopy, TERM));
-    b.push(KeyBinding::new("cmd-x", TermCut, TERM));
-    b.push(KeyBinding::new("cmd-v", TermPaste, TERM));
-    b.push(KeyBinding::new("cmd-alt-v", TermPasteSecret, TERM));
-    b.push(KeyBinding::new("cmd-a", TermSelectAll, TERM));
-    b.push(KeyBinding::new("cmd-h", Hide, ANYWHERE));
-    b.push(KeyBinding::new("cmd-alt-h", HideOthers, ANYWHERE));
+    b.push(KeyBinding::new(term_keys::COPY, TermCopy, TERM));
+    b.push(KeyBinding::new(term_keys::CUT, TermCut, TERM));
+    b.push(KeyBinding::new(term_keys::PASTE, TermPaste, TERM));
+    b.push(KeyBinding::new(term_keys::PASTE_SECRET, TermPasteSecret, TERM));
+    b.push(KeyBinding::new(term_keys::SELECT_ALL, TermSelectAll, TERM));
+    #[cfg(target_os = "macos")]
+    {
+        b.push(KeyBinding::new("cmd-h", Hide, ANYWHERE));
+        b.push(KeyBinding::new("cmd-alt-h", HideOthers, ANYWHERE));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        b.push(KeyBinding::new("ctrl-c", TermCopyOrInterrupt, TERM));
+        b.push(KeyBinding::new("ctrl-shift-v", TermPaste, TERM));
+    }
     for s in OVERLAY_KEYS {
         if let Some(k) = bound.0.get(s.setting).filter(|k| !k.is_empty()) {
             b.push((s.bind)(k, s.when));
@@ -623,7 +668,7 @@ pub fn normalize_keys(keys: &str) -> String {
         .join(" ")
 }
 
-/// "cmd-shift-t" -> "⇧⌘T" for display.
+/// "cmd-shift-t" -> "⇧⌘T" for display; off macOS "ctrl-shift-t" -> "Ctrl+Shift+T".
 pub fn pretty(keys: &str) -> String {
     if keys.trim().is_empty() {
         return String::new();
@@ -643,42 +688,114 @@ pub fn pretty(keys: &str) -> String {
                 None => (vec![], stroke),
             },
         };
-        let has = |m: &str| mods.contains(&m);
-        if has("ctrl") {
-            out.push('⌃');
+        if cfg!(target_os = "macos") {
+            pretty_mac(&mods, key, &mut out);
+        } else {
+            pretty_words(&mods, key, &mut out);
         }
-        if has("alt") {
-            out.push('⌥');
-        }
-        if has("shift") {
-            out.push('⇧');
-        }
-        if has("cmd") {
-            out.push('⌘');
-        }
-        out.push_str(&match key {
-            "enter" => "↩".to_string(),
-            "backspace" => "⌫".to_string(),
-            "escape" => "⎋".to_string(),
-            "space" => "Space".to_string(),
-            "tab" => "⇥".to_string(),
-            "up" => "↑".into(),
-            "down" => "↓".into(),
-            "left" => "←".into(),
-            "right" => "→".into(),
-            "pageup" => "PgUp".into(),
-            "pagedown" => "PgDn".into(),
-            "home" => "Home".into(),
-            "end" => "End".into(),
-            "delete" => "⌦".into(),
-            k => k.to_uppercase(),
-        });
     }
     out
 }
 
+/// One keystroke as macOS writes it: ⌃⌥⇧⌘ then the key.
+fn pretty_mac(mods: &[&str], key: &str, out: &mut String) {
+    let has = |m: &str| mods.contains(&m);
+    if has("ctrl") {
+        out.push('⌃');
+    }
+    if has("alt") {
+        out.push('⌥');
+    }
+    if has("shift") {
+        out.push('⇧');
+    }
+    if has("cmd") {
+        out.push('⌘');
+    }
+    out.push_str(&match key {
+        "enter" => "↩".to_string(),
+        "backspace" => "⌫".to_string(),
+        "escape" => "⎋".to_string(),
+        "space" => "Space".to_string(),
+        "tab" => "⇥".to_string(),
+        "up" => "↑".into(),
+        "down" => "↓".into(),
+        "left" => "←".into(),
+        "right" => "→".into(),
+        "pageup" => "PgUp".into(),
+        "pagedown" => "PgDn".into(),
+        "home" => "Home".into(),
+        "end" => "End".into(),
+        "delete" => "⌦".into(),
+        k => k.to_uppercase(),
+    });
+}
+
+/// A key written in macOS glyphs ("⇧⌘C", "⌥↩") as this platform shows it: as written on
+/// macOS; elsewhere in words with ⌘ read as Ctrl ("Ctrl+Shift+C", "Alt+Enter"). For the keys of
+/// places where macOS's ⌘ is a plain Ctrl off macOS: menus, overlays, text fields (in the
+/// terminal it's Ctrl+Shift instead: [`term_keys`]).
+pub fn glyph_keys(s: &str) -> String {
+    if cfg!(target_os = "macos") || s.is_empty() {
+        return s.to_string();
+    }
+    let mut mods: Vec<&str> = vec![];
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        let m = match c {
+            '⌃' | '⌘' => "ctrl",
+            '⌥' => "alt",
+            '⇧' => "shift",
+            _ => break,
+        };
+        if !mods.contains(&m) {
+            mods.push(m);
+        }
+        rest = &rest[c.len_utf8()..];
+    }
+    let key = match rest {
+        "↩" => "enter",
+        "⌫" => "backspace",
+        "⎋" => "escape",
+        "⇥" => "tab",
+        "⌦" => "delete",
+        k => k,
+    };
+    let mut out = String::new();
+    pretty_words(&mods, &key.to_lowercase(), &mut out);
+    out
+}
+
+/// One keystroke as Windows writes it: Ctrl+Alt+Shift+Win+key.
+fn pretty_words(mods: &[&str], key: &str, out: &mut String) {
+    for (m, name) in [("ctrl", "Ctrl"), ("alt", "Alt"), ("shift", "Shift"), ("cmd", "Win")] {
+        if mods.contains(&m) {
+            out.push_str(name);
+            out.push('+');
+        }
+    }
+    out.push_str(&match key {
+        "enter" => "Enter".to_string(),
+        "backspace" => "Backspace".to_string(),
+        "escape" => "Esc".to_string(),
+        "space" => "Space".to_string(),
+        "tab" => "Tab".to_string(),
+        "up" => "↑".into(),
+        "down" => "↓".into(),
+        "left" => "←".into(),
+        "right" => "→".into(),
+        "pageup" => "PgUp".into(),
+        "pagedown" => "PgDn".into(),
+        "home" => "Home".into(),
+        "end" => "End".into(),
+        "delete" => "Del".into(),
+        k => k.to_uppercase(),
+    });
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
     #[test]
     fn pretty_keys() {
         assert_eq!(super::pretty("cmd-enter"), "⌘↩");
@@ -689,6 +806,54 @@ mod tests {
         assert_eq!(super::normalize_keys("cmd-shift-comma"), "cmd-shift-,");
         let ks = gpui_kit::Keystroke::parse(&super::normalize_keys("cmd-comma")).unwrap();
         assert_eq!((ks.key.as_str(), ks.modifiers.platform), (",", true));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn pretty_keys_in_words() {
+        assert_eq!(super::pretty("ctrl-enter"), "Ctrl+Enter");
+        assert_eq!(super::pretty("ctrl-alt-shift-t"), "Ctrl+Alt+Shift+T");
+        assert_eq!(super::pretty("alt-shift-left"), "Alt+Shift+←");
+        assert_eq!(super::pretty("ctrl-comma"), "Ctrl+,");
+        assert_eq!(super::pretty("ctrl--"), "Ctrl+-");
+        assert_eq!(super::pretty("ctrl-k ctrl-s"), "Ctrl+K Ctrl+S");
+        assert_eq!(super::pretty("shift-f3"), "Shift+F3");
+        assert_eq!(super::pretty("cmd-t"), "Win+T");
+        assert_eq!(super::glyph_keys("⇧⌘C"), "Ctrl+Shift+C");
+        assert_eq!(super::glyph_keys("⌥↩"), "Alt+Enter");
+        assert_eq!(super::glyph_keys("⌘⇧↩"), "Ctrl+Shift+Enter");
+        assert_eq!(super::glyph_keys("⌥↑↓"), "Alt+↑↓");
+        assert_eq!(super::glyph_keys("↩"), "Enter");
+    }
+
+    /// No two shortcuts share keys: a setting's default against another's, and (off macOS,
+    /// where the scheme is new) a shortcut that reaches the terminal against the terminal's
+    /// own keys.
+    #[test]
+    fn default_shortcuts_dont_collide() {
+        let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+        for s in super::SHORTCUTS {
+            let k = super::normalize_keys(super::default_key(s.setting));
+            if k.is_empty() {
+                continue;
+            }
+            let k = super::canonical(&k);
+            if let Some(other) = seen.insert(k.clone(), s.setting) {
+                panic!("{} and {other} both default to {k}", s.setting);
+            }
+        }
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        let reaches_terminal = [super::WINDOW, super::TERM, super::ANYWHERE, super::UNCOVERED];
+        seen.retain(|_, s| super::SHORTCUTS.iter().any(|x| x.setting == *s && reaches_terminal.contains(&x.when)));
+        for f in super::FIXED.iter().filter(|f| f.when == super::TERM) {
+            for k in f.keys {
+                if let Some(s) = seen.get(&super::canonical(k)) {
+                    panic!("{s} defaults to {k}, which the terminal keeps for {:?}", f.title);
+                }
+            }
+        }
     }
 
     #[test]
@@ -853,19 +1018,32 @@ mod dispatch {
         (k.to_string(), actions.to_vec())
     }
 
+    /// A shortcut's default keys on this platform.
+    fn key(setting: &str) -> String {
+        super::normalize_keys(super::default_key(setting))
+    }
+
+    /// Project 1's keys on this platform.
+    fn project_1() -> String {
+        super::pick("cmd-1", "ctrl-1").to_string()
+    }
+
     #[gpui_kit::test]
     fn image_sheet_blocks_main_shortcuts(cx: &mut TestAppContext) {
-        let got = press(Kind::Modal, overlay::ANNOTATE, &["cmd-t", "cmd-d", "cmd-1", "cmd-w", "cmd-enter", "cmd-q", "cmd-,", "escape"], cx);
+        let [t, d, w, enter, q, comma] = ["keys.new_agent", "keys.split", "keys.close", "keys.approve", "keys.quit", "keys.settings"].map(key);
+        let p1 = project_1();
+        let keys: [&str; 8] = [&t, &d, &p1, &w, &enter, &q, &comma, "escape"];
+        let got = press(Kind::Modal, overlay::ANNOTATE, &keys, cx);
         assert_eq!(
             got,
             vec![
-                ran("cmd-t", &[]),
-                ran("cmd-d", &[]),
-                ran("cmd-1", &[]),
-                ran("cmd-w", &["remove_image"]),
-                ran("cmd-enter", &["attach"]),
-                ran("cmd-q", &["quit"]),
-                ran("cmd-,", &["settings"]),
+                ran(&t, &[]),
+                ran(&d, &[]),
+                ran(&p1, &[]),
+                ran(&w, &["remove_image"]),
+                ran(&enter, &["attach"]),
+                ran(&q, &["quit"]),
+                ran(&comma, &["settings"]),
                 ran("escape", &["dismiss"]),
             ]
         );
@@ -873,31 +1051,35 @@ mod dispatch {
 
     #[gpui_kit::test]
     fn popover_blocks_main_shortcuts(cx: &mut TestAppContext) {
-        let got = press(Kind::Popover, overlay::LINKS, &["cmd-t", "cmd-enter", "cmd-w", "cmd-l", "cmd-,"], cx);
+        let [t, enter, w, l, comma] = ["keys.new_agent", "keys.approve", "keys.close", "keys.links", "keys.settings"].map(key);
+        let got = press(Kind::Popover, overlay::LINKS, &[&t, &enter, &w, &l, &comma].map(|s| s.as_str()), cx);
         assert_eq!(
             got,
             vec![
-                ran("cmd-t", &[]),
-                ran("cmd-enter", &[]),
-                ran("cmd-w", &["dismiss"]),
-                ran("cmd-l", &["toggle_links"]),
-                ran("cmd-,", &["settings"]),
+                ran(&t, &[]),
+                ran(&enter, &[]),
+                ran(&w, &["dismiss"]),
+                ran(&l, &["toggle_links"]),
+                ran(&comma, &["settings"]),
             ]
         );
     }
 
     #[gpui_kit::test]
     fn screens_keep_main_shortcuts(cx: &mut TestAppContext) {
-        let got = press(Kind::Screen, overlay::RULES, &["cmd-t", "cmd-1", "cmd-w"], cx);
-        assert_eq!(got, vec![ran("cmd-t", &["new_agent"]), ran("cmd-1", &["select_project"]), ran("cmd-w", &["close_window"])]);
+        let (t, p1, w) = (key("keys.new_agent"), project_1(), key("keys.close"));
+        let got = press(Kind::Screen, overlay::RULES, &[&t, &p1, &w].map(|s| s.as_str()), cx);
+        assert_eq!(got, vec![ran(&t, &["new_agent"]), ran(&p1, &["select_project"]), ran(&w, &["close_window"])]);
     }
 
     #[gpui_kit::test]
     fn keys_when_moves_a_shortcut(cx: &mut TestAppContext) {
-        // ⌘T made to work over the image sheet, ⌘D anywhere; ⌘1 isn't a setting and stays put.
+        // New agent made to work over the image sheet, split anywhere; project 1 isn't a
+        // setting and stays put.
         let when = ["keys.new_agent = MidnaMain", "keys.split = *"];
-        let got = press_with(&when, Kind::Modal, overlay::ANNOTATE, &["cmd-t", "cmd-d", "cmd-1"], cx);
-        assert_eq!(got, vec![ran("cmd-t", &["new_agent"]), ran("cmd-d", &["split"]), ran("cmd-1", &[])]);
+        let (t, d, p1) = (key("keys.new_agent"), key("keys.split"), project_1());
+        let got = press_with(&when, Kind::Modal, overlay::ANNOTATE, &[&t, &d, &p1].map(|s| s.as_str()), cx);
+        assert_eq!(got, vec![ran(&t, &["new_agent"]), ran(&d, &["split"]), ran(&p1, &[])]);
         cx.update(|cx| {
             assert_eq!(super::when_clause(cx, "keys.new_agent").as_deref(), Some("MidnaMain"));
             assert_eq!(super::when_clause(cx, "keys.split"), None);

@@ -372,7 +372,7 @@ impl QueueView {
         let n = list.len();
         let sel = self.sel.filter(|&i| i < n);
         match ks.key.as_str() {
-            "up" | "down" if md.alt && !md.platform => {
+            "up" | "down" if md.alt && !md.secondary() => {
                 let Some(i) = sel else { return };
                 let to = if ks.key == "up" { i.saturating_sub(1) } else { (i + 1).min(n - 1) };
                 if to != i {
@@ -380,7 +380,7 @@ impl QueueView {
                     self.call("queue.move", json!({ "id": list[i].id, "to": to }), cx);
                 }
             }
-            "up" | "down" if !md.platform => {
+            "up" | "down" if !md.secondary() => {
                 if n > 0 {
                     self.sel = Some(match (sel, ks.key.as_str()) {
                         (None, "up") => n - 1,
@@ -391,11 +391,11 @@ impl QueueView {
                     self.scroll.scroll_to_item(self.sel.unwrap_or(0));
                 }
             }
-            "enter" if md.shift && !md.platform => {
+            "enter" if md.shift && !md.secondary() => {
                 let Some(i) = sel else { return };
                 self.call("queue.send_now", json!({ "id": list[i].id }), cx);
             }
-            "enter" if !md.platform && !md.alt => {
+            "enter" if !md.secondary() && !md.alt => {
                 if !self.input.read(cx).text().trim().is_empty() {
                     self.submit(cx);
                 } else if let Some(i) = sel {
@@ -404,7 +404,7 @@ impl QueueView {
                     return;
                 }
             }
-            "backspace" if md.alt && !md.platform && self.input.read(cx).text().is_empty() => {
+            "backspace" if md.alt && !md.secondary() && self.input.read(cx).text().is_empty() => {
                 let Some(i) = sel else { return };
                 self.remove(&list[i].id, cx);
                 self.sel = if n > 1 { Some(i.min(n - 2)) } else { None };
