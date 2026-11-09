@@ -43,6 +43,9 @@ fn a_busy_mac_holds_heavy_work_back() {
     // Light commands go through: midna has no opinion on them.
     let r = request(&mut a, "Bash(git status)");
     assert_eq!(r["source"], "default", "{r}");
+    // Windows agents run their commands in the PowerShell tool, which waits the same way.
+    assert_eq!(request(&mut a, r#"PowerShell($env:RUST_LOG = 'x'; & "C:\tools\cargo" test)"#)["source"], "guard");
+    assert_eq!(request(&mut a, "PowerShell(Get-ChildItem; git status)")["source"], "default");
     // A rule's allow is about permission, not load.
     call(&mut h, "rule.add", json!({ "effect": "allow", "matcher": { "kind": "tool", "pattern": "Bash(cargo *)" }, "scope": { "kind": "global" } }));
     assert_eq!(request(&mut a, "Bash(cargo build)")["source"], "guard");
@@ -63,7 +66,7 @@ fn a_busy_mac_holds_heavy_work_back() {
     call(&mut h, "settings.set", json!({ "key": "guard.busy_gate", "value": false }));
     assert_eq!(request(&mut a, "Bash(cargo build)")["source"], "rule");
     let kinds: Vec<String> = call(&mut h, "events.list", json!({ "since_seq": 0, "limit": 1000 })).as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap().to_string()).collect();
-    assert_eq!(kinds.iter().filter(|k| *k == "guard.held").count(), 4, "{kinds:?}");
+    assert_eq!(kinds.iter().filter(|k| *k == "guard.held").count(), 5, "{kinds:?}");
     assert!(kinds.contains(&"guard.run_anyway".into()), "{kinds:?}");
 }
 
@@ -75,7 +78,8 @@ fn builds_wait_in_line_for_a_slot() {
     call(&mut h, "settings.set", json!({ "key": "guard.build_slots", "value": 1 }));
     let (s1, s2) = (open_sh(&mut h), open_sh(&mut h));
     let mut a = d.agent(Some(&s1));
-    assert_eq!(request(&mut a, "Bash(cargo build)")["source"], "default");
+    // The first build runs in the PowerShell tool (Windows), the second in Bash.
+    assert_eq!(request(&mut a, "PowerShell(cargo build)")["source"], "default");
     // Light commands never wait.
     assert_eq!(request(&mut a, "Bash(git status)")["source"], "default");
     let mut b = d.agent(Some(&s2));
@@ -94,7 +98,7 @@ fn builds_wait_in_line_for_a_slot() {
     assert_eq!((builds[1]["session_id"].as_str(), builds[1]["command"].as_str(), builds[1]["waiting"].as_bool()), (Some(s2.as_str()), Some("flutter test"), Some(true)), "{l}");
     assert!(!waiting.is_finished());
     // The first build returned and nothing it started runs: the next one goes.
-    hook(&mut a, "PostToolUse", json!({ "tool_name": "Bash", "tool_input": { "command": "cargo build" }, "tool_response": {} }));
+    hook(&mut a, "PostToolUse", json!({ "tool_name": "PowerShell", "tool_input": { "command": "cargo build" }, "tool_response": {} }));
     assert_eq!(waiting.join().unwrap()["source"], "default");
     let l = call(&mut h, "system.load", json!({}));
     assert_eq!(l["builds"].as_array().unwrap().len(), 1, "{l}");

@@ -489,7 +489,7 @@ pub fn scan_entry(v: &Value, cwd: &str, tools: &mut HashMap<String, (String, Opt
                         }
                         if let Some(id) = part.get("id").and_then(Value::as_str) {
                             let via = match name.as_str() {
-                                "Bash" => input.get("command").and_then(Value::as_str).map(command_head),
+                                "Bash" | "PowerShell" => input.get("command").and_then(Value::as_str).map(command_head),
                                 n => Some(n.rsplit("__").next().unwrap_or(n).to_string()),
                             };
                             tools.insert(id.to_string(), (name, via));
@@ -507,7 +507,7 @@ pub fn scan_entry(v: &Value, cwd: &str, tools: &mut HashMap<String, (String, Opt
 /// Tools whose output is worth reading for pull request links: what the agent ran, not what
 /// it read (a `cat` of notes is full of links nobody chose here).
 fn reads_output(tool: &str) -> bool {
-    matches!(tool, "Bash" | "Agent" | "Task") || tool.starts_with("mcp__")
+    matches!(tool, "Bash" | "PowerShell" | "Agent" | "Task") || tool.starts_with("mcp__")
 }
 
 /// Scratch files (the agent's temp and scratchpad dirs) are not worth coming back to.
@@ -718,6 +718,20 @@ mod tests {
         assert_eq!(command_head("FOO=1 git push -u origin main"), "git push");
         assert_eq!(command_head("git push origin feat/x"), "git push origin");
         assert_eq!(command_head("./scripts/smoke.sh"), "./scripts/smoke.sh");
+    }
+
+    #[test]
+    fn a_powershell_call_counts_as_a_command() {
+        let mut tools = HashMap::new();
+        let call = json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"p1","name":"PowerShell","input":{"command":"gh pr create --fill"}}]}});
+        let result = json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"p1","content":"https://github.com/o/r/pull/7\n"}]}});
+        let mut links = vec![];
+        for l in [call, result] {
+            let f = scan_entry(&l, r"C:\p", &mut tools);
+            record(&mut links, f, "2026-10-04T10:00:00Z", None);
+        }
+        let got: Vec<(&str, LinkSource, Option<&str>)> = links.iter().map(|l| (l.target.as_str(), l.source, l.via.as_deref())).collect();
+        assert_eq!(got, [("https://github.com/o/r/pull/7", LinkSource::Tool, Some("gh pr create"))]);
     }
 
     #[test]

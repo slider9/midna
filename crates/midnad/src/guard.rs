@@ -604,9 +604,12 @@ pub fn hold(d: &Daemon, a: &PolicyAction, gone: &dyn Fn() -> bool) -> Option<Str
         None => (a.value.as_str(), ""),
     };
     let subagent = matches!(tool, "Agent" | "Task");
-    let model = if tool == "Bash" { sys::model_program(arg) } else { None };
+    let shell = sys::is_shell_tool(tool);
+    // `arg` as written stays the build's command: after_tool matches it.
+    let cmd = sys::tool_command(tool, arg);
+    let model = if shell { sys::model_program(&cmd) } else { None };
     let reason = subagent.then(|| too_many_subagents(d, sid)).flatten().or_else(|| {
-        let heavy = subagent || model.is_some() || tool == "Bash" && sys::is_heavy_command(arg);
+        let heavy = subagent || model.is_some() || shell && sys::is_heavy_command(&cmd);
         if !heavy || !d.setting("guard.busy_gate").as_bool().unwrap_or(true) {
             return None;
         }
@@ -642,12 +645,12 @@ pub fn hold(d: &Daemon, a: &PolicyAction, gone: &dyn Fn() -> bool) -> Option<Str
             info.pending_agents.pop();
         }
     }
-    if reason.is_some() || tool != "Bash" || runs_anyway(d, sid) {
+    if reason.is_some() || !shell || runs_anyway(d, sid) {
         return reason;
     }
     match model {
         Some(program) => build_slot(d, sid, arg, program, true, gone),
-        None => build_slot(d, sid, arg, sys::heavy_program(arg)?, false, gone),
+        None => build_slot(d, sid, arg, sys::heavy_program(&cmd)?, false, gone),
     }
 }
 
@@ -746,9 +749,9 @@ fn has_turn<'a>(line: impl IntoIterator<Item = &'a Waiter>, ticket: u64, running
     line.into_iter().filter(|w| w.parked.is_none()).position(|w| w.ticket == ticket).is_some_and(|ahead| running + ahead < slots)
 }
 
-/// A Bash call returned: the build it ran gives its slot up once nothing it started runs.
+/// A shell call returned: the build it ran gives its slot up once nothing it started runs.
 pub fn after_tool(d: &Daemon, sid: &str, ev: &str, payload: &Value) {
-    if !matches!(ev, "PostToolUse" | "PostToolUseFailure") || payload.get("tool_name").and_then(Value::as_str) != Some("Bash") {
+    if !matches!(ev, "PostToolUse" | "PostToolUseFailure") || !payload.get("tool_name").and_then(Value::as_str).is_some_and(sys::is_shell_tool) {
         return;
     }
     let Some(command) = payload.pointer("/tool_input/command").and_then(Value::as_str) else { return };

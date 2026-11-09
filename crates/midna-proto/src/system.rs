@@ -418,6 +418,20 @@ pub fn is_poll_loop(command: &str) -> bool {
 /// Mac is busy. Any simple command in a compound one counts (`source env.sh && cargo test`), but
 /// only by the program it runs: words in quotes, heredoc bodies and comments are text, not
 /// commands (`tb note "ran make"` and `cat > x.md <<EOF … cargo build … EOF` aren't builds).
+/// Claude Code's shell tools: `Bash`, and `PowerShell`, which agents on Windows mostly use. Both
+/// take a `command`, a `description`, a `timeout` and `run_in_background`.
+pub fn is_shell_tool(tool: &str) -> bool {
+    matches!(tool, "Bash" | "PowerShell")
+}
+
+/// A shell tool's command the way the readers here ([`heavy_program`], [`model_program`]) take
+/// it. They read sh; a PowerShell command reads the same once its `\` is a separator, not an
+/// escape (it becomes `/`), and its backtick is the escape (it becomes `\`). That's enough to
+/// find what it runs: `$env:X = 1; cargo build`, `& "C:\…\npm" install`, `if ($?) { … }`.
+pub fn tool_command<'a>(tool: &str, command: &'a str) -> std::borrow::Cow<'a, str> {
+    if tool == "PowerShell" { command.chars().map(|c| match c { '\\' => '/', '`' => '\\', c => c }).collect::<String>().into() } else { command.into() }
+}
+
 pub fn is_heavy_command(command: &str) -> bool {
     heavy_program(command).is_some()
 }
@@ -719,6 +733,21 @@ mod tests {
         assert!(!is_poll_loop("bash -c cargo build --workspace"));
         assert!(!is_poll_loop("python3 -c while True: sleep(1)"));
         assert!(!is_poll_loop("bash -c until make; do echo retry; done"));
+    }
+
+    #[test]
+    fn powershell_commands_read_like_sh() {
+        let heavy = |c: &str| heavy_program(&tool_command("PowerShell", c));
+        assert_eq!(heavy("cargo build; if ($?) { cargo test }").as_deref(), Some("cargo"));
+        assert_eq!(heavy("if (Test-Path x) { npm install }").as_deref(), Some("npm"));
+        assert_eq!(heavy("$env:RUST_LOG = 'debug'; cargo test -p midnad").as_deref(), Some("cargo"));
+        assert_eq!(heavy(r#"& "C:\Program Files\nodejs\npm" install"#).as_deref(), Some("npm"));
+        assert_eq!(heavy(r"Set-Location D:\x; cargo build 2>&1 | Out-File build.log").as_deref(), Some("cargo"));
+        assert_eq!(heavy("Get-ChildItem; git status"), None);
+        // the backtick escapes, as `\` does in sh
+        assert_eq!(heavy("Write-Host \"a`\"b\"; cargo check").as_deref(), Some("cargo"));
+        assert_eq!(tool_command("Bash", r"a\ b"), r"a\ b");
+        assert!(is_shell_tool("PowerShell") && is_shell_tool("Bash") && !is_shell_tool("Read"));
     }
 
     #[test]

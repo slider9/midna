@@ -116,6 +116,19 @@ pub fn launch_allows(allowed: &[String], value: &str) -> bool {
     })
 }
 
+/// A shell tool call as the other shell's (`PowerShell(git push)` for `Bash(git push)`), so a
+/// rule written for either covers the command in both: agents on macOS run Bash, on Windows
+/// mostly PowerShell.
+fn other_shell(value: &str) -> Option<String> {
+    let (tool, rest) = value.split_once('(')?;
+    let other = match tool {
+        "Bash" => "PowerShell",
+        "PowerShell" => "Bash",
+        _ => return None,
+    };
+    Some(format!("{other}({rest}"))
+}
+
 pub fn is_expired(r: &Rule, now: i64) -> bool {
     r.expires_at.as_deref().and_then(time::parse_rfc3339).is_some_and(|t| t <= now)
 }
@@ -178,7 +191,7 @@ pub fn evaluate(rules: &[Rule], a: &PolicyAction, now: i64, default_setting: &st
             (false, "expired".into())
         } else if !scope_applies(&r.scope, a) {
             (false, format!("{} scope does not apply", scope_label(&r.scope)))
-        } else if !glob_match(&r.matcher.pattern, &a.value) {
+        } else if !(glob_match(&r.matcher.pattern, &a.value) || a.kind == ActionKind::Tool && other_shell(&a.value).is_some_and(|v| glob_match(&r.matcher.pattern, &v))) {
             (false, format!("pattern `{}` does not match", r.matcher.pattern))
         } else {
             (true, format!("{} `{}` matches ({} scope)", r.effect.as_str(), r.matcher.pattern, scope_label(&r.scope)))
@@ -234,6 +247,23 @@ mod tests {
         assert!(glob_match("*", ""));
         assert!(glob_match(&escape_glob("ls *.rs"), "ls *.rs"));
         assert!(!glob_match(&escape_glob("ls *.rs"), "ls a.rs"));
+    }
+
+    #[test]
+    fn a_shell_rule_covers_both_shells() {
+        let tool = |r: Rule| Rule { matcher: Matcher { kind: ActionKind::Tool, ..r.matcher }, ..r };
+        let call = |v: &str| PolicyAction { kind: ActionKind::Tool, value: v.into(), session: None, project: None };
+        let rules = vec![tool(rule("r_bash", Effect::Deny, "Bash(git push --force*)", RuleScope::Global)), tool(rule("r_ps", Effect::Ask, "PowerShell(Remove-Item*)", RuleScope::Global))];
+        let decide = |v: &str| evaluate(&rules, &call(v), time::now_unix(), "auto").decision;
+        assert_eq!(decide("PowerShell(git push --force origin main)"), Effect::Deny);
+        assert_eq!(decide("Bash(git push --force origin main)"), Effect::Deny);
+        assert_eq!(decide("Bash(Remove-Item -Recurse x)"), Effect::Ask);
+        assert_eq!(decide("PowerShell(git push origin main)"), Effect::Allow);
+        // only a shell call: a Read of a file named like a command is its own thing
+        assert_eq!(decide("Read(git push --force)"), Effect::Allow);
+        // a command rule (`midna exec`) doesn't change
+        let cmd = PolicyAction { kind: ActionKind::Command, value: "PowerShell(git push --force)".into(), session: None, project: None };
+        assert_eq!(evaluate(&[rule("r_c", Effect::Deny, "Bash(git push --force*)", RuleScope::Global)], &cmd, time::now_unix(), "auto").decision, Effect::Allow);
     }
 
     #[test]

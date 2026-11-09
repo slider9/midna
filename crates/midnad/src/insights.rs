@@ -584,15 +584,15 @@ fn approval_label(title: &str) -> String {
         return "Question".into();
     }
     let Some((tool, arg)) = t.split_once('(').filter(|(tool, _)| !tool.is_empty() && !tool.contains(' ')) else { return t.to_string() };
-    if tool != "Bash" {
+    if !system::is_shell_tool(tool) {
         return tool.to_string();
     }
     let arg = arg.strip_suffix(')').unwrap_or(arg);
     let mut words = arg.split_whitespace();
     let Some(first) = words.next() else { return tool.to_string() };
     match words.next().filter(|w| w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') && !w.starts_with('-')) {
-        Some(second) => format!("Bash({first} {second})"),
-        None => format!("Bash({first})"),
+        Some(second) => format!("{tool}({first} {second})"),
+        None => format!("{tool}({first})"),
     }
 }
 
@@ -1159,6 +1159,7 @@ mod tests {
     fn approval_labels() {
         assert_eq!(approval_label("permission Bash(git push origin main)"), "Bash(git push)");
         assert_eq!(approval_label("permission Bash(ls -la)"), "Bash(ls)");
+        assert_eq!(approval_label("permission PowerShell(git push origin main)"), "PowerShell(git push)");
         assert_eq!(approval_label("permission WebFetch(https://docs.rs)"), "WebFetch");
         assert_eq!(approval_label("question: Which one?"), "Question");
         assert_eq!(approval_label("Allow deploy to prod?"), "Allow deploy to prod?");
