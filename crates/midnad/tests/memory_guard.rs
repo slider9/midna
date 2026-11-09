@@ -25,6 +25,9 @@ fn memory_pressure_holds_heavy_work_back_and_says_so() {
     let mut h = d.human();
     let sid = open_sh(&mut h);
     let mut a = d.agent(Some(&sid));
+    // Windows: the guard's first sample may not be in yet (it opens every process there).
+    #[cfg(windows)]
+    wait_for(5, "a memory sample", || (call(&mut h, "system.load", json!({}))["memory_total_bytes"].as_u64() > Some(0)).then_some(()));
     let l = call(&mut h, "system.load", json!({}));
     assert_eq!((l["memory_pressure"].as_str(), l["memory_held"].as_bool(), l["held"].as_bool()), (Some("warning"), Some(true), Some(false)), "{l}");
     assert!(l["memory_total_bytes"].as_u64().unwrap() > 0, "{l}");

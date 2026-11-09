@@ -112,9 +112,9 @@ fn sent(screen: &str) -> Vec<String> {
 /// queued for that refusal used to wait forever for the box to empty.
 #[test]
 fn steps_for_a_refused_prompt_clear_it_from_the_input_box() {
-    let d = TestDaemon::start_with(|c| c.agent_bin = Some(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake_input_box.py").into()));
+    let d = TestDaemon::start_with(|c| c.agent_bin = Some(python_bin(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake_input_box.py"))));
     let mut h = d.human();
-    let s = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp" }));
+    let s = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": tmp() }));
     let sid = s["id"].as_str().unwrap().to_string();
     call(&mut h, "session.resize", json!({ "id": sid, "cols": 80, "rows": 24 }));
     wait_for(10, "the box", || screen(&mut h, &sid).contains("fake input box").then_some(()));
@@ -419,7 +419,7 @@ fn run_command_in_background_or_with_no_terminal() {
     let mut h = d.human();
     let dir = d.home.join("proj");
     std::fs::create_dir_all(&dir).unwrap();
-    let dir = dir.canonicalize().unwrap();
+    let dir = midna_proto::paths::canonical(&dir).unwrap();
     let p = call(&mut h, "project.add", json!({ "path": dir }));
     let pid = p["id"].as_str().unwrap().to_string();
     let add = |h: &mut Client, name: &str, action: Value| {
@@ -452,7 +452,10 @@ fn run_command_in_background_or_with_no_terminal() {
 
     // Headless: no terminal; the exit code and output end up on the delivery.
     let before = call(&mut h, "session.list", json!({})).as_array().unwrap().len();
-    let hl = add(&mut h, "Housekeeping", run("echo from $MIDNA_TRIGGER in $(pwd); echo oops >&2; test -z \"$MIDNA_SESSION\" && exit 3", json!({ "headless": true })));
+    // Windows: Git's sh says where it is its own way (/tmp/…); cygpath says it Windows' way.
+    let pwd = if cfg!(windows) { r#"$(cygpath -w "$PWD")"# } else { "$(pwd)" };
+    let cmd = format!("echo from $MIDNA_TRIGGER in {pwd}; echo oops >&2; test -z \"$MIDNA_SESSION\" && exit 3");
+    let hl = add(&mut h, "Housekeeping", run(&cmd, json!({ "headless": true })));
     let r = call(&mut h, "trigger.test", json!({ "trigger_id": hl["id"] }));
     assert!(r["summary"].as_str().unwrap().starts_with("Matches · would run with no terminal: "), "{r}");
     fire_daily(&d, &hl["id"]);
@@ -471,7 +474,9 @@ fn run_command_in_background_or_with_no_terminal() {
     fire_daily(&d, &slow["id"]);
     let del = finished_run(&mut h, &slow["id"], 15);
     let ran = &del["command_runs"][0];
-    assert_eq!((ran["timed_out"].as_bool(), ran["exit_code"].as_i64(), ran["output"].as_str()), (Some(true), None, Some("started")), "{ran}");
+    // Windows has no signals: midnad ends the run with TerminateProcess, which leaves exit code 1.
+    let code = if cfg!(windows) { Some(1) } else { None };
+    assert_eq!((ran["timed_out"].as_bool(), ran["exit_code"].as_i64(), ran["output"].as_str()), (Some(true), code, Some("started")), "{ran}");
 }
 
 #[test]
@@ -524,10 +529,10 @@ fn started_command(h: &mut Client, trigger: &Value) -> Vec<String> {
 
 #[test]
 fn local_agents_use_the_normal_config_and_a_triggers_own_mode_and_tools() {
-    let d = TestDaemon::start_with(|c| c.agent_bin = Some("/bin/echo".into()));
+    let d = TestDaemon::start_with(|c| c.agent_bin = Some(posix_bin("echo")));
     let mut h = d.human();
     call(&mut h, "settings.set", json!({ "key": "agents.shell_on_exit", "value": false }));
-    let pid = call(&mut h, "project.add", json!({ "path": "/tmp", "name": "tmp" }))["id"].clone();
+    let pid = call(&mut h, "project.add", json!({ "path": tmp(), "name": "tmp" }))["id"].clone();
     let sid = open_sh(&mut h);
     let mut a = d.agent(Some(&sid));
     let agent = |extra: Value| {
@@ -602,7 +607,7 @@ fn cron_trigger(h: &mut Client) -> Option<Value> {
 
 #[test]
 fn claude_crons_become_schedules_that_follow_the_terminal() {
-    let d = TestDaemon::start_with(|c| c.agent_bin = Some("/bin/echo".into()));
+    let d = TestDaemon::start_with(|c| c.agent_bin = Some(posix_bin("echo")));
     let mut h = d.human();
     call(&mut h, "settings.set", json!({ "key": "agents.shell_on_exit", "value": false }));
     let sid = open_sh(&mut h);

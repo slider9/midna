@@ -13,6 +13,7 @@ Needs (installed by hand):
 - Visual Studio Build Tools: MSVC and a Windows SDK (tested with MSVC 14.51, SDK 10.0.26100)
 - Zig **0.15.2** unpacked to `.toolchain/zig/` in the main checkout (libghostty-vt)
 - Git for Windows: Git Bash is the build shell, and midna uses its `bash.exe` as the POSIX `sh`
+- Python 3 as `python` (tests only: the fake agents in `crates/midnad/tests`)
 
 In Git Bash:
 
@@ -105,7 +106,8 @@ shortcut list and the menus and hints you see most are done.
 - Tests:
   - `midna-proto`: 105/105.
   - `midnad --lib`: 224 pass, 1 ignored. This includes ConPTY (`a_console_app_runs_in_the_pseudoconsole`), MSVC argument quoting, `which` with PATHEXT, the process table, a TCP listener lookup and the socket peer pid.
-  - `midna-cli`: all 51 unit tests pass. The integration tests that need no POSIX shell pass: `secrets_cli` 6/6 (including `secret exec` masking), `system_wait` 1/1, `triggers_cli` 3/3, and in `cli.rs` `exit_codes`, `discoverability`, `mcp_exposes_catalog_as_tools` and `codex_notify_runs_the_previous_command`.
+  - `midna-cli`: all 51 unit tests and every integration test pass: `cli` 13, `mcp` 4, `secrets_cli` 6 (including `secret exec` masking), `system_wait` 1, `triggers_cli` 3. `adopt.rs` is Unix only.
+  - midnad integration tests (`crates/midnad/tests/*.rs`): 170 of 200 pass (4 ignored: three helpers the tests run as programs, and one ignored on every platform). What fails and why is item 2 under "Not done yet".
   - `midna-app`: 350 unit tests, including key dispatch through GPUI with this platform's defaults.
 - End to end, with `midnad.exe --foreground` on a temp `MIDNA_HOME` and the real `midna.exe`:
   - Terminals open and run commands for Windows PowerShell 5.1 (the default shell), cmd and Git Bash. `send` and `read --screen` work, `list` shows the console titles, and cwd is honoured.
@@ -120,7 +122,13 @@ In rough order of how much they matter:
 
 1. **macOS wording.** The shortcuts work (see Shortcuts), but setting descriptions, blurbs, the setup
    screen and many hints still say ⌘ and ⌥.
-2. **Integration tests.** 18 of the 31 `crates/midnad/tests/*.rs` files, plus `cli.rs` and `mcp.rs` in midna-cli, open `/bin/sh` in `/tmp` or use `libc` / `std::os::unix`. They need a portable shell and temp-dir helper (`midnad::sys::posix_sh()` exists). `midna-cli/tests/adopt.rs` is `cfg(unix)` until the shims below exist.
+2. **Integration tests: the product gaps they show.** The tests run on Windows through the helpers in `crates/midnad/tests/common/mod.rs` (and midna-cli's): `tmp()`, `sh()` and `posix_bin()` (Git for Windows' `usr\bin` tools, as 8.3 paths), `script()` (a `.sh` with a `.cmd` that runs it), and a copy of the test binary standing in for `nc -U`. Each test binary sets `MIDNA_SHELL` to Git's `sh`, so one-line commands get a POSIX shell as on macOS. What's Unix only is `cfg(unix)` with its reason: `shell_integration.rs`, in-place upgrade and restart (`upgrade.rs` checks the refusal instead), file modes, `/` as the root, and `adopt.rs` until the shims below exist. The tests that still fail do so on the product:
+   - **Paths split and checked on `/` only.** Basenames use `rsplit('/')` (`rpc/session.rs:300`, `auto_name.rs`, `rpc/project.rs:50`, `git.rs:74`, `procs.rs:285`, `midna-proto/src/system.rs`), so a terminal is named `C:\PROGRA~1\Git\usr\bin\sh.exe` and a project by its whole path. `agents.trust_folders`, `ui.status.items` and `ui.header.buttons` (`midna-proto/src/settings.rs:132,191`) and `rpc/script.rs:124` want a leading `/`. `rpc/project.rs:66` matches a project with `"{}/"`, so a subfolder becomes a project of its own, and worktree paths git prints as `C:/…` aren't canonicalised. 17 tests across approvals, auto_name, daemon, local_triggers, notify and system fail on these.
+   - **`.cmd` agents get broken arguments.** A `.cmd` runs as `cmd /d /s /c "…"`, and cmd drops every argument after a newline (Claude's system hint) and acts on `|`, `<`, `>` and `&` inside them (Codex's hint). npm's `claude.cmd` and `codex.cmd` are affected the same way (agent_args, global_hooks).
+   - **Agent calls are slow:** about 20 ms an agent RPC and 130 ms an `agent.hook` alone (a human call takes under 1 ms), 0.5–1 s a hook with a few terminals running. Resume's usage-limit tests run out their few-second windows in parallel and pass with `--test-threads=1`.
+   - **ConPTY on Windows 10** drops faint text (SGR 2), so Claude's dim placeholder reads as typed text and a queued restart waits forever (restart_queue). It also clears a new terminal's screen, so an exited agent's last screen isn't kept above its shell (shell_on_exit). It keeps an app's kitty keyboard push, and probably its mouse mode, to itself (prompt jumps in a full-screen view fail; the tests now expect legacy keys). Its first title is the program's path.
+   - **One handle leaks** per terminal open and close (`resources.rs`: 146 → 346 over 200 cycles).
+   - **Intermittent: typed input gets lost.** Bytes sent to a fresh Git Bash terminal sometimes go missing: the first (`stream_attach_frames_roundtrip` once read `cho streamed-…`), a `\0` typed in a command, or the final Enter (`stream_keys_scroll_and_selection` fails about two runs in three). `steps_for_a_refused_prompt_clear_it_from_the_input_box` and `apps_register_their_own_link_patterns` fail now and then too.
 3. **Typed agents in PowerShell and cmd.** The adopt shims are sh scripts without an extension, which only Git Bash runs. PowerShell and cmd need `claude.cmd` / `codex.cmd` (`midna.exe shim claude %*`; `is_shim` already recognises them).
 4. **Shell integration.** `init.bash`, zsh and fish are wired up by shell name (`/`-separated, no `.exe`), so Git Bash terminals get none yet. PowerShell has no integration (prompt marks, cwd reports) at all.
 5. **Daemon lifecycle.** There's no autostart (a Run key or Task Scheduler entry), no installer or updater, and no in-place upgrade. Upgrading keeping terminals alive would need a separate pty-host process that owns the ConPTYs.

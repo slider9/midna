@@ -2,11 +2,11 @@
 //! human/agent boundary, view-only agent streams, and agents answering permission prompts.
 //! Each test runs an in-process daemon on a temp MIDNA_HOME (see common/mod.rs).
 mod common;
-use common::{TestDaemon, call, call_err, open_sh, read, wait_for};
+use common::{TestDaemon, call, call_err, open_sh, read, send_line_exe, sh_word, wait_for};
 use midna_proto::error::{CONFLICT, HUMAN_ONLY, PARSE_ERROR, REFUSED};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+use midna_proto::ipc::UnixStream;
 use std::time::Duration;
 
 fn raw(d: &TestDaemon) -> UnixStream {
@@ -146,10 +146,12 @@ fn a_terminal_can_only_speak_for_itself() {
     call(&mut h, "session.resize", json!({ "id": a, "cols": 400, "rows": 40 }));
     let sock = d.socket();
     let req = |claim: &str, msg: &str| {
-        format!(
-            "printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"needs_you.raise\",\"params\":{{\"kind\":\"note\",\"message\":\"{msg}\",\"caller\":{{\"session\":\"{claim}\"}}}}}}' | nc -U {} -w 2",
-            sock.display()
-        )
+        let line = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"needs_you.raise","params":{{"kind":"note","message":"{msg}","caller":{{"session":"{claim}"}}}}}}"#);
+        // Windows' Git Bash has no `nc -U`: helper_send_line sends the line instead.
+        if cfg!(windows) {
+            return format!("MIDNA_TEST_SOCKET={} MIDNA_TEST_LINE='{line}' {} --exact helper_send_line --ignored --nocapture", sh_word(&sock), sh_word(send_line_exe()));
+        }
+        format!("printf '%s\\n' '{line}' | nc -U {} -w 2", sock.display())
     };
     // From inside A, claiming B: refused.
     call(&mut h, "session.input", json!({ "id": a, "text": req(&b, "spoofed"), "enter": true }));
@@ -164,6 +166,13 @@ fn a_terminal_can_only_speak_for_itself() {
     let items = call(&mut h, "needs_you.list", json!({}));
     assert!(!items.as_array().unwrap().iter().any(|n| n["title"] == "spoofed"), "{items}");
     assert_eq!(REFUSED, 1);
+}
+
+/// `nc -U` on Windows, run inside a terminal by `a_terminal_can_only_speak_for_itself`.
+#[test]
+#[ignore]
+fn helper_send_line() {
+    common::send_line()
 }
 
 /// Helper run *inside* a terminal by `gui_binary_inside_a_terminal_is_an_agent`: connects as
@@ -185,7 +194,7 @@ fn gui_binary_inside_a_terminal_is_an_agent() {
     assert_eq!(call(&mut h, "daemon.info", json!({}))["role"], "human");
     let id = open_sh(&mut h);
     let exe = std::env::current_exe().unwrap();
-    let cmd = format!("MIDNA_TEST_SOCKET={} {} --exact helper_print_role --ignored --nocapture", d.socket().display(), exe.display());
+    let cmd = format!("MIDNA_TEST_SOCKET={} {} --exact helper_print_role --ignored --nocapture", sh_word(d.socket()), sh_word(exe));
     call(&mut h, "session.input", json!({ "id": id, "text": cmd, "enter": true }));
     let out = wait_for(20, "helper output", || {
         let t = read(&mut h, &id);
@@ -263,6 +272,9 @@ fn only_the_human_or_a_trusted_client_answers_a_question() {
     assert_eq!(e.code, HUMAN_ONLY, "{e:?}");
 }
 
+// File modes are Unix only. On Windows midna's files are private by living under
+// %LOCALAPPDATA% (`sys::set_private` does nothing there).
+#[cfg(unix)]
 #[test]
 fn socket_and_home_are_private() {
     use std::os::unix::fs::PermissionsExt;

@@ -8,7 +8,22 @@ ctrl-c (`\\x03` or kitty `CSI 99;5 u`) clears it.
 import os
 import re
 import sys
-import tty
+try:
+    import tty
+except ImportError:  # Windows
+    tty = None
+
+
+def setraw():
+    """Raw keys: tty on Unix. Windows has no termios: the console gets VT input without line
+    input, echo or ctrl-c handling, and VT output, which is how Claude Code reads keys there."""
+    if tty:
+        tty.setraw(0)
+        return
+    import ctypes
+    k = ctypes.windll.kernel32
+    k.SetConsoleMode(k.GetStdHandle(-10), 0x200)
+    k.SetConsoleMode(k.GetStdHandle(-11), 7)
 
 out = sys.stdout
 sent = []
@@ -26,7 +41,7 @@ def draw():
 
 def main():
     global box
-    tty.setraw(0)
+    setraw()
     out.write("\x1b[?1049h\x1b[?2004h")
     draw()
     pending = ""

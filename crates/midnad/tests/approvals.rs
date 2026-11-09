@@ -61,7 +61,7 @@ fn approval_is_withdrawn_when_the_asker_goes_away() {
     assert!(approvals(&mut h).is_empty());
 
     // Its connection drops (the hook process was killed): the item goes within a second or so.
-    let mut s = std::os::unix::net::UnixStream::connect(d.socket()).unwrap();
+    let mut s = midna_proto::ipc::UnixStream::connect(d.socket()).unwrap();
     let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "policy.request", "params": { "caller": { "role": "agent" }, "action": { "kind": "command", "value": "deploy staging" }, "timeout_secs": 30 } });
     s.write_all(format!("{req}\n").as_bytes()).unwrap();
     let item = wait_approval(&mut h);
@@ -149,11 +149,11 @@ fn no_wait_returns_the_needs_you_id_and_finishes_later() {
 fn agents_may_remove_projects_their_open_created() {
     let d = TestDaemon::start();
     let mut h = d.human();
-    let dir = PathBuf::from(format!("/tmp/midna-auto-{}", std::process::id()));
+    let dir = tmp().join(format!("midna-auto-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut a = d.agent(None);
-    let s = call(&mut a, "session.open", json!({ "kind": "shell", "cwd": dir, "command": ["/bin/sh"] }));
+    let s = call(&mut a, "session.open", json!({ "kind": "shell", "cwd": dir, "command": [sh()] }));
     let (sid, pid) = (s["id"].as_str().unwrap().to_string(), s["project_id"].as_str().unwrap().to_string());
     let p = call(&mut h, "project.list", json!({})).as_array().unwrap().iter().find(|p| p["id"] == pid.as_str()).cloned().unwrap();
     assert_eq!(p["auto_created"], true);
@@ -179,30 +179,54 @@ struct FakeTrust {
 
 impl FakeTrust {
     fn new(tag: &str) -> FakeTrust {
-        let dir = PathBuf::from(format!("/tmp/midna-trust-{tag}-{}", std::process::id()));
+        let dir = tmp().join(format!("midna-trust-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let fixture = format!("{}/tests/fixtures/claude-2.1.288-trust-folder.screen.txt", env!("CARGO_MANIFEST_DIR"));
+        // Raw input: `tty` on Unix. Windows has no termios: its console gets VT output and VT
+        // input without line input or echo, which is how Claude Code reads keys there.
+        let (vt, raw) = if cfg!(windows) {
+            ("import ctypes; k = ctypes.windll.kernel32; k.SetConsoleMode(k.GetStdHandle(-11), 7)", "k.SetConsoleMode(k.GetStdHandle(-10), 0x200)")
+        } else {
+            ("", "import tty; tty.setraw(0)")
+        };
+        // Debug-quoted paths are Python string literals, Windows backslashes included.
         let script = format!(
             "#!/usr/bin/env python3\n\
-             import os, sys, tty\n\
-             screen = [l.rstrip() for l in open('{fixture}').read().splitlines()]\n\
+             import os, sys\n\
+             {vt}\n\
+             screen = [l.rstrip() for l in open({fixture:?}, encoding='utf-8').read().splitlines()]\n\
              while screen and not screen[-1]: screen.pop()\n\
              sys.stdout.write('\\x1b[H\\x1b[2J' + '\\r\\n'.join(screen)); sys.stdout.flush()\n\
-             tty.setraw(0)\n\
+             {raw}\n\
              while True:\n\
              \x20   b = os.read(0, 64)\n\
              \x20   if not b: break\n\
-             \x20   open('{d}/keys', 'ab').write(b)\n\
-             \x20   if b'\\r' in b and b'\\x1b[B' not in open('{d}/keys', 'rb').read(): break\n\
+             \x20   open({keys:?}, 'ab').write(b)\n\
+             \x20   if b'\\r' in b and b'\\x1b[B' not in open({keys:?}, 'rb').read(): break\n\
              \x20   if b'\\r' in b:\n\
              \x20       sys.stdout.write('\\x1b[H\\x1b[2J  welcome\\r\\n> '); sys.stdout.flush()\n",
-            d = dir.display()
+            keys = dir.join("keys")
         );
         let bin = dir.join("claude");
-        std::fs::write(&bin, script).unwrap();
-        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        }
+        // Windows runs no script by its shebang: `claude.cmd` starts Python on it.
+        #[cfg(windows)]
+        {
+            std::fs::write(bin.with_extension("py"), script).unwrap();
+            std::fs::write(bin.with_extension("cmd"), format!("@{} \"{}\"\r\n", python(), bin.with_extension("py").display())).unwrap();
+        }
         FakeTrust { dir }
+    }
+
+    /// The program to start as `claude`.
+    fn bin(&self) -> String {
+        let bin = self.dir.join("claude");
+        if cfg!(windows) { bin.with_extension("cmd") } else { bin }.to_string_lossy().into_owned()
     }
 
     fn keys(&self) -> Vec<u8> {
@@ -219,10 +243,10 @@ impl Drop for FakeTrust {
 #[test]
 fn folder_trust_dialog_is_a_needs_you_item() {
     let fake = FakeTrust::new("item");
-    let bin = fake.dir.join("claude").to_string_lossy().into_owned();
+    let bin = fake.bin();
     let d = TestDaemon::start_with(move |c| c.agent_bin = Some(bin));
     let mut h = d.human();
-    let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp" }))["id"].as_str().unwrap().to_string();
+    let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": tmp() }))["id"].as_str().unwrap().to_string();
     let item = wait_for(10, "trust item", || {
         call(&mut h, "needs_you.list", json!({ "session_id": sid })).as_array().unwrap().iter().find(|n| n["kind"] == "permission_prompt").cloned()
     });
@@ -240,20 +264,20 @@ fn folder_trust_dialog_is_a_needs_you_item() {
     std::thread::sleep(std::time::Duration::from_millis(3500));
     assert!(call(&mut h, "needs_you.list", json!({ "session_id": sid })).as_array().unwrap().is_empty(), "not raised again once answered");
     // Trusting it saves the folder.
-    assert_eq!(call(&mut h, "settings.get", json!({ "key": "agents.trust_folders" }))["value"], json!(["/tmp"]));
+    assert_eq!(call(&mut h, "settings.get", json!({ "key": "agents.trust_folders" }))["value"], json!([tmp()]));
 }
 
 #[test]
 fn trust_folders_answers_yes_without_asking() {
     let fake = FakeTrust::new("auto");
-    let bin = fake.dir.join("claude").to_string_lossy().into_owned();
+    let bin = fake.bin();
     let cwd = fake.dir.to_string_lossy().into_owned();
     let d = TestDaemon::start_with(move |c| c.agent_bin = Some(bin));
     let mut h = d.human();
     // Agents can't widen it themselves: that asks the human.
-    let err = call_err(&mut d.agent(None), "settings.set", json!({ "key": "agents.trust_folders", "value": "/tmp" }));
+    let err = call_err(&mut d.agent(None), "settings.set", json!({ "key": "agents.trust_folders", "value": tmp() }));
     assert_eq!(err.code, HUMAN_ONLY);
-    call(&mut h, "settings.set", json!({ "key": "agents.trust_folders", "value": "/tmp/midna-trust-auto-*" }));
+    call(&mut h, "settings.set", json!({ "key": "agents.trust_folders", "value": tmp().join("midna-trust-auto-*") }));
     let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": cwd }))["id"].as_str().unwrap().to_string();
     wait_for(10, "keys typed", || (fake.keys() == b"\x1b[B\r").then_some(()));
     let items = call(&mut h, "needs_you.list", json!({ "session_id": sid }));
@@ -267,11 +291,11 @@ fn trust_folders_answers_yes_without_asking() {
 #[test]
 fn trust_folders_answers_again_after_a_restart() {
     let fake = FakeTrust::new("restart");
-    let bin = fake.dir.join("claude").to_string_lossy().into_owned();
+    let bin = fake.bin();
     let cwd = fake.dir.to_string_lossy().into_owned();
     let d = TestDaemon::start_with(move |c| c.agent_bin = Some(bin));
     let mut h = d.human();
-    call(&mut h, "settings.set", json!({ "key": "agents.trust_folders", "value": "/tmp/midna-trust-restart-*" }));
+    call(&mut h, "settings.set", json!({ "key": "agents.trust_folders", "value": tmp().join("midna-trust-restart-*") }));
     let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": cwd }))["id"].as_str().unwrap().to_string();
     wait_for(10, "keys typed", || (fake.keys() == b"\x1b[B\r").then_some(()));
     call(&mut d.agent(Some(&sid)), "agent.hook", json!({ "agent": "claude", "event": "SessionStart", "payload": { "session_id": "conv-1" } }));
@@ -284,7 +308,7 @@ fn trust_folders_answers_again_after_a_restart() {
 #[test]
 fn denying_trust_saves_nothing() {
     let fake = FakeTrust::new("deny");
-    let bin = fake.dir.join("claude").to_string_lossy().into_owned();
+    let bin = fake.bin();
     let cwd = fake.dir.to_string_lossy().into_owned();
     let d = TestDaemon::start_with(move |c| c.agent_bin = Some(bin));
     let mut h = d.human();
@@ -303,7 +327,7 @@ fn denying_trust_saves_nothing() {
 /// the agent has had time to exit (or not).
 fn answer_in_terminal(tag: &str, keys: &str) -> (Value, Value) {
     let fake = FakeTrust::new(tag);
-    let bin = fake.dir.join("claude").to_string_lossy().into_owned();
+    let bin = fake.bin();
     let cwd = fake.dir.to_string_lossy().into_owned();
     let d = TestDaemon::start_with(move |c| c.agent_bin = Some(bin));
     let mut h = d.human();
@@ -400,10 +424,10 @@ fn a_setting_change_shows_both_values_and_saves_the_humans_edit() {
 
 #[test]
 fn a_global_ask_steps_aside_for_tools_the_human_launched_the_agent_with() {
-    let d = TestDaemon::start_with(|c| c.agent_bin = Some("/bin/cat".into()));
+    let d = TestDaemon::start_with(|c| c.agent_bin = Some(posix_bin("cat")));
     let mut h = d.human();
     let slack = "mcp__claude_ai_Slack__slack_send_message";
-    let open = |c: &mut Client| call(c, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp", "agent_args": ["--allowedTools", slack] }))["id"].clone();
+    let open = |c: &mut Client| call(c, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": tmp(), "agent_args": ["--allowedTools", slack] }))["id"].clone();
     let mine = open(&mut h);
     call(&mut h, "rule.add", json!({ "effect": "ask", "matcher": { "kind": "tool", "pattern": "mcp__claude_ai_Slack__*" } }));
     let check = |c: &mut Client, sid: &Value, tool: &str| {

@@ -7,23 +7,40 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// `ps` state letter(s) of a process (`T` = stopped), or None once it's gone.
+/// `ps` state letter(s) of a process (`T` = stopped), or None once it's gone. Windows has no
+/// `ps` states: `T` there when every thread is suspended (midna pauses with NtSuspendProcess),
+/// else `S`.
 fn state(pid: i64) -> Option<String> {
+    #[cfg(unix)]
     let o = Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().ok()?;
+    #[cfg(windows)]
+    let o = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        .arg(format!(
+            "$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue; if ($p) {{ if (@($p.Threads | Where-Object {{ $_.ThreadState -ne 'Wait' -or $_.WaitReason -ne 'Suspended' }}).Count -eq 0) {{ 'T' }} else {{ 'S' }} }}"
+        ))
+        .output()
+        .ok()?;
     let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
     (!s.is_empty()).then_some(s)
 }
 
 /// A shell terminal running `sleep 300` as a child; (terminal id, shell pid, sleep pid).
+/// Windows: `cmd` running `ping`, a native tree. Git's `sh` starts a child the Cygwin way (fork,
+/// then exec in a new process), so its `sleep` has no Windows parent left to be found by.
 fn sleeper(h: &mut Client) -> (String, i64, i64) {
-    let s = call(h, "session.open", json!({ "kind": "shell", "cwd": "/tmp", "command": ["/bin/sh", "-c", "sleep 300 & wait"] }));
+    #[cfg(unix)]
+    let (command, child) = (json!([sh(), "-c", "sleep 300 & wait"]), "sleep");
+    #[cfg(windows)]
+    let (command, child) = (json!(["cmd", "/d", "/c", "ping", "-n", "300", "127.0.0.1"]), "PING");
+    let s = call(h, "session.open", json!({ "kind": "shell", "cwd": tmp(), "command": command }));
     let id = s["id"].as_str().unwrap().to_string();
     let procs = wait_for(10, "the sleep child", || {
         let p = call(h, "session.processes", json!({ "id": id }));
-        p.as_array().filter(|a| a.iter().any(|p| p["name"] == "sleep")).cloned()
+        p.as_array().filter(|a| a.iter().any(|p| p["name"] == child)).cloned()
     });
     let pid = |name: &str| procs.iter().find(|p| p["name"] == name).unwrap()["pid"].as_i64().unwrap();
-    (id, procs[0]["pid"].as_i64().unwrap(), pid("sleep"))
+    (id, procs[0]["pid"].as_i64().unwrap(), pid(child))
 }
 
 #[test]
@@ -88,7 +105,7 @@ struct Repo {
 
 impl Repo {
     fn new(tag: &str) -> Repo {
-        let root = PathBuf::from(format!("/tmp/midna-wt-{}-{tag}", std::process::id()));
+        let root = tmp().join(format!("midna-wt-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("main")).unwrap();
         let r = Repo { root };
@@ -115,7 +132,7 @@ impl Repo {
     fn add(&self, name: &str) -> String {
         self.git("main", &["worktree", "add", "-q", "-b", name, &self.wt(name).to_string_lossy()]);
         // git reports the realpath (/private/tmp on macOS).
-        std::fs::canonicalize(self.wt(name)).unwrap().to_string_lossy().into_owned()
+        midna_proto::paths::canonical(self.wt(name)).unwrap().to_string_lossy().into_owned()
     }
 }
 
@@ -139,13 +156,13 @@ fn worktrees_are_cleaned_only_when_idle_unused_clean_and_unlocked() {
     let d = TestDaemon::start();
     let mut h = d.human();
     // A terminal in the main checkout makes midna watch the repo.
-    call(&mut h, "session.open", json!({ "kind": "shell", "cwd": repo.main(), "command": ["/bin/sh"] }));
+    call(&mut h, "session.open", json!({ "kind": "shell", "cwd": repo.main(), "command": [sh()] }));
     let idle = repo.add("idle");
     let used = repo.add("used");
     let dirty = repo.add("dirty");
     let stale_lock = repo.add("stale");
     let live_lock = repo.add("live");
-    call(&mut h, "session.open", json!({ "kind": "shell", "cwd": used, "command": ["/bin/sh"] }));
+    call(&mut h, "session.open", json!({ "kind": "shell", "cwd": used, "command": [sh()] }));
     std::fs::write(Path::new(&dirty).join("a.txt"), "changed\n").unwrap();
     repo.git("main", &["worktree", "lock", "--reason", "claude agent agent-x (pid 999999 start Fri Oct  9 02:01:00 2026)", &stale_lock]);
     let me = std::process::id();

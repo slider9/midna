@@ -5,10 +5,8 @@ use common::*;
 use serde_json::{Value, json};
 
 fn fake_agent() -> std::path::PathBuf {
-    let bin = std::path::PathBuf::from(format!("/tmp/midna-replace-{}.sh", std::process::id()));
-    std::fs::write(&bin, "#!/bin/sh\nfor a; do echo \"ARG:$a\"; done\necho DONE\nsleep 30\n").unwrap();
-    std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    bin
+    let bin = tmp().join(format!("midna-replace-{}.sh", std::process::id()));
+    script(&bin, "for a; do echo \"ARG:$a\"; done\necho DONE\nsleep 30\n").into()
 }
 
 fn argv(h: &mut midna_proto::Client, sid: &str) -> Vec<String> {
@@ -53,7 +51,7 @@ fn an_agent_is_replaced_in_place_with_a_new_conversation() {
     let args = argv(&mut h, &new);
     assert!(args.windows(2).any(|w| w == ["--model", "opus"]), "{args:?}");
     assert!(!args.iter().any(|a| a == "go"), "the first prompt isn't sent again: {args:?}");
-    let _ = std::fs::remove_file(bin);
+    remove_script(bin);
 }
 
 #[test]
@@ -67,6 +65,6 @@ fn a_shell_is_replaced_and_an_agent_needs_force_while_it_works() {
     assert!(e.message.contains("force"), "{e:?}");
     let s = call(&mut h, "session.replace", json!({ "id": old }));
     assert_eq!(s["kind"], "shell");
-    assert_eq!(s["command"], json!(["/bin/sh"]));
+    assert_eq!(s["command"], json!([sh()]));
     assert_eq!(ids(&mut h), [s["id"].as_str().unwrap().to_string()]);
 }

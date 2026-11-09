@@ -1,6 +1,7 @@
 //! `midna mcp` driven over stdio like a real MCP client, against an in-process daemon on a
 //! temp MIDNA_HOME. The MCP server runs "inside" a midna terminal (MIDNA_SESSION set), as it
 //! does for agents midna launches, and does a realistic agent workflow through MCP only.
+mod common;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -18,7 +19,7 @@ struct D {
 
 impl D {
     fn start() -> D {
-        let home = PathBuf::from(format!("/tmp/midna-m-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let home = common::tmp().join(format!("midna-m-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&home);
         let mut cfg = midnad::Config::for_home(home.clone());
         cfg.app_path = Some(std::env::current_exe().unwrap().to_string_lossy().into_owned());
@@ -224,7 +225,7 @@ fn a_terminal_listing_stays_small_with_a_long_launch_command() {
     std::fs::create_dir_all(&dir).unwrap();
     let project = human.call_value("project.add", json!({ "path": dir, "name": "demo" })).unwrap();
     let marker = "launch-marker-".repeat(600);
-    let command = json!(["/bin/sh", "-c", format!("sleep 60 # {marker}")]);
+    let command = json!([common::sh(), "-c", format!("sleep 60 # {marker}")]);
     let long = "n".repeat(4000);
     let params = json!({ "project_id": project["id"], "kind": "shell", "command": command, "name": long });
     let s = human.call_value("session.open", params).unwrap();
@@ -264,7 +265,7 @@ fn agent_workflow_through_mcp_only() {
     std::fs::create_dir_all(&dir).unwrap();
     let project = human.call_value("project.add", json!({ "path": dir, "name": "demo" })).unwrap();
     let pid = project["id"].as_str().unwrap().to_string();
-    let me = human.call_value("session.open", json!({ "project_id": pid, "kind": "shell", "command": ["/bin/sh"], "name": "agent" })).unwrap();
+    let me = human.call_value("session.open", json!({ "project_id": pid, "kind": "shell", "command": [common::sh()], "name": "agent" })).unwrap();
     let me = me["id"].as_str().unwrap().to_string();
 
     let mut m = Mcp::spawn(&d.sock(), Some(&me));
@@ -278,7 +279,7 @@ fn agent_workflow_through_mcp_only() {
     assert_eq!(projects[0]["id"], pid.as_str());
 
     // Open a shell (defaults to my project), run a command, read the output.
-    let sh = m.ok("session_open", json!({ "kind": "shell", "command": ["/bin/sh"], "name": "build" }));
+    let sh = m.ok("session_open", json!({ "kind": "shell", "command": [common::sh()], "name": "build" }));
     let sid = sh["id"].as_str().unwrap().to_string();
     assert_eq!(sh["project_id"], pid.as_str());
     m.ok("session_input", json!({ "id": sid, "text": "echo mcp-$((2+3))", "enter": true }));
@@ -356,7 +357,7 @@ fn compact_mode_search_describe_call() {
     let project = human.call_value("project.add", json!({ "path": dir, "name": "demo" })).unwrap();
     let pid = project["id"].as_str().unwrap().to_string();
     let open = |human: &mut midna_proto::Client, name: &str| -> String {
-        let s = human.call_value("session.open", json!({ "project_id": pid, "kind": "shell", "command": ["/bin/sh"], "name": name })).unwrap();
+        let s = human.call_value("session.open", json!({ "project_id": pid, "kind": "shell", "command": [common::sh()], "name": name })).unwrap();
         s["id"].as_str().unwrap().to_string()
     };
     let me = open(&mut human, "agent");
@@ -381,7 +382,7 @@ fn compact_mode_search_describe_call() {
     assert!(open.contains("the `call` tool"), "{open}");
     let schema: Value = serde_json::from_str(open.split_once("Params (JSON Schema): ").unwrap().1).unwrap();
     assert!(schema["properties"]["kind"].is_object(), "{open}");
-    let sh = m.ok("call", json!({ "method": "session.open", "params": { "kind": "shell", "command": ["/bin/sh"], "name": "build" } }));
+    let sh = m.ok("call", json!({ "method": "session.open", "params": { "kind": "shell", "command": [common::sh()], "name": "build" } }));
     let sid = sh["id"].as_str().unwrap().to_string();
     assert_eq!(sh["project_id"], pid.as_str());
     m.ok("call", json!({ "method": "session_input", "params": { "id": sid, "text": "echo mcp-$((2+3))", "enter": true } }));

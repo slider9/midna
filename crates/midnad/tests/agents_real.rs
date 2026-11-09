@@ -137,12 +137,21 @@ fn input_enter_follows_kitty_keyboard_mode() {
     let open = |h: &mut Client, kitty: bool| {
         let push = if kitty { r"printf '\033[>1u';" } else { "" };
         let script = format!("{push} stty raw -echo; dd bs=1 count=6 2>/dev/null | od -An -c; sleep 5");
-        let s = call(h, "session.open", json!({ "kind": "shell", "cwd": "/tmp", "command": ["/bin/sh", "-c", script] }));
+        let s = call(h, "session.open", json!({ "kind": "shell", "cwd": tmp(), "command": [sh(), "-c", script] }));
         s["id"].as_str().unwrap().to_string()
     };
     let kitty = open(&mut h, true);
     let legacy = open(&mut h, false);
     std::thread::sleep(std::time::Duration::from_millis(500));
+    if cfg!(windows) {
+        // ConPTY keeps the app's push to itself (it has no kitty keys to give an app), so midnad
+        // never sees it and Enter stays a CR.
+        call(&mut h, "session.input", json!({ "id": kitty, "text": "abcde", "enter": true }));
+        call(&mut h, "session.input", json!({ "id": legacy, "text": "abcde", "enter": true }));
+        wait_for(5, "kitty enter", || read(&mut h, &kitty).contains("e  \\r").then_some(()));
+        wait_for(5, "legacy enter", || read(&mut h, &legacy).contains("e  \\r").then_some(()));
+        return;
+    }
     call(&mut h, "session.input", json!({ "id": kitty, "text": "a", "enter": true }));
     call(&mut h, "session.input", json!({ "id": legacy, "text": "abcde", "enter": true }));
     wait_for(5, "kitty enter", || read(&mut h, &kitty).contains("033   [   1   3   u").then_some(()));
@@ -157,11 +166,20 @@ fn input_submits_by_default_and_on_a_trailing_newline() {
     let mut h = d.human();
     let open = |h: &mut Client| {
         let script = r"printf '\033[>1u'; stty raw -echo; dd bs=1 count=6 2>/dev/null | od -An -c; sleep 5";
-        let s = call(h, "session.open", json!({ "kind": "shell", "cwd": "/tmp", "command": ["/bin/sh", "-c", script] }));
+        let s = call(h, "session.open", json!({ "kind": "shell", "cwd": tmp(), "command": [sh(), "-c", script] }));
         s["id"].as_str().unwrap().to_string()
     };
     let (default, newline) = (open(&mut h), open(&mut h));
     std::thread::sleep(std::time::Duration::from_millis(500));
+    if cfg!(windows) {
+        // ConPTY keeps the app's kitty push to itself, so Enter is a CR there (and a trailing
+        // newline is that CR, never an LF). Five letters fill dd's 6 bytes.
+        call(&mut h, "session.input", json!({ "id": default, "text": "abcde" }));
+        call(&mut h, "session.input", json!({ "id": newline, "text": "bcdef\n", "enter": false }));
+        wait_for(5, "default enter", || read(&mut h, &default).contains("e  \\r").then_some(()));
+        wait_for(5, "newline enter", || read(&mut h, &newline).contains("f  \\r").then_some(()));
+        return;
+    }
     call(&mut h, "session.input", json!({ "id": default, "text": "a" }));
     call(&mut h, "session.input", json!({ "id": newline, "text": "b\n", "enter": false }));
     wait_for(5, "default enter", || read(&mut h, &default).contains("a 033   [   1   3   u").then_some(()));

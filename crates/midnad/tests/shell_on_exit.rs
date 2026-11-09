@@ -7,14 +7,12 @@ use serde_json::{Value, json};
 
 /// A fake agent that prints a line and exits.
 fn fake_agent(tag: &str) -> String {
-    let bin = std::path::PathBuf::from(format!("/tmp/midna-soe-{}-{tag}.sh", std::process::id()));
-    std::fs::write(&bin, "#!/bin/sh\necho AGENT-BYE\nsleep 0.3\n").unwrap();
-    std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    bin.to_string_lossy().into_owned()
+    script(tmp().join(format!("midna-soe-{}-{tag}.sh", std::process::id())), "echo AGENT-BYE\nsleep 0.3\n")
 }
 
 fn start(tag: &str) -> TestDaemon {
-    // The shell left behind is $SHELL: keep it free of the user's dotfiles.
+    // The shell left behind is $SHELL: keep it free of the user's dotfiles. Windows ignores a
+    // SHELL that isn't a Windows path, so there it's PowerShell, the default.
     unsafe { std::env::set_var("SHELL", "/bin/sh") };
     let bin = fake_agent(tag);
     TestDaemon::start_with(move |c| c.agent_bin = Some(bin))
@@ -28,17 +26,21 @@ fn get(h: &mut Client, sid: &str) -> Value {
 fn an_exited_agent_becomes_a_shell_below_its_last_screen() {
     let d = start("on");
     let mut h = d.human();
-    let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp" }))["id"].as_str().unwrap().to_string();
+    let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": tmp() }))["id"].as_str().unwrap().to_string();
     let s = wait_for(10, "the shell", || {
         let s = get(&mut h, &sid);
         (s["kind"] == "shell" && !s["pid"].is_null()).then_some(s)
     });
     assert!(s["agent"].is_null(), "{s}");
-    assert_eq!(s["command"][1], "-l", "{s}");
+    // A login shell. On Windows that's PowerShell (unless MIDNA_SHELL names another), without its banner.
+    let shell = s["command"][0].as_str().unwrap_or_default().to_ascii_lowercase();
+    let pwsh = cfg!(windows) && (shell.ends_with("powershell.exe") || shell.ends_with("pwsh.exe"));
+    assert_eq!(s["command"][1], if pwsh { "-NoLogo" } else { "-l" }, "{s}");
     assert_eq!(s["status"]["state"], "idle", "{s}");
     assert_eq!(s["status"]["reason"], "claude exited", "{s}");
     assert!(read(&mut h, &sid).contains("AGENT-BYE"), "the agent's screen carries over");
-    call(&mut h, "session.input", json!({ "id": sid, "text": "echo SHELL-$((40+2))", "enter": true }));
+    let sum = if pwsh { "echo SHELL-$(40+2)" } else { "echo SHELL-$((40+2))" };
+    call(&mut h, "session.input", json!({ "id": sid, "text": sum, "enter": true }));
     wait_for(10, "the shell to answer", || read(&mut h, &sid).contains("SHELL-42").then_some(()));
     assert!(read(&mut h, &sid).contains("AGENT-BYE"));
 }
@@ -48,7 +50,7 @@ fn off_leaves_the_agent_exited() {
     let d = start("off");
     let mut h = d.human();
     call(&mut h, "settings.set", json!({ "key": "agents.shell_on_exit", "value": false }));
-    let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp" }))["id"].as_str().unwrap().to_string();
+    let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": tmp() }))["id"].as_str().unwrap().to_string();
     wait_for(10, "exit", || (get(&mut h, &sid)["status"]["state"] == "exited").then_some(()));
     std::thread::sleep(std::time::Duration::from_millis(500));
     let s = get(&mut h, &sid);

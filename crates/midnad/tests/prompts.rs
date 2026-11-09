@@ -111,7 +111,7 @@ fn jumps_drive_a_full_screen_agent_view() {
     let d = TestDaemon::start();
     let mut h = d.human();
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake_agent_view.py");
-    let s = call(&mut h, "session.open", json!({ "kind": "shell", "cwd": "/tmp", "command": ["python3", script] }));
+    let s = call(&mut h, "session.open", json!({ "kind": "shell", "cwd": tmp(), "command": [python(), script] }));
     let sid = s["id"].as_str().unwrap().to_string();
     call(&mut h, "session.resize", json!({ "id": sid, "cols": 80, "rows": 24 }));
     wait_for(10, "the view", || screen(&mut h, &sid).iter().any(|l| l.contains("reply 6.25")).then_some(()));

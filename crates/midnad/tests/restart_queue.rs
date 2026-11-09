@@ -14,13 +14,12 @@ struct FakeClaude {
 
 impl FakeClaude {
     fn new(tag: &str) -> FakeClaude {
-        let dir = PathBuf::from(format!("/tmp/midna-fake-{}-{tag}", std::process::id()));
+        let dir = tmp().join(format!("midna-fake-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let rule = "─".repeat(40);
-        let script = format!(
-            "#!/bin/sh\n\
-             case \"$1\" in --version) cat '{d}/installed'; exit 0;; esac\n\
+        let body = format!(
+            "case \"$1\" in --version) cat '{d}/installed'; exit 0;; esac\n\
              echo \"$@\" >> '{d}/argv'\n\
              [ -f '{d}/notice' ] && printf '%30s\\342\\234\\224 Update installed \\302\\267 Restart to update\\n' ''\n\
              printf '\\033[38;2;136;136;136m%s\\033[39m\\n\\342\\235\\257\\302\\240\\033[2mTry \"fix lint errors\"\\033[22m\\n\\033[38;2;136;136;136m%s\\033[39m\\n' '{rule}' '{rule}'\n\
@@ -28,15 +27,15 @@ impl FakeClaude {
              sleep 300 & wait $!\n",
             d = dir.display()
         );
-        let bin = dir.join("claude");
-        std::fs::write(&bin, script).unwrap();
-        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        script(dir.join("claude"), &body);
         std::fs::write(dir.join("installed"), "2.1.289 (Claude Code)\n").unwrap();
         FakeClaude { dir }
     }
 
+    /// What `script` made: `claude`, or `claude.cmd` on Windows.
     fn bin(&self) -> String {
-        self.dir.join("claude").to_string_lossy().into_owned()
+        let bin = self.dir.join("claude");
+        if cfg!(windows) { bin.with_extension("cmd") } else { bin }.to_string_lossy().into_owned()
     }
 
     fn launches(&self) -> Vec<String> {
@@ -78,7 +77,7 @@ fn queued_restart_waits_for_background_work_then_resumes() {
     let d = TestDaemon::start_with(move |c| c.agent_bin = Some(bin));
     let mut h = d.human();
     call(&mut h, "settings.set", json!({ "key": "agents.restart_idle_secs", "value": 0 }));
-    let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp", "prompt": "do the thing" }))["id"].as_str().unwrap().to_string();
+    let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": tmp(), "prompt": "do the thing" }))["id"].as_str().unwrap().to_string();
     wait_for(5, "fake claude started", || (fake.launches().len() == 1).then_some(()));
     assert!(fake.launches()[0].ends_with("do the thing"), "{:?}", fake.launches());
     let mut a = d.agent(Some(&sid));
@@ -168,7 +167,7 @@ fn on_screen_update_notice_is_offered_without_a_status_line() {
     call(&mut h, "settings.set", json!({ "key": "agents.restart_idle_secs", "value": 0 }));
     fake.show_notice();
     fake.install("2.1.290");
-    let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp" }))["id"].as_str().unwrap().to_string();
+    let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": tmp() }))["id"].as_str().unwrap().to_string();
     wait_for(5, "fake claude started", || (fake.launches().len() == 1).then_some(()));
     let mut a = d.agent(Some(&sid));
     // The user's own status line: midna never hears a version.
@@ -215,7 +214,7 @@ fn cancel_and_exit_drop_a_queued_restart() {
     let mut h = d.human();
     // The agent's exit below should end the terminal, not drop it to a shell.
     call(&mut h, "settings.set", json!({ "key": "agents.shell_on_exit", "value": false }));
-    let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp" }))["id"].as_str().unwrap().to_string();
+    let sid = call(&mut h, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": tmp() }))["id"].as_str().unwrap().to_string();
     wait_for(5, "fake claude started", || (fake.launches().len() == 1).then_some(()));
     let mut a = d.agent(Some(&sid));
     hook(&mut a, "SessionStart", json!({ "session_id": "conv-1", "source": "startup" }));
@@ -234,7 +233,7 @@ fn cancel_and_exit_drop_a_queued_restart() {
     // Queued, then the agent exits: the queue goes with it.
     call(&mut h, "session.restart", json!({ "id": sid, "when": "idle" }));
     let pid = call(&mut h, "session.get", json!({ "id": sid }))["pid"].as_i64().unwrap() as i32;
-    unsafe { libc::kill(pid, libc::SIGTERM) };
+    midnad::sys::signal(pid, midnad::sys::Sig::Term);
     wait_for(10, "exit", || call(&mut h, "session.get", json!({ "id": sid }))["pid"].is_null().then_some(()));
     assert!(info(&mut h, &sid)["restart"].is_null());
 }

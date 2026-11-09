@@ -10,7 +10,22 @@ of the last transcript row. The input box is a `❯` row between two rules.
 import os
 import re
 import sys
-import tty
+try:
+    import tty
+except ImportError:  # Windows
+    tty = None
+
+
+def setraw():
+    """Raw keys: tty on Unix. Windows has no termios: the console gets VT input without line
+    input, echo or ctrl-c handling, and VT output, which is how Claude Code reads keys there."""
+    if tty:
+        tty.setraw(0)
+        return
+    import ctypes
+    k = ctypes.windll.kernel32
+    k.SetConsoleMode(k.GetStdHandle(-10), 0x200)
+    k.SetConsoleMode(k.GetStdHandle(-11), 7)
 
 PROMPTS, REPLY = 6, 25
 T = ["  fake agent view", ""]
@@ -42,7 +57,7 @@ def draw(top):
 
 
 def main():
-    tty.setraw(0)
+    setraw()
     out.write("\x1b[?1049h\x1b[?1000h\x1b[?1006h")
     top = draw(10**9)
     pending = b""

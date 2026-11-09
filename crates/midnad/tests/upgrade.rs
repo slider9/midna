@@ -2,14 +2,23 @@
 //! can't run in-process). Ports `spikes/daemon-reexec/test.sh` and `test_flood.sh`.
 //!
 //! Every test runs its own daemon on a temp MIDNA_HOME; this test binary is the "GUI" (human).
+//!
+//! Windows can't upgrade or restart in place (no exec; see `src/upgrade_windows.rs`), so only
+//! the tests that don't swap the binary run there, plus one that checks the refusal.
+mod common;
 use midna_proto::{Client, ClientError};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 static N: AtomicU32 = AtomicU32::new(0);
+/// The copies of midnad the daemon runs from (Windows starts programs by their `.exe`).
+const V1: &str = if cfg!(windows) { "v1.exe" } else { "v1" };
+const V2: &str = if cfg!(windows) { "v2.exe" } else { "v2" };
 
 struct Bin {
     home: PathBuf,
@@ -26,14 +35,14 @@ impl Bin {
 
     /// The daemon reports this load average.
     fn start_with_load(load1: f64) -> Bin {
-        let home = PathBuf::from(format!("/tmp/midna-u-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let home = common::tmp().join(format!("midna-u-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
-        for v in ["v1", "v2"] {
+        for v in [V1, V2] {
             std::fs::copy(env!("CARGO_BIN_EXE_midnad"), home.join(v)).unwrap();
         }
         let log = std::fs::File::create(home.join("daemon.log")).unwrap();
-        let child = Command::new(home.join("v1"))
+        let child = Command::new(home.join(V1))
             .args(["--foreground", "--home"])
             .arg(&home)
             .env_remove("MIDNA_SOCKET")
@@ -77,11 +86,14 @@ impl Bin {
         call(&mut self.human(), "daemon.info", json!({}))
     }
 
+    // Only the in-place upgrade tests (Unix only) read the log or wait for an upgrade.
+    #[cfg(unix)]
     fn log(&self) -> String {
         std::fs::read_to_string(self.home.join("daemon.log")).unwrap_or_default()
     }
 
     /// Wait for the n-th `daemon.upgraded` event and return its data.
+    #[cfg(unix)]
     fn wait_upgraded(&self, n: usize) -> Value {
         wait_for(20, "daemon.upgraded", || {
             let mut c = Client::connect(self.socket()).ok()?;
@@ -107,7 +119,7 @@ impl Drop for Bin {
             std::thread::sleep(Duration::from_millis(50));
         }
         if let Some(p) = pid {
-            unsafe { libc::kill(p as i32, libc::SIGKILL) };
+            midnad::sys::signal(p as i32, midnad::sys::Sig::Kill);
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -132,29 +144,36 @@ fn wait_for<T>(secs: u64, what: &str, mut f: impl FnMut() -> Option<T>) -> T {
     }
 }
 
+// The helpers from here to the tests serve the in-place upgrade tests, which are Unix only.
+#[cfg(unix)]
 fn open(c: &mut Client, kind: &str, argv: &[&str]) -> (String, i64) {
     let s = call(c, "session.open", json!({ "kind": kind, "cwd": "/tmp", "command": argv, "cols": 100, "rows": 30 }));
     (s["id"].as_str().unwrap().to_string(), s["pid"].as_i64().unwrap())
 }
 
+#[cfg(unix)]
 fn read(c: &mut Client, id: &str, lines: u32) -> String {
     call(c, "session.read", json!({ "id": id, "lines": lines }))["text"].as_str().unwrap().to_string()
 }
 
+#[cfg(unix)]
 fn screen(c: &mut Client, id: &str) -> String {
     call(c, "session.read", json!({ "id": id, "screen": true }))["text"].as_str().unwrap().to_string()
 }
 
+#[cfg(unix)]
 fn alive(pid: i64) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
 /// A loop printing `C <n>` every 50ms; its HUP trap records any hangup in `hup_file`.
+#[cfg(unix)]
 fn counter_cmd(hup_file: &str) -> String {
     format!("trap 'echo HUP >> {hup_file}' HUP; i=0; while :; do echo C $i; i=$((i+1)); sleep 0.05; done")
 }
 
 /// The `C <n>` numbers in a session's text; panics on any gap.
+#[cfg(unix)]
 fn counts(text: &str) -> Vec<u64> {
     let v: Vec<u64> = text.lines().filter_map(|l| l.strip_prefix("C ")?.trim().parse().ok()).collect();
     for w in v.windows(2) {
@@ -163,10 +182,13 @@ fn counts(text: &str) -> Vec<u64> {
     v
 }
 
+#[cfg(unix)]
 fn session(c: &mut Client, id: &str) -> Value {
     call(c, "session.get", json!({ "id": id }))
 }
 
+// In-place upgrade and restart: refused on Windows (see upgrade_and_restart_are_refused_on_windows).
+#[cfg(unix)]
 #[test]
 fn upgrade_keeps_shells_ids_screens_and_counting() {
     let d = Bin::start();
@@ -227,6 +249,8 @@ fn upgrade_keeps_shells_ids_screens_and_counting() {
     assert!(d.log().contains("resumed 2 session(s)"));
 }
 
+// In-place upgrade and restart: refused on Windows (see upgrade_and_restart_are_refused_on_windows).
+#[cfg(unix)]
 #[test]
 fn upgrade_during_flood_loses_nothing() {
     let d = Bin::start();
@@ -253,6 +277,8 @@ fn upgrade_during_flood_loses_nothing() {
     assert!(tail.lines().filter(|l| !l.is_empty() && *l != "FLOOD-DONE").all(|l| l == "y"), "{tail}");
 }
 
+// In-place upgrade and restart: refused on Windows (see upgrade_and_restart_are_refused_on_windows).
+#[cfg(unix)]
 #[test]
 fn selftest_failure_aborts_the_upgrade() {
     let d = Bin::start();
@@ -285,7 +311,7 @@ fn selftest_failure_aborts_the_upgrade() {
 fn agents_get_a_needs_you_for_upgrade() {
     let d = Bin::start();
     let mut agent = Client::connect(d.socket()).unwrap().as_agent(None);
-    let err = match agent.call_value("daemon.upgrade", json!({ "binary_path": d.path("v2") })) {
+    let err = match agent.call_value("daemon.upgrade", json!({ "binary_path": d.path(V2) })) {
         Err(ClientError::Rpc(e)) => e,
         other => panic!("expected human-only, got {other:?}"),
     };
@@ -295,6 +321,8 @@ fn agents_get_a_needs_you_for_upgrade() {
     assert!(needs.as_array().unwrap().iter().any(|n| n["detail"].as_str().unwrap_or("").contains("daemon.upgrade")), "{needs}");
 }
 
+// In-place upgrade and restart: refused on Windows (see upgrade_and_restart_are_refused_on_windows).
+#[cfg(unix)]
 #[test]
 fn watchdog_falls_back_when_the_new_binary_dies() {
     let d = Bin::start();
@@ -329,6 +357,8 @@ fn watchdog_falls_back_when_the_new_binary_dies() {
     assert!(d.log().contains("falling back"), "{}", d.log());
 }
 
+// In-place upgrade and restart: refused on Windows (see upgrade_and_restart_are_refused_on_windows).
+#[cfg(unix)]
 #[test]
 fn sigterm_restarts_in_place_and_sigint_stops_and_hangs_up() {
     let d = Bin::start();
@@ -363,6 +393,8 @@ fn sigterm_restarts_in_place_and_sigint_stops_and_hangs_up() {
     assert!(Path::new(&hup).exists(), "an explicit stop sends SIGHUP");
 }
 
+// In-place upgrade and restart: refused on Windows (see upgrade_and_restart_are_refused_on_windows).
+#[cfg(unix)]
 #[test]
 fn restart_rpc_is_a_graceful_handoff() {
     let d = Bin::start();
@@ -385,6 +417,8 @@ fn restart_rpc_is_a_graceful_handoff() {
     assert_eq!(st["exit_code"], 4, "{st}");
 }
 
+// In-place upgrade and restart: refused on Windows (see upgrade_and_restart_are_refused_on_windows).
+#[cfg(unix)]
 #[test]
 fn a_busy_mac_postpones_the_upgrade_unless_forced() {
     let cpus = std::thread::available_parallelism().unwrap().get() as f64;
@@ -414,4 +448,26 @@ fn a_busy_mac_postpones_the_upgrade_unless_forced() {
     let up = d.wait_upgraded(1);
     assert_eq!(up["fallback"], json!(false), "{up}");
     assert_eq!(d.info()["pid"].as_i64().unwrap(), pid0);
+}
+
+/// Windows has no exec, and a pseudoconsole dies with the process that made it, so midnad
+/// can't swap itself in place: the human's `daemon.upgrade` and `daemon.restart` are refused,
+/// saying what to do instead, and the daemon goes on as it was.
+#[cfg(windows)]
+#[test]
+fn upgrade_and_restart_are_refused_on_windows() {
+    let d = Bin::start();
+    let mut c = d.human();
+    let pid0 = d.info()["pid"].as_i64().unwrap();
+    for (m, p) in [("daemon.upgrade", json!({ "binary_path": d.path(V2) })), ("daemon.restart", json!({}))] {
+        let e = match c.call_value(m, p) {
+            Err(ClientError::Rpc(e)) => e,
+            other => panic!("{m}: expected a refusal, got {other:?}"),
+        };
+        assert_eq!(e.code, midna_proto::error::REFUSED, "{m}: {e:?}");
+        assert!(e.message.contains("can't upgrade or restart in place on Windows"), "{m}: {e:?}");
+    }
+    assert_eq!(d.info()["pid"].as_i64(), Some(pid0));
+    let ev = call(&mut c, "events.list", json!({ "since_seq": 0, "limit": 100, "filter": { "kinds": ["daemon.upgraded"] } }));
+    assert!(ev.as_array().unwrap().is_empty(), "{ev}");
 }

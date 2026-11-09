@@ -39,8 +39,8 @@ fn shell_session_input_read_close() {
 fn exit_codes_set_status() {
     let d = TestDaemon::start();
     let mut c = d.human();
-    let ok = call(&mut c, "session.open", json!({ "kind": "shell", "cwd": "/tmp", "command": ["/bin/sh", "-c", "exit 0"] }));
-    let bad = call(&mut c, "session.open", json!({ "kind": "monitor", "cwd": "/tmp", "command": ["/bin/sh", "-c", "echo boom; exit 3"] }));
+    let ok = call(&mut c, "session.open", json!({ "kind": "shell", "cwd": tmp(), "command": [sh(), "-c", "exit 0"] }));
+    let bad = call(&mut c, "session.open", json!({ "kind": "monitor", "cwd": tmp(), "command": [sh(), "-c", "echo boom; exit 3"] }));
     let state = |c: &mut Client, id: &Value| call(c, "session.get", json!({ "id": id }))["status"].clone();
     wait_for(5, "exit 0", || (state(&mut c, &ok["id"])["state"] == "exited").then_some(()));
     let st = wait_for(5, "exit 3", || Some(state(&mut c, &bad["id"])).filter(|s| s["state"] == "failed"));
@@ -62,7 +62,9 @@ fn osc_title_is_tracked() {
     call(&mut c, "session.input", json!({ "id": id, "text": "printf '\\033]0;hello title\\007'", "enter": true }));
     wait_for(5, "title", || (call(&mut c, "session.get", json!({ "id": id }))["title"] == "hello title").then_some(()));
     let ev = call(&mut c, "events.list", json!({ "filter": { "kinds": ["session.title"] } }));
-    assert_eq!(ev[0]["data"]["title"], "hello title");
+    // Windows: ConPTY sets the title to the program's path first.
+    let ours = if cfg!(windows) { ev.as_array().unwrap().len() - 1 } else { 0 };
+    assert_eq!(ev[ours]["data"]["title"], "hello title", "{ev}");
 }
 
 #[test]
@@ -129,7 +131,7 @@ fn rules_expire() {
 fn policy_check_precedence() {
     let d = TestDaemon::start();
     let mut h = d.human();
-    let p = call(&mut h, "project.add", json!({ "path": "/tmp" }));
+    let p = call(&mut h, "project.add", json!({ "path": tmp() }));
     let pid = p["id"].as_str().unwrap();
     let sid = open_sh(&mut h);
     let add = |h: &mut Client, effect: &str, pattern: &str, scope: Value| {
@@ -272,7 +274,9 @@ fn discover_lists_every_method() {
     assert_eq!(names.len(), midna_proto::catalog().len());
     assert_eq!(call_err(&mut d.human(), "no.such", json!({})).code, -32601);
     // An in-process daemon can't re-exec its host (tests/upgrade.rs covers the real binary).
-    assert_eq!(call_err(&mut d.human(), "daemon.upgrade", json!({ "binary_path": "/x" })).code, midna_proto::error::CONFLICT);
+    // Windows refuses any in-place upgrade (src/upgrade_windows.rs).
+    let code = if cfg!(windows) { REFUSED } else { CONFLICT };
+    assert_eq!(call_err(&mut d.human(), "daemon.upgrade", json!({ "binary_path": "/x" })).code, code);
 }
 
 #[test]
@@ -349,7 +353,9 @@ sys.stdout.write("\x1b[?1049h")
 draw()
 signal.signal(signal.SIGWINCH, draw)
 while True: time.sleep(1)"#;
-    let s = call(&mut c, "session.open", json!({ "kind": "shell", "cwd": "/tmp", "command": ["python3", "-c", app] }));
+    // Windows has no SIGWINCH: the app polls its size instead.
+    let app = if cfg!(windows) { app.replace("signal.signal(signal.SIGWINCH, draw)\nwhile True: time.sleep(1)", "while True: time.sleep(0.05); draw()") } else { app.to_string() };
+    let s = call(&mut c, "session.open", json!({ "kind": "shell", "cwd": tmp(), "command": [python(), "-c", app] }));
     let id = s["id"].as_str().unwrap().to_string();
     let mut st = d.human().attach(&id, 60, 20, 8, 16).unwrap();
     let screen = |c: &mut Client| -> Vec<String> {
@@ -603,10 +609,7 @@ fn script_run_builtins_and_custom() {
     // /tmp is not a git repo: github renders nothing.
     let r = call(&mut h, "script.run", json!({ "session_id": sid, "slot": "header" }));
     assert_eq!(r["segments"], json!([]));
-    let script = d.home.join("seg.sh");
-    std::fs::write(&script, "#!/bin/sh\necho '[{\"text\":\"hi '$MIDNA_SLOT'\",\"tone\":\"ok\"}]'\n").unwrap();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut std::fs::metadata(&script).unwrap().permissions(), 0o755);
-    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let script = script(d.home.join("seg.sh"), "echo '[{\"text\":\"hi '$MIDNA_SLOT'\",\"tone\":\"ok\"}]'\n");
     call(&mut h, "settings.set", json!({ "key": "ui.row.script", "value": script }));
     let r = call(&mut h, "script.run", json!({ "session_id": sid, "slot": "row" }));
     assert_eq!(r["segments"], json!([{ "text": "hi row", "tone": "ok" }]));
@@ -626,7 +629,7 @@ fn script_parts_show_the_worktree_and_branch() {
     git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]);
     git(&main, &["worktree", "add", "-q", "../repo-fix", "-b", "fix/login"]);
     let open = |h: &mut midna_proto::Client, cwd: &std::path::Path| {
-        call(h, "session.open", json!({ "kind": "shell", "cwd": cwd, "command": ["/bin/sh"] }))["id"].as_str().unwrap().to_string()
+        call(h, "session.open", json!({ "kind": "shell", "cwd": cwd, "command": [sh()] }))["id"].as_str().unwrap().to_string()
     };
     let (in_main, in_wt) = (open(&mut h, &main), open(&mut h, &d.home.join("repo-fix")));
     // status bar default: worktree+branch; the main checkout has no worktree segment
@@ -665,7 +668,7 @@ fn on_default_branch_opens_in_the_checkout_that_has_main_out() {
     let repo = call(&mut h, "project.add", json!({ "path": main }))["id"].clone();
     let wt = call(&mut h, "project.add", json!({ "path": d.home.join("repo-wt-fix") }))["id"].clone();
     let open = |h: &mut Client, pid: &Value, on_main: bool| {
-        call(h, "session.open", json!({ "kind": "shell", "project_id": pid, "on_default_branch": on_main, "command": ["/bin/sh"] }))
+        call(h, "session.open", json!({ "kind": "shell", "project_id": pid, "on_default_branch": on_main, "command": [sh()] }))
     };
     // A worktree project's new tab goes to the main checkout, in its project.
     let s = open(&mut h, &wt, true);
@@ -708,7 +711,7 @@ fn switch_to_default_branch_moves_only_an_idle_clean_main_checkout() {
     let repo = call(&mut h, "project.add", json!({ "path": main }))["id"].clone();
     let wt = call(&mut h, "project.add", json!({ "path": main.join(".wt/fix") }))["id"].clone();
     let open = |h: &mut Client, pid: &Value, switch: bool| {
-        call(h, "session.open", json!({ "kind": "shell", "project_id": pid, "switch_to_default_branch": switch, "command": ["/bin/sh"] }))["id"].clone()
+        call(h, "session.open", json!({ "kind": "shell", "project_id": pid, "switch_to_default_branch": switch, "command": [sh()] }))["id"].clone()
     };
     let close = |h: &mut Client, id: &Value| {
         call(h, "session.close", json!({ "id": id, "force": true }));
@@ -757,13 +760,13 @@ fn a_worktree_outside_every_project_opens_in_its_repos_project() {
     git(&main, &["worktree", "add", "-q", "../repo-wt-fix", "-b", "fix"]);
     let repo = call(&mut h, "project.add", json!({ "path": main }))["id"].clone();
     let mut a = d.agent(None);
-    let s = call(&mut a, "session.open", json!({ "kind": "shell", "cwd": d.home.join("repo-wt-fix"), "command": ["/bin/sh"] }));
+    let s = call(&mut a, "session.open", json!({ "kind": "shell", "cwd": d.home.join("repo-wt-fix"), "command": [sh()] }));
     assert_eq!(s["project_id"], repo, "{s}");
     let projects = call(&mut h, "project.list", json!({}));
     assert!(!projects.as_array().unwrap().iter().any(|p| p["name"] == "repo-wt-fix"), "{projects}");
     // A plain folder outside every project still gets its own.
     std::fs::create_dir_all(d.home.join("plain")).unwrap();
-    let s = call(&mut a, "session.open", json!({ "kind": "shell", "cwd": d.home.join("plain"), "command": ["/bin/sh"] }));
+    let s = call(&mut a, "session.open", json!({ "kind": "shell", "cwd": d.home.join("plain"), "command": [sh()] }));
     assert_ne!(s["project_id"], repo);
 }
 
@@ -772,10 +775,8 @@ fn status_bar_script_items() {
     let d = TestDaemon::start();
     let mut h = d.human();
     let sid = open_sh(&mut h);
-    let script = d.home.join("ci.sh");
-    std::fs::write(&script, "#!/bin/sh\necho '[{\"text\":\"CI\",\"tone\":\"ok\",\"icon\":\"check\",\"tooltip\":\"all green\",\"mono\":true}]'\n").unwrap();
-    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let path = script.to_str().unwrap();
+    let script = script(d.home.join("ci.sh"), "echo '[{\"text\":\"CI\",\"tone\":\"ok\",\"icon\":\"check\",\"tooltip\":\"all green\",\"mono\":true}]'\n");
+    let path = script.as_str();
     // only a path listed in ui.status.items runs
     let run = json!({ "session_id": sid, "slot": "status", "script": path });
     assert!(call_err(&mut h, "script.run", run.clone()).code != 0);
@@ -796,10 +797,8 @@ fn custom_header_buttons_run_and_click() {
     let d = TestDaemon::start();
     let mut h = d.human();
     let sid = open_sh(&mut h);
-    let script = d.home.join("deploy.sh");
-    std::fs::write(&script, "#!/bin/sh\nif [ -n \"$MIDNA_CLICK\" ]; then echo '[{\"text\":\"Deployed\",\"icon\":\"check\"}]'; else echo '[{\"text\":\"Deploy\",\"icon\":\"play\"}]'; fi\n").unwrap();
-    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let path = script.to_str().unwrap();
+    let script = script(d.home.join("deploy.sh"), "if [ -n \"$MIDNA_CLICK\" ]; then echo '[{\"text\":\"Deployed\",\"icon\":\"check\"}]'; else echo '[{\"text\":\"Deploy\",\"icon\":\"play\"}]'; fi\n");
+    let path = script.as_str();
     let look = json!({ "session_id": sid, "slot": "button", "script": path });
     let click = json!({ "session_id": sid, "script": path });
     assert!(call_err(&mut h, "script.run", look.clone()).code != 0);
@@ -865,7 +864,10 @@ fn keys_an_app_isnt_reading_dont_stop_its_output() {
     let mut c = d.human();
     let id = open_sh(&mut c);
     let mut st = d.human().attach(&id, 60, 10, 8, 16).unwrap();
-    let print = "stty raw -echo; sleep 1; yes | head -c 4000000; stty sane; clear; echo printed-\"it\"-all";
+    // Windows: ConPTY passes a flood of short lines at some 15,000 a second, so 4 MB would take
+    // minutes there; 200 KB still keeps the app from reading for seconds.
+    let bytes = if cfg!(windows) { 200_000 } else { 4_000_000 };
+    let print = format!("stty raw -echo; sleep 1; yes | head -c {bytes}; stty sane; clear; echo printed-\"it\"-all");
     call(&mut c, "session.input", json!({ "id": id, "text": print, "enter": true }));
     std::thread::sleep(Duration::from_millis(300));
     std::thread::spawn(move || {
@@ -902,11 +904,13 @@ fn stream_keys_scroll_and_selection() {
     st.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut last = st.next_frame().unwrap();
     // A reader that pushes the kitty "disambiguate" flag, then dumps the next 7 bytes it gets.
-    let probe = "printf '\\033[>1u'; stty raw -echo; dd bs=1 count=7 2>/dev/null | od -An -c; stty sane; printf '\\033[<u'\r";
+    // Windows: ConPTY keeps the push to itself, so ctrl-a stays SOH, one byte.
+    let (count, ctrl_a) = if cfg!(windows) { (1, "001") } else { (7, "[   9   7   ;   5   u") };
+    let probe = format!("printf '\\033[>1u'; stty raw -echo; dd bs=1 count={count} 2>/dev/null | od -An -c; stty sane; printf '\\033[<u'\r");
     st.input(probe.as_bytes()).unwrap();
     std::thread::sleep(Duration::from_millis(400));
     st.send(&ClientMsg::Key(KeyMsg { action: KeyAction::Press, mods: MOD_CTRL, key: "a".into(), text: String::new() })).unwrap();
-    wait_for(5, "kitty ctrl-a", || read(&mut c, &id).contains("[   9   7   ;   5   u").then_some(()));
+    wait_for(5, "kitty ctrl-a", || read(&mut c, &id).contains(ctrl_a).then_some(()));
     // Same through the RPC, in legacy mode now: ctrl-c is ETX.
     call(&mut c, "session.input", json!({ "id": id, "text": "stty raw -echo; dd bs=1 count=1 2>/dev/null | od -An -tx1; stty sane", "enter": true }));
     std::thread::sleep(Duration::from_millis(400));
@@ -969,18 +973,19 @@ fn stream_keys_scroll_and_selection() {
 fn no_project_opens_at_root() {
     let d = TestDaemon::start();
     let mut c = d.human();
-    let home = std::env::var("HOME").unwrap();
-    let s = call(&mut c, "session.open", json!({ "kind": "shell", "command": ["/bin/sh"] }));
+    // Windows: the profile folder, not a HOME some shells set.
+    let home = if cfg!(windows) { midna_proto::paths::user_home().to_string_lossy().into_owned() } else { std::env::var("HOME").unwrap() };
+    let s = call(&mut c, "session.open", json!({ "kind": "shell", "command": [sh()] }));
     assert_eq!(s["project_id"], "root");
     assert_eq!(s["cwd"], home.as_str());
     // No project is created for root, and "root" can be passed back explicitly.
     assert!(call(&mut c, "project.list", json!({})).as_array().unwrap().is_empty());
-    let again = call(&mut c, "session.open", json!({ "kind": "shell", "project_id": "root", "command": ["/bin/sh"] }));
+    let again = call(&mut c, "session.open", json!({ "kind": "shell", "project_id": "root", "command": [sh()] }));
     assert_eq!(again["project_id"], "root");
     // An agent standing in a root terminal opens its siblings at root too.
     let sid = s["id"].as_str().unwrap();
     let mut a = d.agent(Some(sid));
-    let child = call(&mut a, "session.open", json!({ "kind": "shell", "command": ["/bin/sh"] }));
+    let child = call(&mut a, "session.open", json!({ "kind": "shell", "command": [sh()] }));
     assert_eq!(child["project_id"], "root");
 }
 
@@ -988,19 +993,19 @@ fn no_project_opens_at_root() {
 fn project_can_be_named_instead_of_an_id() {
     let d = TestDaemon::start();
     let mut c = d.human();
-    let base = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("midna-named-{}", std::process::id()));
+    let base = midna_proto::paths::canonical(std::env::temp_dir()).unwrap().join(format!("midna-named-{}", std::process::id()));
     let (a, b) = (base.join("kass"), base.join("other"));
     std::fs::create_dir_all(&a).unwrap();
     std::fs::create_dir_all(&b).unwrap();
     let kass = call(&mut c, "project.add", json!({ "path": a, "name": "kass" }));
-    let s = call(&mut c, "session.open", json!({ "kind": "shell", "project_id": "Kass", "command": ["/bin/sh"] }));
+    let s = call(&mut c, "session.open", json!({ "kind": "shell", "project_id": "Kass", "command": [sh()] }));
     assert_eq!(s["project_id"], kass["id"]);
     let listed = call(&mut c, "session.list", json!({ "project_id": "kass" }));
     assert_eq!(listed.as_array().unwrap().len(), 1);
     // An unknown name is refused, not an empty list; a shared name asks for an id.
     assert!(call_err(&mut c, "session.list", json!({ "project_id": "nope" })).message.contains("no project nope"));
     call(&mut c, "project.add", json!({ "path": b, "name": "kass" }));
-    let e = call_err(&mut c, "session.open", json!({ "kind": "shell", "project_id": "kass", "command": ["/bin/sh"] }));
+    let e = call_err(&mut c, "session.open", json!({ "kind": "shell", "project_id": "kass", "command": [sh()] }));
     assert!(e.message.contains("use an id"), "{}", e.message);
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -1009,25 +1014,36 @@ fn project_can_be_named_instead_of_an_id() {
 fn slash_is_never_a_project() {
     let d = TestDaemon::start();
     let mut c = d.human();
-    let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("midna-rel-{}", std::process::id()));
+    let dir = midna_proto::paths::canonical(std::env::temp_dir()).unwrap().join(format!("midna-rel-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("sub")).unwrap();
     let dir_s = dir.to_string_lossy().into_owned();
-    let s = call(&mut c, "session.open", json!({ "kind": "shell", "cwd": dir_s, "command": ["/bin/sh"] }));
+    let s = call(&mut c, "session.open", json!({ "kind": "shell", "cwd": dir_s, "command": [sh()] }));
     let pid = s["project_id"].as_str().unwrap().to_string();
     // A relative cwd is the caller's terminal's, not the daemon's (which is / under launchd).
     let mut a = d.agent(Some(s["id"].as_str().unwrap()));
-    let here = call(&mut a, "session.open", json!({ "kind": "shell", "cwd": ".", "command": ["/bin/sh"] }));
+    let here = call(&mut a, "session.open", json!({ "kind": "shell", "cwd": ".", "command": [sh()] }));
     assert_eq!((here["project_id"].as_str(), here["cwd"].as_str()), (Some(pid.as_str()), Some(dir_s.as_str())));
-    let sub = call(&mut a, "session.open", json!({ "kind": "shell", "cwd": "sub", "command": ["/bin/sh"] }));
-    assert_eq!(sub["cwd"], format!("{dir_s}/sub"));
+    let sub = call(&mut a, "session.open", json!({ "kind": "shell", "cwd": "sub", "command": [sh()] }));
+    assert_eq!(sub["cwd"].as_str(), dir.join("sub").to_str());
     // With no terminal to be relative to, it's refused.
-    assert!(call_err(&mut c, "session.open", json!({ "kind": "shell", "cwd": ".", "command": ["/bin/sh"] })).message.contains("relative"));
-    // `/` opens at root instead of becoming a project, and can't be added as one.
-    let slash = call(&mut a, "session.open", json!({ "kind": "shell", "cwd": "/", "command": ["/bin/sh"] }));
-    assert_eq!((slash["project_id"].as_str(), slash["cwd"].as_str()), (Some("root"), Some("/")));
-    call_err(&mut c, "project.add", json!({ "path": "/" }));
+    assert!(call_err(&mut c, "session.open", json!({ "kind": "shell", "cwd": ".", "command": [sh()] })).message.contains("relative"));
     let paths: Vec<String> = call(&mut c, "project.list", json!({})).as_array().unwrap().iter().map(|p| p["path"].as_str().unwrap().to_string()).collect();
     assert_eq!(paths, [dir_s.clone()]);
+    // `/` is Unix's one root. Windows has a root per drive, and `/` there is the current drive's.
+    #[cfg(unix)]
+    slash_opens_at_root(&mut c, &mut a, &dir, &dir_s);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `/` opens at root instead of becoming a project, and can't be added as one; a `/` project an
+/// older daemon stored is dropped on load.
+#[cfg(unix)]
+fn slash_opens_at_root(c: &mut Client, a: &mut Client, dir: &std::path::Path, dir_s: &str) {
+    let slash = call(a, "session.open", json!({ "kind": "shell", "cwd": "/", "command": [sh()] }));
+    assert_eq!((slash["project_id"].as_str(), slash["cwd"].as_str()), (Some("root"), Some("/")));
+    call_err(c, "project.add", json!({ "path": "/" }));
+    let paths: Vec<String> = call(c, "project.list", json!({})).as_array().unwrap().iter().map(|p| p["path"].as_str().unwrap().to_string()).collect();
+    assert_eq!(paths, [dir_s.to_string()]);
     // A `/` project an older daemon stored is dropped on load; its terminals move to root.
     let mut state = midnad::state::State::default();
     let mut old: midna_proto::Session = serde_json::from_value(slash.clone()).unwrap();
@@ -1039,14 +1055,13 @@ fn slash_is_never_a_project() {
     let loaded = midnad::state::State::load(&file);
     assert!(loaded.projects.is_empty());
     assert_eq!(loaded.sessions[0].project_id, "root");
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn background_terminals_open_and_move() {
     let d = TestDaemon::start();
     let mut c = d.human();
-    let s = call(&mut c, "session.open", json!({ "kind": "shell", "command": ["/bin/sh"], "background": true }));
+    let s = call(&mut c, "session.open", json!({ "kind": "shell", "command": [sh()], "background": true }));
     let id = s["id"].as_str().unwrap().to_string();
     assert_eq!(s["background"], true);
     // Still a normal terminal: listed and readable.
@@ -1071,12 +1086,12 @@ fn close_on_exit_closes_a_clean_exit_and_keeps_a_failure() {
     let d = TestDaemon::start();
     let mut h = d.human();
     let open = |h: &mut Client, script: &str| {
-        let s = call(h, "session.open", json!({ "kind": "monitor", "cwd": "/tmp", "command": ["/bin/sh", "-c", script], "close_on_exit": true }));
+        let s = call(h, "session.open", json!({ "kind": "monitor", "cwd": tmp(), "command": [sh(), "-c", script], "close_on_exit": true }));
         s["id"].as_str().unwrap().to_string()
     };
     let clean = open(&mut h, "sleep 0.3; exit 0");
     let failed = open(&mut h, "sleep 0.3; exit 3");
-    let plain = call(&mut h, "session.open", json!({ "kind": "monitor", "cwd": "/tmp", "command": ["/bin/sh", "-c", "exit 0"] }))["id"].as_str().unwrap().to_string();
+    let plain = call(&mut h, "session.open", json!({ "kind": "monitor", "cwd": tmp(), "command": [sh(), "-c", "exit 0"] }))["id"].as_str().unwrap().to_string();
     wait_for(10, "clean exit to close", || h.call_value("session.get", json!({ "id": clean })).is_err().then_some(()));
     wait_for(10, "failure to be marked", || (call(&mut h, "session.get", json!({ "id": failed }))["status"]["state"] == "failed").then_some(()));
     wait_for(10, "plain exit to be marked", || (call(&mut h, "session.get", json!({ "id": plain }))["status"]["state"] == "exited").then_some(()));
@@ -1088,7 +1103,7 @@ fn close_on_exit_closes_a_clean_exit_and_keeps_a_failure() {
 fn pinned_projects_survive_a_restart() {
     let mut d = TestDaemon::start();
     let mut h = d.human();
-    let p = call(&mut h, "project.add", json!({ "path": "/tmp" }));
+    let p = call(&mut h, "project.add", json!({ "path": tmp() }));
     assert!(p.get("pinned").is_none(), "unpinned by default: {p}");
     let id = p["id"].as_str().unwrap().to_string();
     assert_eq!(call(&mut h, "project.update", json!({ "id": id, "pinned": true }))["pinned"], true);
@@ -1126,7 +1141,7 @@ fn pr_refs_link_to_the_terminals_github_repo() {
     for args in [&["init", "-q"][..], &["remote", "add", "origin", "git@github.com:o/r.git"]] {
         assert!(std::process::Command::new("git").args(args).current_dir(&repo).env("GIT_CONFIG_GLOBAL", "/dev/null").status().unwrap().success());
     }
-    let open = |c: &mut Client, cwd: &std::path::Path| call(c, "session.open", json!({ "kind": "shell", "cwd": cwd, "command": ["/bin/sh"] }))["id"].as_str().unwrap().to_string();
+    let open = |c: &mut Client, cwd: &std::path::Path| call(c, "session.open", json!({ "kind": "shell", "cwd": cwd, "command": [sh()] }))["id"].as_str().unwrap().to_string();
     let link = |c: &mut Client, id: &str| (0..24).map(|row| call(c, "session.link_at", json!({ "id": id, "col": 19, "row": row }))).find(|l| l["kind"] != "none");
     let id = open(&mut c, &repo);
     call(&mut c, "session.input", json!({ "id": id, "text": "clear; echo 'the bot opened PR #61. The sub'", "enter": true }));

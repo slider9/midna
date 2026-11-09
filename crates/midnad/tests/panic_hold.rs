@@ -12,9 +12,9 @@ fn panic_items(h: &mut midna_proto::Client) -> Vec<Value> {
 
 #[test]
 fn after_a_panic_agents_wait_for_the_human() {
-    let mut d = TestDaemon::start_with(|c| c.agent_bin = Some("/bin/cat".into()));
+    let mut d = TestDaemon::start_with(|c| c.agent_bin = Some(posix_bin("cat")));
     let mut h = d.human();
-    let open_agent = |c: &mut midna_proto::Client| c.call_value("session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp", "name": "trailer" }));
+    let open_agent = |c: &mut midna_proto::Client| c.call_value("session.open", json!({ "kind": "agent", "agent": "claude", "cwd": tmp(), "name": "trailer" }));
     let sid = open_agent(&mut h).unwrap()["id"].as_str().unwrap().to_string();
     call(&mut d.agent(Some(&sid)), "policy.request", json!({ "action": { "kind": "tool", "value": "Bash(python3 make_trailer.py --tts)" } }));
     // No report: nothing happens.
@@ -37,7 +37,7 @@ fn after_a_panic_agents_wait_for_the_human() {
 
     // Agents, triggers and apps can't start or restart an agent; the human can.
     let mut a = d.agent(None);
-    let e = call_err(&mut a, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": "/tmp" }));
+    let e = call_err(&mut a, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": tmp() }));
     assert_eq!(e.code, REFUSED, "{e:?}");
     assert!(e.message.contains("kernel panic"), "{e:?}");
     // Refused at once, not after an approval nobody answers.

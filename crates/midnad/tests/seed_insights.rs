@@ -12,6 +12,7 @@
 //! MIDNA_SEED_HOME=/tmp/mh-seed cargo test -p midnad --test seed_insights -- --ignored seed_dev_home
 //! MIDNA_HOME=/tmp/mh-seed MIDNA_APP_PATH=$PWD/target/debug/midna-app target/debug/midnad --foreground
 //! ```
+mod common;
 use midna_proto::{Actor, ActorKind, Client, Event, time};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -171,7 +172,7 @@ fn call(c: &mut Client, m: &str, p: Value) -> Value {
 
 #[test]
 fn seeded_history_feeds_series() {
-    let home = PathBuf::from(format!("/tmp/midna-s-{}", std::process::id()));
+    let home = common::tmp().join(format!("midna-s-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     let now = time::now_unix();
     let n = seed_history(&home, now);
@@ -223,7 +224,7 @@ fn seeded_history_feeds_series() {
 
     // live: a real terminal driven by agent.hook shows up in today's hourly series
     let before = call(&mut c, "insights.series", json!({"range": "today", "metric": "turns"}))["total"].as_f64().unwrap();
-    let opened = call(&mut c, "session.open", json!({"project_id": "p_4b2a55", "kind": "shell", "command": ["/bin/cat"]}));
+    let opened = call(&mut c, "session.open", json!({"project_id": "p_4b2a55", "kind": "shell", "command": [common::posix_bin("cat")]}));
     let sid = opened["id"].as_str().or(opened["session"]["id"].as_str()).unwrap().to_string();
     call(&mut c, "agent.hook", json!({"agent": "claude", "event": "UserPromptSubmit", "payload": {"prompt": "hi"}, "session": sid}));
     let today = call(&mut c, "insights.series", json!({"range": "today", "metric": "turns", "by": "project"}));
