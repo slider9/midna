@@ -26,7 +26,7 @@ const CODEX_WRAPPER_NAME: &str = "midna-notify";
 /// The CLI path to write into global config: the stable `bin/current/midna` of an installed
 /// midna (it survives updates), else the CLI this daemon uses.
 pub fn global_cli(d: &Daemon) -> String {
-    let current = d.cfg.home.join("bin/current/midna");
+    let current = crate::install::current_cli(&d.cfg.home);
     if current.is_file() { current.to_string_lossy().into_owned() } else { d.cfg.cli_path.clone() }
 }
 

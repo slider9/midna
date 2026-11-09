@@ -70,6 +70,11 @@ fn main() {
     if raw.first().map(String::as_str) == Some("shim") {
         shim::run(&raw[1..]);
     }
+    // Windows: midnad's `claude.exe` and `codex.exe` shims are this binary under another name.
+    #[cfg(windows)]
+    if let Some(agent) = shim::started_as() {
+        shim::run(&[vec![agent], raw].concat());
+    }
     // `queue` gives a few flags values (`--idle 10m`) that are booleans elsewhere (`restart --idle`).
     let args = match Args::parse(raw.clone()) {
         Ok(a) if a.pos.first().map(String::as_str) == Some("queue") => Args::parse_with(raw, queue::VALUE_FLAGS),

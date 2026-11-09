@@ -84,9 +84,51 @@ pub fn write_files(d: &Daemon) {
     for a in AGENTS {
         write(shims_dir(home).join(a.as_str()), &shim_script(&cli, a.as_str()), 0o755);
     }
+    #[cfg(windows)]
+    exe_shims(&shims_dir(home), Path::new(&cli));
     write(zsh_dir(home).join(".zshenv"), ZSHENV, 0o644);
     write(bash_init(home), BASH_INIT, 0o644);
     write(fish_data(home).join("fish").join("vendor_conf.d").join("midna.fish"), FISH_CONF, 0o644);
+}
+
+/// Windows: only Git Bash runs the sh shims, but every shell (PowerShell, cmd) runs an .exe.
+/// `claude.exe` and `codex.exe` in the shims dir are copies of midna.exe, which runs as `midna
+/// shim <agent>` when started under one of those names. A copy keeps midna.exe's time, so one
+/// that differs in time or size is out of date and is replaced. A shim that's running can't be
+/// replaced or deleted, only renamed: it's moved aside, and removed on a later call. (A hard
+/// link would save the copy but would keep cargo from replacing a dev build's midna.exe while
+/// one runs.)
+#[cfg(windows)]
+pub fn exe_shims(dir: &Path, cli: &Path) {
+    let Some(src) = std::fs::metadata(cli).ok().filter(|m| m.is_file()) else { return };
+    let _ = std::fs::create_dir_all(dir);
+    let marker = dir.join(midna_proto::paths::SHIMS_MARKER);
+    if !marker.is_file() {
+        let _ = std::fs::write(marker, "claude.exe and codex.exe here are copies of midna.exe: started under those names it runs as `midna shim claude|codex`.\n");
+    }
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".old")) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    for a in AGENTS {
+        let shim = dir.join(format!("{}.exe", a.as_str()));
+        if std::fs::metadata(&shim).is_ok_and(|m| m.len() == src.len() && m.modified().ok() == src.modified().ok()) {
+            continue;
+        }
+        let tmp = dir.join(format!("{}.exe.tmp", a.as_str()));
+        if std::fs::copy(cli, &tmp).is_err() {
+            continue;
+        }
+        let aside = dir.join(format!("{}.exe.{}.old", a.as_str(), std::process::id()));
+        if shim.exists() && std::fs::rename(&shim, &aside).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            continue;
+        }
+        if std::fs::rename(&tmp, &shim).is_ok() {
+            let _ = std::fs::remove_file(&aside);
+        }
+    }
 }
 
 /// A shell terminal's launch: the shims dir first on PATH, and the shell's startup files
@@ -98,6 +140,9 @@ pub fn shell_env(d: &Daemon, command: &[String], env: &mut Vec<(String, String)>
         return None;
     }
     let home = &d.cfg.home;
+    // A rebuilt or updated midna.exe reaches the shims before the next `claude` typed here.
+    #[cfg(windows)]
+    exe_shims(&shims_dir(home), Path::new(&crate::global_hooks::global_cli(d)));
     let shims = shims_dir(home).to_string_lossy().into_owned();
     match env.iter_mut().find(|(k, _)| k == "PATH") {
         Some((_, v)) => *v = format!("{shims}{}{v}", crate::sys::PATH_SEP),

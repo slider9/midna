@@ -18,3 +18,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 midnad.workspace = true
+
+# Windows only: its fake agent is this test binary started as claude.exe, whose arguments
+# libtest would refuse.
+[[test]]
+name = "adopt_windows"
+harness = false

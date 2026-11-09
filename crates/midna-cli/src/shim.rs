@@ -239,8 +239,21 @@ fn candidates(dir: &Path, agent: &str) -> Vec<PathBuf> {
     exts.split(';').filter(|e| !e.is_empty()).map(|e| dir.join(format!("{agent}{}", e.to_ascii_lowercase()))).filter(|c| c.is_file()).collect()
 }
 
-/// midna's own shim, wherever it is (another MIDNA_HOME's on PATH too): the sh script, or on
-/// Windows the `.cmd` one (`midna.exe shim <agent> %*`).
+/// midna's own shim, wherever it is (another MIDNA_HOME's on PATH too): the sh script, a `.cmd`
+/// one (`midna.exe shim <agent> %*`), or on Windows anything in a shims dir (`claude.exe` there
+/// is a copy of midna.exe; midnad marks the dir).
 fn is_shim(p: &Path) -> bool {
+    if cfg!(windows) && p.parent().is_some_and(|d| d.join(midna_proto::paths::SHIMS_MARKER).is_file()) {
+        return true;
+    }
     std::fs::read(p).is_ok_and(|b| b.len() < 4096 && (b.windows(14).any(|w| w == b"exec \"$cli\" sh") || b.windows(12).any(|w| w.eq_ignore_ascii_case(b"\" shim claud") || w.eq_ignore_ascii_case(b"\" shim codex"))))
+}
+
+/// The agent this binary stands in for, when it was started as midnad's `claude.exe` or
+/// `codex.exe` shim.
+#[cfg(windows)]
+pub fn started_as() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let name = exe.file_stem()?.to_str()?.to_ascii_lowercase();
+    matches!(name.as_str(), "claude" | "codex").then_some(name)
 }

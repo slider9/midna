@@ -37,6 +37,18 @@ pub fn current_binary(home: &Path) -> PathBuf {
     root.join(name.trim()).join(format!("midnad{EXE}"))
 }
 
+/// The installed `midna` CLI (`bin/current/midna`; on Windows `midna.exe` in the directory
+/// `bin/current` names).
+#[cfg(unix)]
+pub fn current_cli(home: &Path) -> PathBuf {
+    bin_root(home).join("current").join("midna")
+}
+
+#[cfg(windows)]
+pub fn current_cli(home: &Path) -> PathBuf {
+    current_binary(home).with_file_name(format!("midna{EXE}"))
+}
+
 /// Install the running executable. Returns the versioned directory.
 pub fn install_self(home: &Path) -> std::io::Result<PathBuf> {
     let exe = std::env::current_exe()?;

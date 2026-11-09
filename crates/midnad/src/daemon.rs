@@ -102,15 +102,15 @@ fn app_path_from_env() -> Option<String> {
     }
 }
 
-/// `MIDNA_CLI_PATH`, else a `midna` next to this executable (or one dir up, for test binaries
-/// in target/*/deps), else plain `midna` from PATH.
+/// `MIDNA_CLI_PATH`, else a `midna` (`midna.exe`) next to this executable (or one dir up, for
+/// test binaries in target/*/deps), else plain `midna` from PATH.
 pub fn default_cli_path() -> String {
     if let Ok(p) = std::env::var("MIDNA_CLI_PATH") {
         return p;
     }
     if let Ok(exe) = std::env::current_exe() {
         for dir in exe.ancestors().skip(1).take(2) {
-            let c = dir.join("midna");
+            let c = dir.join(format!("midna{}", std::env::consts::EXE_SUFFIX));
             if c.is_file() {
                 return c.to_string_lossy().into_owned();
             }

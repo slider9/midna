@@ -280,6 +280,11 @@ pub fn native(p: &str) -> String {
     if cfg!(windows) && Path::new(p).is_absolute() { p.replace('/', "\\") } else { p.to_string() }
 }
 
+/// The file in a midna home's shims dir that says the `claude.exe` and `codex.exe` beside it are
+/// midna's own (Windows: they're copies of midna.exe), so `midna shim` never runs one as the
+/// real agent.
+pub const SHIMS_MARKER: &str = "midna-shims.txt";
+
 pub fn state_path(home: &std::path::Path) -> PathBuf {
     home.join("state.json")
 }

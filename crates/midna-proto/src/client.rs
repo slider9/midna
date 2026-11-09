@@ -89,7 +89,10 @@ impl Client {
         self
     }
 
+    /// On both handles: reads go through the reader's, which on Windows is a socket of its own
+    /// (a clone there is a duplicated handle, with its own timeouts), not the same one as on Unix.
     pub fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        self.reader.get_ref().set_read_timeout(d)?;
         self.writer.set_read_timeout(d)
     }
 
@@ -261,7 +264,9 @@ impl AttachStream {
         self.reader.read_exact(&mut self.buf)?;
         Frame::decode(&self.buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
+    /// On both handles, as [`Client::set_read_timeout`].
     pub fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        self.reader.get_ref().set_read_timeout(d)?;
         self.writer.set_read_timeout(d)
     }
     /// A second handle for writing (want/resize/input) from another thread.
@@ -287,5 +292,29 @@ impl StreamWriter {
     }
     pub fn send(&mut self, m: &frame::ClientMsg) -> std::io::Result<()> {
         self.s.write_all(&m.encode())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A daemon that takes the connection and never answers: the call gives up after the
+    /// timeout instead of waiting forever (on Windows the reader is a socket handle of its own).
+    #[test]
+    fn a_read_timeout_ends_a_call_nobody_answers() {
+        let dir = std::env::temp_dir().join(format!("mc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s.sock");
+        let listener = crate::ipc::UnixListener::bind(&sock).unwrap();
+        let held = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
+        let mut c = Client::connect(&sock).unwrap();
+        c.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let t0 = std::time::Instant::now();
+        assert!(c.call_value("ping", json!({})).is_err());
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        drop(held.join());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
