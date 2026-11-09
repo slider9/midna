@@ -119,7 +119,7 @@ pub fn parse_list(out: &str) -> Vec<Entry> {
     let mut v: Vec<Entry> = vec![];
     for line in out.lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
-            v.push(Entry { path: p.to_string(), ..Default::default() });
+            v.push(Entry { path: paths::native(p), ..Default::default() });
         } else if let Some(e) = v.last_mut() {
             if let Some(b) = line.strip_prefix("branch ") {
                 e.branch = b.trim_start_matches("refs/heads/").to_string();
@@ -366,17 +366,17 @@ pub fn list(d: &Daemon, p: WorktreesListParams) -> Result<Value, RpcError> {
 }
 
 pub fn clean(d: &Daemon, p: WorktreesCleanParams) -> Result<Value, RpcError> {
-    let path = p.path.as_deref().map(|s| s.trim_end_matches('/').to_string());
+    let path = p.path.as_deref().map(|s| paths::trim_end_sep(s).to_string());
     let list = scan(d, None);
     if let Some(path) = &path
-        && !list.iter().any(|w| &w.path == path)
+        && !list.iter().any(|w| paths::same_path(&w.path, path))
     {
         return Err(RpcError::not_found(format!("{path} isn't a linked worktree of a repo midna watches (`midna worktrees` lists them)")));
     }
     // ignore_idle waives only the idle rule (and auto-clean being off); terminals, processes,
     // live locks and uncommitted work still keep a worktree.
     let pick = |w: &WorktreeInfo| {
-        let chosen = path.as_ref().is_none_or(|p| &w.path == p);
+        let chosen = path.as_ref().is_none_or(|p| paths::same_path(&w.path, p));
         let idle_only = w.keep_because.as_deref().is_some_and(|k| k.starts_with("it was used") || k.starts_with("worktrees.auto_clean_hours"));
         chosen && (w.removable || (p.ignore_idle && idle_only))
     };

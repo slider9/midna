@@ -179,7 +179,7 @@ pub fn scripts_wanted(items: Option<&serde_json::Value>, script: Option<&serde_j
     let Some(items) = items.and_then(|v| v.as_array()) else {
         return if script_on { vec!["script".into()] } else { vec![] };
     };
-    items.iter().filter_map(|i| i.as_str()).filter(|i| i.starts_with('/') || (*i == "script" && script_on)).map(str::to_string).collect()
+    items.iter().filter_map(|i| i.as_str()).filter(|i| midna_proto::paths::is_absolute(i) || (*i == "script" && script_on)).map(str::to_string).collect()
 }
 
 /// What each item is called in the right-click menu (a script path: its file name).

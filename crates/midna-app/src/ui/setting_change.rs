@@ -66,9 +66,9 @@ fn value_of(key: &str, items: &[String]) -> Value {
 
 /// `~/…` for a path under the home folder.
 fn tilde(p: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && p.starts_with(&format!("{h}/")) => format!("~{}", &p[h.len()..]),
-        _ => p.to_string(),
+    match midna_proto::paths::home_var().as_deref().and_then(|h| midna_proto::paths::after(p, h)).filter(|r| !r.is_empty()) {
+        Some(rest) => format!("~{rest}"),
+        None => p.to_string(),
     }
 }
 
@@ -122,7 +122,7 @@ pub fn panel(m: &MainWindow, t: &Theme, n: &NeedsYou, cx: &mut Context<MainWindo
                 .child(if current { "Show proposed" } else { "Show current" }),
         );
     let control = control(t, n, &c, &value, current, cx);
-    let paths: Vec<String> = if CHIP_KEYS.contains(&c.key.as_str()) { items_of(&c.key, &value).into_iter().filter(|i| i.starts_with('/')).collect() } else { vec![] };
+    let paths: Vec<String> = if CHIP_KEYS.contains(&c.key.as_str()) { items_of(&c.key, &value).into_iter().filter(|i| midna_proto::paths::is_absolute(i)).collect() } else { vec![] };
     let mut body = div()
         .flex()
         .flex_col()
@@ -202,7 +202,7 @@ fn control(t: &Theme, n: &NeedsYou, c: &SettingChange, value: &Value, current: b
             let mut row = div().flex().flex_wrap().gap(px(6.));
             for (i, o) in opts.into_iter().enumerate() {
                 let on = o == now;
-                let label = if o.starts_with('/') { sw::chip_label(&o) } else { sw::option_label(key, &o) };
+                let label = if midna_proto::paths::is_absolute(&o) { sw::chip_label(&o) } else { sw::option_label(key, &o) };
                 let id = n.id.clone();
                 row = row.child(
                     div()
@@ -252,7 +252,7 @@ fn chips(t: &Theme, n: &NeedsYou, c: &SettingChange, value: &Value, current: boo
     // on ones, then what today has that this turns off, then every other option, plus any path
     // either value has, so a dropped one can go back on
     let mut all: Vec<String> = on.clone();
-    let paths = was.iter().chain(items_of(&key, &c.to).iter()).filter(|i| i.starts_with('/')).cloned().collect::<Vec<_>>();
+    let paths = was.iter().chain(items_of(&key, &c.to).iter()).filter(|i| midna_proto::paths::is_absolute(i)).cloned().collect::<Vec<_>>();
     for i in was.iter().cloned().chain(options.iter().filter(|o| **o != "none").map(|o| o.to_string())).chain(paths) {
         if !all.contains(&i) {
             all.push(i);
@@ -263,7 +263,7 @@ fn chips(t: &Theme, n: &NeedsYou, c: &SettingChange, value: &Value, current: boo
         let is_on = on.contains(&item);
         let added = !current && is_on && !was.contains(&item);
         let removed = !current && !is_on && was.contains(&item);
-        let path = item.starts_with('/');
+        let path = midna_proto::paths::is_absolute(&item);
         let color = match () {
             _ if added => t.ok,
             _ if removed => t.err,

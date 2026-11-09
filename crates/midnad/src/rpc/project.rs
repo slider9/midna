@@ -14,7 +14,7 @@ pub fn list(d: &Daemon) -> R {
 
 fn normalize(path: &str) -> String {
     let p = midna_proto::paths::canonical(path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string());
-    if p.len() > 1 { p.trim_end_matches('/').to_string() } else { p }
+    paths::trim_end_sep(&p).to_string()
 }
 
 /// Find the project containing `path` (deepest match) or add one for it.
@@ -40,14 +40,14 @@ fn add_inner(d: &Daemon, actor: Actor, path: &str, name: Option<String>, auto_cr
         return Err(RpcError::bad_params(format!("{path} can't be a project; open a terminal there at root instead")));
     }
     let mut core = d.core();
-    if let Some(p) = core.state.projects.iter_mut().find(|p| p.path == path) {
+    if let Some(p) = core.state.projects.iter_mut().find(|p| paths::same_path(&p.path, &path)) {
         // The human adding it themselves makes it theirs.
         if actor.kind == ActorKind::Human && std::mem::take(&mut p.auto_created) {
             d.mark_dirty();
         }
         return Ok(p.clone());
     }
-    let name = name.unwrap_or_else(|| path.rsplit('/').find(|s| !s.is_empty()).unwrap_or(&path).to_string());
+    let name = name.unwrap_or_else(|| Some(paths::base_name(&path)).filter(|b| !b.is_empty()).unwrap_or(&path).to_string());
     let order = core.state.projects.iter().map(|p| p.order + 1).max().unwrap_or(0);
     let p = Project { id: format!("p_{}", hex_id(6)), name, path, icon: None, order, commands: vec![], last_opened_at: None, auto_created, pinned: false };
     core.state.projects.push(p.clone());
@@ -63,7 +63,7 @@ pub fn containing(d: &Daemon, path: &str) -> Option<Project> {
         .state
         .projects
         .iter()
-        .filter(|p| path == p.path || path.starts_with(&format!("{}/", p.path)))
+        .filter(|p| paths::is_under(&path, &p.path))
         .max_by_key(|p| p.path.len())
         .cloned()
 }

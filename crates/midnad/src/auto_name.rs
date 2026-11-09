@@ -56,7 +56,7 @@ fn is_default_name(s: &Session) -> bool {
     let n = s.name.as_str();
     s.agent.is_some_and(|a| a.as_str() == n)
         || s.adopted.as_ref().is_some_and(|a| a.agent.as_str() == n)
-        || s.command.first().is_some_and(|c| c.rsplit('/').next() == Some(n))
+        || s.command.first().is_some_and(|c| paths::program_name(c) == n)
         || n == "shell"
 }
 
@@ -143,7 +143,7 @@ pub fn from_title(agent: AgentKind, title: &str, cwd: &str) -> Option<String> {
         AgentKind::Claude => text,
     };
     let text = text.trim();
-    let folder = cwd.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    let folder = paths::base_name(cwd);
     let placeholder = ["claude", "claude code", "codex", "openai codex"].iter().any(|p| text.eq_ignore_ascii_case(p)) || text == folder;
     if text.is_empty() || placeholder {
         return None;
@@ -168,7 +168,7 @@ pub fn from_context(git: Option<&GitInfo>, cwd: &str, folder: bool) -> Option<St
         readable(&parts[from.min(parts.len())..].join(" "))
     });
     let worktree = git.and_then(|g| g.worktree.as_deref()).map(readable);
-    let dir = folder.then(|| cwd.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string());
+    let dir = folder.then(|| paths::base_name(cwd).to_string());
     [branch_name, worktree, dir].into_iter().flatten().find(|n| !n.is_empty()).map(|n| fit(&n))
 }
 

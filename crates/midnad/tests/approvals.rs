@@ -264,7 +264,14 @@ fn folder_trust_dialog_is_a_needs_you_item() {
     std::thread::sleep(std::time::Duration::from_millis(3500));
     assert!(call(&mut h, "needs_you.list", json!({ "session_id": sid })).as_array().unwrap().is_empty(), "not raised again once answered");
     // Trusting it saves the folder.
-    assert_eq!(call(&mut h, "settings.get", json!({ "key": "agents.trust_folders" }))["value"], json!([tmp()]));
+    assert_eq!(call(&mut h, "settings.get", json!({ "key": "agents.trust_folders" }))["value"], json!([as_saved(&tmp().to_string_lossy())]));
+}
+
+/// `cwd` the way `agents.trust_folders` saves it: as `~…` under the home folder. Windows' temp
+/// folder is inside the home folder; macOS's isn't.
+fn as_saved(cwd: &str) -> String {
+    let home = midna_proto::paths::home_var().unwrap_or_default();
+    midna_proto::paths::after(cwd, &home).map_or_else(|| cwd.to_string(), |rest| format!("~{rest}"))
 }
 
 #[test]
@@ -347,7 +354,7 @@ fn answer_in_terminal(tag: &str, keys: &str) -> (Value, Value) {
 #[test]
 fn yes_typed_in_the_terminal_saves_the_folder() {
     let (saved, cwd) = answer_in_terminal("typed-yes", "\x1b[B\r");
-    assert_eq!(saved, json!([cwd]));
+    assert_eq!(saved, json!([as_saved(cwd.as_str().unwrap())]));
 }
 
 #[test]

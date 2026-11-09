@@ -105,7 +105,7 @@ pub fn folder_of(url: &str) -> Option<String> {
     let raw = raw.strip_prefix('/').filter(|r| r.as_bytes().get(1) == Some(&b':')).unwrap_or(raw);
     let path = PathBuf::from(percent_decode(raw));
     let dir = if path.is_dir() { path } else { path.parent()?.to_path_buf() };
-    let s = dir.to_string_lossy().trim_end_matches('/').to_string();
+    let s = midna_proto::paths::trim_end_sep(&dir.to_string_lossy()).to_string();
     Some(if s.is_empty() { "/".into() } else { s })
 }
 
@@ -136,7 +136,7 @@ pub fn open(dir: String, cx: &mut App) {
     cx.activate(true);
     crate::windows::with_active(cx, move |m, window, cx| {
         window.activate_window();
-        let existing = m.sessions.iter().find(|s| !s.background && s.kind == crate::model::SessionKind::Shell && s.cwd.trim_end_matches('/') == dir).map(|s| s.id.clone());
+        let existing = m.sessions.iter().find(|s| !s.background && s.kind == crate::model::SessionKind::Shell && midna_proto::paths::same_path(midna_proto::paths::trim_end_sep(&s.cwd), &dir)).map(|s| s.id.clone());
         if let Some(id) = existing {
             cx.defer(move |cx| crate::windows::reveal(id, cx));
             return;

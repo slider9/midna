@@ -826,7 +826,10 @@ fn state_persists_across_restart() {
         call(&mut h, "settings.set", json!({ "key": "theme", "value": "dark" }));
         // Keep the files: copy the home before the harness deletes it.
         let copy = std::path::PathBuf::from(format!("{}-copy", d.home.display()));
-        std::thread::sleep(Duration::from_millis(400)); // saver interval
+        // The saver runs every few hundred ms, later on a busy machine.
+        wait_for(5, "state saved", || {
+            std::fs::read(d.home.join("state.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).filter(|s| s["settings"]["theme"] == "dark")
+        });
         let _ = std::fs::remove_dir_all(&copy);
         std::fs::create_dir_all(&copy).unwrap();
         for f in ["state.json", "events.jsonl"] {
@@ -1032,7 +1035,8 @@ fn slash_is_never_a_project() {
     // `/` is Unix's one root. Windows has a root per drive, and `/` there is the current drive's.
     #[cfg(unix)]
     slash_opens_at_root(&mut c, &mut a, &dir, &dir_s);
-    std::fs::remove_dir_all(&dir).unwrap();
+    // Windows can't remove a folder a running shell has as its cwd.
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `/` opens at root instead of becoming a project, and can't be added as one; a `/` project an

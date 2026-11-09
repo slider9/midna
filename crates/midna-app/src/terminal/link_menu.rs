@@ -296,7 +296,7 @@ pub(super) fn own_head(own: &AppLinkMenu, base: Head, body: Option<&Body>) -> He
         _ => None,
     };
     let (icon, image) = match own.icon.as_deref() {
-        Some(path) if path.starts_with('/') => (base.icon, Path::new(path).is_file().then(|| PathBuf::from(path))),
+        Some(path) if midna_proto::paths::is_absolute(path) => (base.icon, Path::new(path).is_file().then(|| PathBuf::from(path))),
         Some(name) => (Icon::from_name(name).unwrap_or(base.icon), None),
         None => (base.icon, None),
     };

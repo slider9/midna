@@ -2645,7 +2645,7 @@ pub(crate) fn open_file(backend: Arc<dyn Backend>, session: String, path: String
             return;
         };
         let q = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
-        let bin = editor.split_whitespace().next().unwrap_or("").rsplit('/').next().unwrap_or("").to_string();
+        let bin = midna_proto::paths::program_name(editor.split_whitespace().next().unwrap_or("")).to_string();
         let cmd = match (bin.as_str(), line) {
             ("code" | "cursor" | "zed" | "subl", Some(l)) => {
                 format!("{editor} -g {}", q(&format!("{path}:{l}")))

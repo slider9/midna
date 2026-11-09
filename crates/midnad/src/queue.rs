@@ -408,7 +408,7 @@ pub fn add(d: &Daemon, sid: &str, text: String, enter: bool, images: Vec<String>
     if text.is_empty() && images.is_empty() {
         return Err(RpcError::bad_params("nothing to queue: give `text` or `images`"));
     }
-    if let Some(bad) = images.iter().find(|p| !p.starts_with('/')) {
+    if let Some(bad) = images.iter().find(|p| !paths::is_absolute(p)) {
         return Err(RpcError::bad_params(format!("image paths must be absolute: {bad}")));
     }
     check_when(d, sid, &when)?;

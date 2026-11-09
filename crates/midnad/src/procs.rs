@@ -282,7 +282,7 @@ pub fn server_name(name: &str, command: &str) -> String {
         if a.starts_with('-') || a == "run" {
             continue;
         }
-        let base = a.rsplit('/').next().unwrap_or(a);
+        let base = a.rsplit(midna_proto::paths::SEPARATORS).next().unwrap_or(a);
         let stem = base.strip_suffix(".js").or(base.strip_suffix(".mjs")).or(base.strip_suffix(".cjs")).or(base.strip_suffix(".ts")).or(base.strip_suffix(".py")).or(base.strip_suffix(".rb")).unwrap_or(base);
         return if stem.is_empty() { name.to_string() } else { stem.to_string() };
     }

@@ -129,10 +129,10 @@ impl SettingSpec {
                 };
                 let mut out: Vec<String> = vec![];
                 for i in items.iter().map(|i| i.trim()).filter(|i| !i.is_empty()) {
-                    if !(i.starts_with('/') || i == "~" || i.starts_with("~/")) {
+                    if !(crate::paths::is_absolute(i) || i.strip_prefix('~').is_some_and(|r| r.is_empty() || r.starts_with(crate::paths::SEPARATORS))) {
                         return Err(format!("{}: `{i}` must be an absolute path or start with ~/", self.key));
                     }
-                    let i = if i.len() > 1 { i.trim_end_matches('/') } else { i };
+                    let i = crate::paths::trim_end_sep(i);
                     if !out.iter().any(|o| o == i) {
                         out.push(i.to_string());
                     }
@@ -188,7 +188,7 @@ impl SettingSpec {
                 };
                 let mut out: Vec<&str> = vec![];
                 for i in items.iter().map(|i| i.trim()).filter(|i| !i.is_empty()) {
-                    if !(options.contains(&i) || (allow_paths && i.starts_with('/'))) {
+                    if !(options.contains(&i) || (allow_paths && crate::paths::is_absolute(i))) {
                         let paths = if allow_paths { ", or an absolute path to a script" } else { "" };
                         return Err(format!("{}: unknown item `{i}` (one of: {}{paths})", self.key, options.join(", ")));
                     }

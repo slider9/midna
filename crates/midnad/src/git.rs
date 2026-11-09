@@ -71,7 +71,7 @@ pub fn parse_shortstat(s: &str) -> (u32, u32, u32) {
 fn parse_rev_parse(out: &str) -> Option<(String, Option<String>)> {
     let mut it = out.lines().map(str::trim);
     let (dir, common, top, branch) = (it.next()?, it.next()?, it.next()?, it.next()?);
-    let worktree = (dir != common).then(|| top.rsplit('/').next().unwrap_or(top).to_string());
+    let worktree = (dir != common).then(|| Some(paths::base_name(top)).filter(|b| !b.is_empty()).unwrap_or(top).to_string());
     Some((branch.to_string(), worktree))
 }
 

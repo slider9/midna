@@ -1038,6 +1038,7 @@ const TEMP_DIRS: [&str; 6] = ["/tmp", "/private/tmp", "/var/tmp", "/private/var/
 /// Whether `path` is a system temp folder or inside one.
 fn in_temp_dir(path: &str) -> bool {
     TEMP_DIRS.iter().any(|d| path.strip_prefix(d).is_some_and(|rest| rest.is_empty() || rest.starts_with('/')))
+        || (cfg!(windows) && midna_proto::paths::is_under(path, &std::env::temp_dir().to_string_lossy()))
 }
 
 /// Closed projects, most recently opened first, leaving out temp folders. Folders under
@@ -1077,9 +1078,9 @@ pub fn ide_commands(ides: &[crate::ide::Ide], current: Option<&str>, dir: &str, 
 
 /// `path` with `$HOME` shown as `~`.
 pub fn tilde(path: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && (path == h || path.starts_with(&format!("{h}/"))) => format!("~{}", &path[h.len()..]),
-        _ => path.to_string(),
+    match midna_proto::paths::home_var().as_deref().and_then(|h| midna_proto::paths::after(path, h)) {
+        Some(rest) => format!("~{rest}"),
+        None => path.to_string(),
     }
 }
 
@@ -1095,15 +1096,15 @@ pub fn ask_cli(agent: AgentKind, project: Option<&str>, prompt: &str) -> String 
 pub fn path_command(query: &str, home: &str, projects: &[Project]) -> Option<Command> {
     let q = query.trim();
     let path = match q.strip_prefix('~') {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("{home}{rest}"),
-        _ if q.starts_with('/') => q.to_string(),
+        Some(rest) if rest.is_empty() || rest.starts_with(midna_proto::paths::SEPARATORS) => format!("{home}{rest}"),
+        _ if midna_proto::paths::is_absolute(q) => q.to_string(),
         _ => return None,
     };
-    let path = if path.len() > 1 { path.trim_end_matches('/').to_string() } else { path };
+    let path = midna_proto::paths::trim_end_sep(&path).to_string();
     if !std::path::Path::new(&path).is_dir() {
         return None;
     }
-    let title = match projects.iter().find(|p| p.path == path) {
+    let title = match projects.iter().find(|p| midna_proto::paths::same_path(&p.path, &path)) {
         Some(p) => format!("Open project {}", p.name),
         None => format!("Open {path} as a project"),
     };
@@ -1168,12 +1169,12 @@ pub fn folder_rows(query: &str, home: &str, roots: &[String]) -> Option<Vec<Comm
     };
     let abs = expand(typed);
     let mut out = vec![];
-    let trimmed = if abs.len() > 1 { abs.trim_end_matches('/') } else { abs.as_str() };
-    if (typed.starts_with('/') || typed.starts_with('~')) && std::path::Path::new(trimmed).is_dir() {
+    let trimmed = midna_proto::paths::trim_end_sep(&abs);
+    if (midna_proto::paths::is_absolute(typed) || typed.starts_with('~')) && std::path::Path::new(trimmed).is_dir() {
         let shown = tilde(trimmed);
         let mut c = Command::new(format!("folder.add:{trimmed}"), CmdIcon::Project, format!("Add {shown} as a project folder"), Run::Prefill { text: query.into() })
             .sub("its subfolders show up as projects you can open");
-        if roots.iter().any(|r| expand(r) == trimmed) {
+        if roots.iter().any(|r| midna_proto::paths::same_path(&expand(r), trimmed)) {
             c = c.sub("already a project folder");
         } else {
             let mut all: Vec<String> = roots.to_vec();
@@ -1184,7 +1185,7 @@ pub fn folder_rows(query: &str, home: &str, roots: &[String]) -> Option<Vec<Comm
         out.push(c);
     }
     // list `dir`'s subfolders whose names start with `partial`
-    let (dir, partial) = match abs.rfind('/') {
+    let (dir, partial) = match abs.rfind(midna_proto::paths::SEPARATORS) {
         Some(i) => (abs[..=i].to_string(), abs[i + 1..].to_lowercase()),
         None => return Some(out),
     };
@@ -1193,9 +1194,12 @@ pub fn folder_rows(query: &str, home: &str, roots: &[String]) -> Option<Vec<Comm
         .unwrap_or_default();
     subs.retain(|n| !n.starts_with('.') && n.to_lowercase().starts_with(&partial));
     subs.sort_by_key(|n| n.to_lowercase());
-    let typed_dir = &typed[..typed.rfind('/').map_or(0, |i| i + 1)];
+    let last_sep = typed.rfind(midna_proto::paths::SEPARATORS);
+    let typed_dir = &typed[..last_sep.map_or(0, |i| i + 1)];
+    // the separator the person typed (`C:\x\` on Windows), else /
+    let sep = last_sep.map_or('/', |i| typed.as_bytes()[i] as char);
     for n in subs.into_iter().take(FOLDER_ROWS) {
-        let next = format!("{typed_dir}{n}/");
+        let next = format!("{typed_dir}{n}{sep}");
         out.push(Command::new(format!("folder.go:{next}"), CmdIcon::Project, next.clone(), Run::Prefill { text: format!("{FOLDER_PREFIX}{next}") }).sub("↩ to look inside"));
     }
     Some(out)
@@ -1243,7 +1247,7 @@ mod tests {
 
     #[test]
     fn typed_paths_offer_to_open_a_project() {
-        let home = std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_string();
+        let home = std::env::temp_dir().to_string_lossy().trim_end_matches(midna_proto::paths::SEPARATORS).to_string();
         let c = path_command("~", &home, &[]).expect("home is a dir");
         assert_eq!(c.run, Some(Run::OpenProject { path: Some(home.clone()) }));
         assert!(path_command("/", &home, &[]).is_some());

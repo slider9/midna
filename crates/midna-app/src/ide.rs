@@ -193,7 +193,7 @@ pub enum Source {
 
 /// A folder rule's match is a path; anything else is a file pattern.
 fn is_folder_rule(m: &str) -> bool {
-    m.starts_with('/') || m == "~" || m.starts_with("~/")
+    midna_proto::paths::is_absolute(m) || m.strip_prefix('~').is_some_and(|r| r.is_empty() || r.starts_with(midna_proto::paths::SEPARATORS))
 }
 
 /// `*` and `?` over one file name.

@@ -1278,7 +1278,7 @@ impl SettingsWindow {
             SettingKind::Enum { options, .. } => {
                 let mut opts: Vec<(String, String)> = options.iter().map(|o| (o.to_string(), option_label(key, o))).collect();
                 if !options.contains(&text.as_str()) {
-                    opts.push((text.clone(), text.rsplit('/').next().unwrap_or(&text).to_string()));
+                    opts.push((text.clone(), midna_proto::paths::base_name(&text).to_string()));
                 }
                 Control::Seg { key: key.into(), options: opts, current: text.clone() }
             }
@@ -1397,7 +1397,7 @@ impl SettingsWindow {
             Some("stale") => (t.need, "Global · out of date".into(), t.need, detail.unwrap_or_else(|| format!("midna's entries in {path} are out of date."))
                 + " Until reinstalled, midna adds its hooks to the agents it starts.", Some(("Reinstall", false))),
             Some("not_installed") => (t.fg, "Per terminal".into(), t.fg, per_terminal.into(), Some(("Install", false))),
-            Some("error") => (t.err, format!("Can't read {}", path.rsplit('/').next().unwrap_or(path)), t.err, detail.unwrap_or_else(|| path.into()), Some(("Reinstall", false))),
+            Some("error") => (t.err, format!("Can't read {}", midna_proto::paths::base_name(path)), t.err, detail.unwrap_or_else(|| path.into()), Some(("Reinstall", false))),
             Some("unavailable") => (t.dim, format!("{name} not set up"), t.dim, format!("No {name} config on this Mac."), None),
             _ => (t.dim, "Checking…".into(), t.dim, String::new(), None),
         };

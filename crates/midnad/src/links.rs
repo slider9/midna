@@ -368,7 +368,7 @@ pub fn add(d: &Daemon, sid: &str, p: &LinksAddParams, by: Actor) -> Result<Link,
     let target = p.target.trim();
     let (kind, target, derived) = if target.starts_with("http://") || target.starts_with("https://") {
         classify_url(target)
-    } else if target.starts_with('/') {
+    } else if paths::is_absolute(target) {
         let cwd = d.core().state.session(sid).map(|s| s.cwd.clone()).unwrap_or_default();
         (LinkKind::File, target.to_string(), file_title(target, &cwd))
     } else if let Some(found) = added_app_link(target, &crate::schemes::app_for) {
@@ -474,7 +474,7 @@ pub fn scan_entry(v: &Value, cwd: &str, tools: &mut HashMap<String, (String, Opt
                             }
                             "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
                                 let path = input.get("file_path").or(input.get("notebook_path")).and_then(Value::as_str).unwrap_or("");
-                                if path.starts_with('/') && !scratch(path) {
+                                if paths::is_absolute(path) && !scratch(path) {
                                     let source = if name == "Write" { LinkSource::Created } else { LinkSource::Edited };
                                     out.push(Found { kind: LinkKind::File, target: path.to_string(), title: file_title(path, cwd), named: false, source, via: Some(name.clone()) });
                                 }
@@ -513,8 +513,8 @@ fn reads_output(tool: &str) -> bool {
 /// Scratch files (the agent's temp and scratchpad dirs) are not worth coming back to.
 fn scratch(path: &str) -> bool {
     let tmp = std::env::temp_dir();
-    let tmp = tmp.to_str().unwrap_or("/tmp").trim_end_matches('/');
-    [tmp, "/tmp", "/private/tmp", "/var/folders", "/private/var/folders"].iter().any(|d| path.strip_prefix(d).is_some_and(|r| r.starts_with('/')))
+    let tmp = tmp.to_str().unwrap_or("/tmp");
+    [tmp, "/tmp", "/private/tmp", "/var/folders", "/private/var/folders"].iter().any(|d| paths::inside(path, d).is_some())
 }
 
 fn result_texts(content: Option<&Value>) -> Vec<&str> {
@@ -636,14 +636,11 @@ pub fn classify_url(url: &str) -> (LinkKind, String, String) {
 
 /// A path relative to the terminal's directory when inside it, else with `~` for home.
 pub fn file_title(path: &str, cwd: &str) -> String {
-    let cwd = cwd.trim_end_matches('/');
-    if !cwd.is_empty()
-        && let Some(rel) = path.strip_prefix(cwd).and_then(|r| r.strip_prefix('/'))
-    {
+    if let Some(rel) = paths::inside(path, cwd) {
         return rel.to_string();
     }
-    if let Ok(home) = std::env::var("HOME")
-        && let Some(rel) = path.strip_prefix(home.trim_end_matches('/')).filter(|r| r.starts_with('/'))
+    if let Some(home) = paths::home_var()
+        && let Some(rel) = paths::after(path, &home).filter(|r| !r.is_empty())
     {
         return format!("~{rel}");
     }

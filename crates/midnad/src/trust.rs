@@ -161,7 +161,9 @@ fn confirm(d: &Daemon) {
         due
     };
     for (sid, cwd) in due {
-        let alive = d.core().state.session(&sid).is_some_and(|s| s.pid.is_some() && !s.status.state.is_terminal());
+        // The agent itself, not just the terminal: after a "No" it exits and the terminal can
+        // carry on as a shell (`agents.shell_on_exit`, or the shell `claude` was typed into).
+        let alive = d.core().state.session(&sid).is_some_and(|s| s.pid.is_some() && s.agent.is_some() && !s.status.state.is_terminal());
         let dialog = d.rt(&sid).and_then(|rt| rt.read(true)).is_none_or(|(screen, _, _)| screen_shows_trust(&screen).is_some());
         if alive && !dialog {
             remember(d, &cwd);
@@ -176,9 +178,9 @@ fn remember(d: &Daemon, cwd: &str) {
     if covered(&list, &home, cwd) {
         return;
     }
-    let entry = match cwd.strip_prefix(&home) {
-        Some(rest) if home != "/" && (rest.is_empty() || rest.starts_with('/')) => format!("~{rest}"),
-        _ => cwd.to_string(),
+    let entry = match paths::after(cwd, &home) {
+        Some(rest) => format!("~{rest}"),
+        None => cwd.to_string(),
     };
     list.push(entry);
     let human = Actor { kind: ActorKind::Human, session: None, name: None, trigger: None, via: None };
@@ -193,8 +195,9 @@ fn trust_folders(d: &Daemon) -> Vec<String> {
 /// folder and everything under it; `~` is `home`; `*` matches within one folder name and `**`
 /// any number of folders. A cwd with `.` or `..` in it is never covered.
 pub fn covered(patterns: &[String], home: &str, cwd: &str) -> bool {
-    let path: Vec<&str> = cwd.split('/').filter(|p| !p.is_empty()).collect();
-    if !cwd.starts_with('/') || path.iter().any(|p| *p == "." || *p == "..") {
+    let cwd = paths::case_folded(cwd);
+    let path: Vec<&str> = cwd.split(paths::SEPARATORS).filter(|p| !p.is_empty()).collect();
+    if !paths::is_absolute(&cwd) || path.iter().any(|p| *p == "." || *p == "..") {
         return false;
     }
     patterns.iter().any(|pat| {
@@ -202,7 +205,8 @@ pub fn covered(patterns: &[String], home: &str, cwd: &str) -> bool {
             Some(rest) => format!("{home}{rest}"),
             None => pat.clone(),
         };
-        let pat: Vec<&str> = abs.split('/').filter(|p| !p.is_empty()).collect();
+        let abs = paths::case_folded(&abs);
+        let pat: Vec<&str> = abs.split(paths::SEPARATORS).filter(|p| !p.is_empty()).collect();
         prefix_match(&pat, &path)
     })
 }

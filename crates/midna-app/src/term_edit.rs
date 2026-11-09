@@ -443,7 +443,7 @@ pub fn agent_running(processes: &serde_json::Value) -> Option<&'static str> {
     let ps = processes.as_array().or_else(|| processes["processes"].as_array())?;
     ps.iter().filter(|p| p["depth"].as_u64().unwrap_or(0) > 0).find_map(|p| {
         let words = p["command"].as_str().unwrap_or("").split_whitespace().take(2);
-        words.map(|w| w.rsplit('/').next().unwrap_or(w)).find_map(|w| match w {
+        words.map(midna_proto::paths::program_name).find_map(|w| match w {
             "claude" => Some("claude"),
             "codex" => Some("codex"),
             _ => None,

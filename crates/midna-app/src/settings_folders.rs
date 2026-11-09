@@ -5,11 +5,9 @@ use super::*;
 
 /// `path` with the home folder written as `~`, the way the CLI and the catalog show paths.
 fn tilde(path: &str, home: &str) -> String {
-    let home = home.trim_end_matches('/');
-    match path.strip_prefix(home) {
-        Some("") if !home.is_empty() => "~".into(),
-        Some(rest) if !home.is_empty() && rest.starts_with('/') => format!("~{rest}"),
-        _ => path.to_string(),
+    match midna_proto::paths::after(path, home) {
+        Some(rest) => format!("~{rest}"),
+        None => path.to_string(),
     }
 }
 
@@ -36,7 +34,7 @@ impl SettingsWindow {
             let Ok(Ok(Some(paths))) = paths.await else {
                 return;
             };
-            let home = std::env::var("HOME").unwrap_or_default();
+            let home = midna_proto::paths::home_var().unwrap_or_default();
             let picked: Vec<String> = paths.iter().map(|p| tilde(&p.to_string_lossy(), &home)).collect();
             let _ = this.update(cx, |s, cx| {
                 let list = s.folders(&key);

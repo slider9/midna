@@ -186,6 +186,100 @@ fn plain(p: PathBuf) -> PathBuf {
     if short.len() >= 260 || odd { p } else { PathBuf::from(short) }
 }
 
+// ------------------------------------------------------------------ path text
+//
+// Paths midna keeps as text (projects, cwds, settings) on Windows come as `C:\x` from Windows,
+// `C:/x` from git and either from people, and Windows ignores case. These read both; on macOS
+// each is what the code had inline (`rsplit('/')`, `starts_with('/')`, …).
+
+/// What separates a path's parts: `/`, and on Windows `\` too.
+pub const SEPARATORS: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+
+fn is_sep(b: u8) -> bool {
+    b == b'/' || (cfg!(windows) && b == b'\\')
+}
+
+/// A path's last part: `b` for `/a/b` and `/a/b/` (and on Windows `C:\a\b`); "" for a root.
+pub fn base_name(p: &str) -> &str {
+    p.trim_end_matches(SEPARATORS).rsplit(SEPARATORS).next().unwrap_or("")
+}
+
+/// A program as people type it: its [`base_name`], on Windows without `.exe` (or `.cmd`, `.bat`,
+/// `.com`), so `C:\Program Files\Git\bin\bash.exe` is `bash`.
+pub fn program_name(p: &str) -> &str {
+    let b = base_name(p);
+    if cfg!(windows) {
+        for ext in [".exe", ".cmd", ".bat", ".com"] {
+            if let Some(stem) = b.len().checked_sub(ext.len()).filter(|&n| n > 0 && b.is_char_boundary(n)).map(|n| &b[..n])
+                && b[stem.len()..].eq_ignore_ascii_case(ext)
+            {
+                return stem;
+            }
+        }
+    }
+    b
+}
+
+/// An absolute path: `/…`, and on Windows `C:\…`, `C:/…` or `\\server\share\…` too.
+pub fn is_absolute(p: &str) -> bool {
+    p.starts_with('/') || (cfg!(windows) && Path::new(p).is_absolute())
+}
+
+/// `p` without trailing separators, except that a root keeps its own (`/`, `C:\`).
+pub fn trim_end_sep(p: &str) -> &str {
+    let t = p.trim_end_matches(SEPARATORS);
+    let drive = cfg!(windows) && t.len() == 2 && t.as_bytes()[1] == b':';
+    if t.is_empty() || drive { p.get(..t.len() + 1).unwrap_or(p) } else { t }
+}
+
+/// What of `path` follows `dir`: "" when they're the same folder, `/x` (or `\x`) when it's
+/// inside, None otherwise. On Windows the separators are alike and case doesn't count. A root
+/// `dir` covers nothing, as before these were shared.
+pub fn after<'a>(path: &'a str, dir: &str) -> Option<&'a str> {
+    let dir = dir.trim_end_matches(SEPARATORS).as_bytes();
+    let p = path.as_bytes();
+    let same = |a: &u8, b: &u8| if cfg!(windows) { a.eq_ignore_ascii_case(b) || (is_sep(*a) && is_sep(*b)) } else { a == b };
+    if dir.is_empty() || p.len() < dir.len() || !p.iter().zip(dir).all(|(a, b)| same(a, b)) {
+        return None;
+    }
+    let rest = path.get(dir.len()..)?;
+    (rest.is_empty() || rest.starts_with(SEPARATORS)).then_some(rest)
+}
+
+/// Whether `path` is the folder `dir` or inside it (both absolute).
+pub fn is_under(path: &str, dir: &str) -> bool {
+    after(path, dir).is_some()
+}
+
+/// `path` from inside the folder `dir` (`src/a.rs` for `/p/src/a.rs` in `/p`), as written in
+/// `path`; None when it isn't inside, or is `dir` itself.
+pub fn inside<'a>(path: &'a str, dir: &str) -> Option<&'a str> {
+    after(path, dir).map(|r| r.trim_start_matches(SEPARATORS)).filter(|r| !r.is_empty())
+}
+
+/// Whether `a` and `b` are one path. Off Windows they're equal; on Windows `C:/x`, `C:\x` and
+/// `c:\X\` are one path too.
+pub fn same_path(a: &str, b: &str) -> bool {
+    if cfg!(windows) { after(a, b).is_some_and(|r| r.trim_matches(SEPARATORS).is_empty()) } else { a == b }
+}
+
+/// The home folder as text: `$HOME`; on Windows [`user_home`], since a Windows process often
+/// has no `HOME`.
+pub fn home_var() -> Option<String> {
+    if cfg!(windows) { Some(user_home().to_string_lossy().into_owned()) } else { std::env::var("HOME").ok() }
+}
+
+/// `p` for matching by name: lowercase on Windows, where case doesn't count; as it is elsewhere.
+pub fn case_folded(p: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) { p.to_lowercase().into() } else { p.into() }
+}
+
+/// A path git printed, the way this system writes paths: git on Windows prints `C:/Users/x`
+/// where Windows and midna have `C:\Users\x`. Only a drive or UNC path changes.
+pub fn native(p: &str) -> String {
+    if cfg!(windows) && Path::new(p).is_absolute() { p.replace('/', "\\") } else { p.to_string() }
+}
+
 pub fn state_path(home: &std::path::Path) -> PathBuf {
     home.join("state.json")
 }
@@ -259,5 +353,55 @@ mod tests {
         assert!(check_write(&dev.join("bin/current"), &protected).is_ok());
         assert!(check_write(&tmp.join("prod-other"), &protected).is_ok(), "a sibling sharing the prefix");
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn path_text_on_slashes() {
+        assert_eq!(base_name("/a/b"), "b");
+        assert_eq!(base_name("/a/b/"), "b");
+        assert_eq!(base_name("/"), "");
+        assert_eq!(program_name("/bin/zsh"), "zsh");
+        assert!(is_absolute("/x") && !is_absolute("x/y") && !is_absolute("~/x"));
+        assert_eq!(trim_end_sep("/a/b/"), "/a/b");
+        assert_eq!(trim_end_sep("/"), "/");
+        assert!(is_under("/p/src/a.rs", "/p") && is_under("/p", "/p/") && is_under("/p/", "/p"));
+        assert!(!is_under("/pq", "/p") && !is_under("/p", "/p/src") && !is_under("/x", "/"));
+        assert_eq!(inside("/p/src/a.rs", "/p"), Some("src/a.rs"));
+        assert_eq!(inside("/p", "/p"), None);
+        assert!(same_path("/a/b", "/a/b") && !same_path("/a/b", "/a/c"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn path_text_off_windows_is_as_written() {
+        assert_eq!(base_name(r"C:\a\b"), r"C:\a\b");
+        assert_eq!(program_name("/usr/bin/tool.exe"), "tool.exe");
+        assert!(!is_absolute(r"C:\x"));
+        assert!(!is_under("/P/x", "/p"), "case counts");
+        assert_eq!(native("C:/a/b"), "C:/a/b");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_text_on_windows() {
+        assert_eq!(base_name(r"C:\a\b"), "b");
+        assert_eq!(base_name(r"C:\a\b\"), "b");
+        assert_eq!(base_name("C:/a/b"), "b");
+        assert_eq!(program_name(r"C:\PROGRA~1\Git\usr\bin\sh.exe"), "sh");
+        assert_eq!(program_name(r"C:\npm\claude.CMD"), "claude");
+        assert_eq!(program_name(".exe"), ".exe");
+        assert!(is_absolute(r"C:\x") && is_absolute("C:/x") && is_absolute(r"\\host\share\x") && is_absolute("/x"));
+        assert!(!is_absolute(r"x\y") && !is_absolute("C:x"));
+        assert_eq!(trim_end_sep(r"C:\a\"), r"C:\a");
+        assert_eq!(trim_end_sep(r"C:\"), r"C:\");
+        assert_eq!(trim_end_sep("C:/"), "C:/");
+        assert!(is_under(r"C:\Projects\x\src", r"C:\Projects\x"));
+        assert!(is_under("C:/projects/X/src", r"C:\Projects\x\"), "git's slashes, other case");
+        assert!(!is_under(r"C:\Projects\xy", r"C:\Projects\x"));
+        assert_eq!(inside(r"C:\p\src\a.rs", "C:/P"), Some(r"src\a.rs"));
+        assert!(same_path(r"C:\a\b", "c:/A/B/") && !same_path(r"C:\a\b", r"C:\a\bc"));
+        assert_eq!(native("C:/a/b"), r"C:\a\b");
+        assert_eq!(native("//host/share/x"), r"\\host\share\x");
+        assert_eq!(native("/r/x"), "/r/x");
     }
 }

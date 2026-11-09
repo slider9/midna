@@ -297,7 +297,7 @@ fn open_session(d: &Arc<Daemon>, ctx: &Ctx, p: SessionOpenParams) -> Result<Sess
     mark_injected(d, &command, &mut env);
     let name = p.name.clone().unwrap_or_else(|| match agent {
         Some(a) => a.as_str().to_string(),
-        None => command[0].rsplit('/').next().unwrap_or("shell").to_string(),
+        None => paths::program_name(&command[0]).to_string(),
     });
     let now = time::now_rfc3339();
     let (cols, rows) = (p.cols.unwrap_or(100).max(2), p.rows.unwrap_or(30).max(2));
@@ -1404,7 +1404,7 @@ mod keystroke_tests {
 /// folder, else where it started), never to the daemon's own working directory, which is `/`.
 fn absolute_cwd(d: &Daemon, ctx: &Ctx, cwd: &str) -> Result<String, RpcError> {
     let path = match cwd.strip_prefix('~') {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("{}{rest}", home_dir()),
+        Some(rest) if rest.is_empty() || rest.starts_with(paths::SEPARATORS) => format!("{}{rest}", home_dir()),
         _ => cwd.to_string(),
     };
     if std::path::Path::new(&path).is_absolute() {
@@ -1418,7 +1418,7 @@ fn absolute_cwd(d: &Daemon, ctx: &Ctx, cwd: &str) -> Result<String, RpcError> {
 }
 
 pub fn home_dir() -> String {
-    std::env::var("HOME").ok().filter(|h| std::path::Path::new(h).is_dir()).unwrap_or_else(|| "/".into())
+    paths::home_var().filter(|h| std::path::Path::new(h).is_dir()).unwrap_or_else(|| "/".into())
 }
 
 #[cfg(test)]

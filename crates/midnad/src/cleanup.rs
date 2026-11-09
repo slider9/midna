@@ -142,7 +142,7 @@ fn worktree_list(cwd: &str) -> Option<(String, Vec<crate::worktrees::Entry>)> {
 /// Note the repo, branch and worktree `sid` works in (`cwd`). Cheap after the first look at a repo.
 pub fn observe(d: &Daemon, sid: &str, cwd: &str, info: Option<&GitInfo>) {
     let Some(info) = info else { return };
-    let Some(top) = git(cwd, &["rev-parse", "--path-format=absolute", "--show-toplevel"]) else { return };
+    let Some(top) = git(cwd, &["rev-parse", "--path-format=absolute", "--show-toplevel"]).map(|t| paths::native(&t)) else { return };
     let known = {
         let book = d.cleanup.book(&d.cfg.home);
         book.trails.get(sid).and_then(|t| t.repos.iter().find(|(main, r)| **main == top || r.worktrees.contains(&top)).map(|(m, _)| m.clone()))
@@ -237,7 +237,7 @@ pub fn after_close(d: &Arc<Daemon>, c: Closing) {
 
 fn expand(p: &str) -> String {
     match p.strip_prefix('~') {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("{}{rest}", std::env::var("HOME").unwrap_or_default()),
+        Some(rest) if rest.is_empty() || rest.starts_with(paths::SEPARATORS) => format!("{}{rest}", paths::home_var().unwrap_or_default()),
         _ => p.to_string(),
     }
 }
@@ -247,8 +247,8 @@ pub fn kept_by<'a>(keep: &'a [String], branch: Option<&str>, path: Option<&str>)
     keep.iter()
         .find(|k| {
             let k = k.trim();
-            if k.starts_with('/') || k.starts_with('~') {
-                path.is_some_and(|p| path_within(p, expand(k).trim_end_matches('/')))
+            if paths::is_absolute(k) || k.starts_with('~') {
+                path.is_some_and(|p| path_within(p, &expand(k)))
             } else {
                 branch.is_some_and(|b| crate::policy::glob_match(k, b))
             }

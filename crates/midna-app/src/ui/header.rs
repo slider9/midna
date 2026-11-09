@@ -97,7 +97,7 @@ fn button_label(b: &str) -> &str {
         "split" => "Split",
         "popout" => "Pop out",
         "restart" => "Restart",
-        p => p.rsplit('/').next().unwrap_or(p),
+        p => midna_proto::paths::base_name(p),
     }
 }
 
@@ -117,7 +117,7 @@ pub fn buttons(m: &MainWindow) -> Vec<String> {
 
 /// The script paths in `ui.header.buttons` (custom buttons).
 pub fn custom_buttons(m: &MainWindow) -> Vec<String> {
-    buttons(m).into_iter().filter(|b| b.starts_with('/')).collect()
+    buttons(m).into_iter().filter(|b| midna_proto::paths::is_absolute(b)).collect()
 }
 
 /// Built-in buttons left out of `ui.header.buttons`: their actions live in the More menu.
@@ -208,7 +208,7 @@ fn toolbar_button(m: &MainWindow, b: String, t: &Theme, cx: &mut Context<MainWin
             }))
             .into_any_element(),
         "restart" => tool(t, "tb-restart", Icon::Restart, "Restart", "keys.restart").on_click(cx.listener(|m, _, _, cx| m.restart_selected(cx))).into_any_element(),
-        p if p.starts_with('/') => custom_button(m, b, t, cx)?,
+        p if midna_proto::paths::is_absolute(p) => custom_button(m, b, t, cx)?,
         _ => return None,
     })
 }
@@ -261,11 +261,11 @@ fn click_custom(m: &mut MainWindow, sid: String, path: String, cx: &mut Context<
 fn buttons_menu(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> impl IntoElement + use<> {
     let current = buttons(m);
     let mut list = menu_box(t).occlude().text_size(px(12.5));
-    let all = midna_proto::settings::HEADER_BUTTONS.iter().map(|s| s.to_string()).chain(current.iter().filter(|b| b.starts_with('/')).cloned());
+    let all = midna_proto::settings::HEADER_BUTTONS.iter().map(|s| s.to_string()).chain(current.iter().filter(|b| midna_proto::paths::is_absolute(b)).cloned());
     for b in all {
         let on = current.iter().any(|c| *c == b);
         let next = crate::ui::statusbar::toggled(&current, &b, "ui.header.buttons");
-        let hint = if b.starts_with('/') { "unchecking removes it" } else { "" };
+        let hint = if midna_proto::paths::is_absolute(&b) { "unchecking removes it" } else { "" };
         list = list.child(
             menu_item(t, &format!("hb-{b}"), button_label(&b), hint, cx.listener(move |m, _, _, cx| save_list(m, "ui.header.buttons", next.clone(), cx)))
                 .child(div().size(px(14.)).flex_none().when(on, |d| d.child(Icon::Check.el(13., t.accent)))),

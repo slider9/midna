@@ -46,6 +46,7 @@ would build them in with `\r\n`.
 | Default shell | `$SHELL -l` | `MIDNA_SHELL`, else `SHELL` if it is a Windows path, else pwsh, else Windows PowerShell (`-NoLogo`) |
 | PATH for terminals and agents | the login shell re-reads it | `sys::user_path()`: the system's and the user's from the registry, read fresh for each terminal, then midnad's own. A tool installed while midnad runs is found |
 | Canonical paths | `std::fs::canonicalize` | `paths::canonical()` drops the `\\?\` prefix canonicalize adds, so projects and cwds are stored and shown as `D:\x` |
+| Paths kept as text | split and checked on `/` | `midna_proto::paths` helpers (`base_name`, `program_name`, `is_absolute`, `is_under`, `inside`, `same_path`, `trim_end_sep`, `native`, `home_var`): `\` and `/` both separate, case doesn't count, `.exe` comes off a program's name, git's `C:/x` becomes `C:\x`, and `~` is `%USERPROFILE%`. On macOS each does what the inline code it replaced did |
 | Daemon start | launchd, `--launchd` | `midnad` detaches with DETACHED_PROCESS (breakaway from the job when allowed); no autostart yet |
 | Installed binaries | `bin/current` symlink | `bin/current` is a text file naming the version dir |
 | In-place upgrade / restart | exec with the same pid, terminals kept | refused (`upgrade_windows.rs`): no exec on Windows. Stop the daemon and start the new one |
@@ -104,10 +105,10 @@ shortcut list and the menus and hints you see most are done.
 
 - `cargo build --workspace`, with no warnings.
 - Tests:
-  - `midna-proto`: 105/105.
+  - `midna-proto`: 107/107.
   - `midnad --lib`: 224 pass, 1 ignored. This includes ConPTY (`a_console_app_runs_in_the_pseudoconsole`), MSVC argument quoting, `which` with PATHEXT, the process table, a TCP listener lookup and the socket peer pid.
   - `midna-cli`: all 51 unit tests and every integration test pass: `cli` 13, `mcp` 4, `secrets_cli` 6 (including `secret exec` masking), `system_wait` 1, `triggers_cli` 3. `adopt.rs` is Unix only.
-  - midnad integration tests (`crates/midnad/tests/*.rs`): 170 of 200 pass (4 ignored: three helpers the tests run as programs, and one ignored on every platform). What fails and why is item 2 under "Not done yet".
+  - midnad integration tests (`crates/midnad/tests/*.rs`): 187 of 200 pass (4 ignored: three helpers the tests run as programs, and one ignored on every platform). What fails and why is item 2 under "Not done yet".
   - `midna-app`: 350 unit tests, including key dispatch through GPUI with this platform's defaults.
 - End to end, with `midnad.exe --foreground` on a temp `MIDNA_HOME` and the real `midna.exe`:
   - Terminals open and run commands for Windows PowerShell 5.1 (the default shell), cmd and Git Bash. `send` and `read --screen` work, `list` shows the console titles, and cwd is honoured.
@@ -123,22 +124,27 @@ In rough order of how much they matter:
 1. **macOS wording.** The shortcuts work (see Shortcuts), but setting descriptions, blurbs, the setup
    screen and many hints still say ⌘ and ⌥.
 2. **Integration tests: the product gaps they show.** The tests run on Windows through the helpers in `crates/midnad/tests/common/mod.rs` (and midna-cli's): `tmp()`, `sh()` and `posix_bin()` (Git for Windows' `usr\bin` tools, as 8.3 paths), `script()` (a `.sh` with a `.cmd` that runs it), and a copy of the test binary standing in for `nc -U`. Each test binary sets `MIDNA_SHELL` to Git's `sh`, so one-line commands get a POSIX shell as on macOS. What's Unix only is `cfg(unix)` with its reason: `shell_integration.rs`, in-place upgrade and restart (`upgrade.rs` checks the refusal instead), file modes, `/` as the root, and `adopt.rs` until the shims below exist. The tests that still fail do so on the product:
-   - **Paths split and checked on `/` only.** Basenames use `rsplit('/')` (`rpc/session.rs:300`, `auto_name.rs`, `rpc/project.rs:50`, `git.rs:74`, `procs.rs:285`, `midna-proto/src/system.rs`), so a terminal is named `C:\PROGRA~1\Git\usr\bin\sh.exe` and a project by its whole path. `agents.trust_folders`, `ui.status.items` and `ui.header.buttons` (`midna-proto/src/settings.rs:132,191`) and `rpc/script.rs:124` want a leading `/`. `rpc/project.rs:66` matches a project with `"{}/"`, so a subfolder becomes a project of its own, and worktree paths git prints as `C:/…` aren't canonicalised. 17 tests across approvals, auto_name, daemon, local_triggers, notify and system fail on these.
    - **`.cmd` agents get broken arguments.** A `.cmd` runs as `cmd /d /s /c "…"`, and cmd drops every argument after a newline (Claude's system hint) and acts on `|`, `<`, `>` and `&` inside them (Codex's hint). npm's `claude.cmd` and `codex.cmd` are affected the same way (agent_args, global_hooks).
    - **Agent calls are slow:** about 20 ms an agent RPC and 130 ms an `agent.hook` alone (a human call takes under 1 ms), 0.5–1 s a hook with a few terminals running. Resume's usage-limit tests run out their few-second windows in parallel and pass with `--test-threads=1`.
-   - **ConPTY on Windows 10** drops faint text (SGR 2), so Claude's dim placeholder reads as typed text and a queued restart waits forever (restart_queue). It also clears a new terminal's screen, so an exited agent's last screen isn't kept above its shell (shell_on_exit). It keeps an app's kitty keyboard push, and probably its mouse mode, to itself (prompt jumps in a full-screen view fail; the tests now expect legacy keys). Its first title is the program's path.
+   - **ConPTY on Windows 10** drops faint text (SGR 2), so Claude's dim placeholder reads as typed text and a queued restart waits forever (restart_queue). It also clears a new terminal's screen, so an exited agent's last screen isn't kept above its shell (shell_on_exit). That screen was also how midna told a "No" typed into Claude's folder-trust dialog from a "Yes"; it now also checks that the agent is still running (`trust::confirm`). It keeps an app's kitty keyboard push, and probably its mouse mode, to itself (prompt jumps in a full-screen view fail; the tests now expect legacy keys). Its first title is the program's path.
    - **One handle leaks** per terminal open and close (`resources.rs`: 146 → 346 over 200 cycles).
    - **Intermittent: typed input gets lost.** Bytes sent to a fresh Git Bash terminal sometimes go missing: the first (`stream_attach_frames_roundtrip` once read `cho streamed-…`), a `\0` typed in a command, or the final Enter (`stream_keys_scroll_and_selection` fails about two runs in three). `steps_for_a_refused_prompt_clear_it_from_the_input_box` and `apps_register_their_own_link_patterns` fail now and then too.
-3. **Typed agents in PowerShell and cmd.** The adopt shims are sh scripts without an extension, which only Git Bash runs. PowerShell and cmd need `claude.cmd` / `codex.cmd` (`midna.exe shim claude %*`; `is_shim` already recognises them).
-4. **Shell integration.** `init.bash`, zsh and fish are wired up by shell name (`/`-separated, no `.exe`), so Git Bash terminals get none yet. PowerShell has no integration (prompt marks, cwd reports) at all.
-5. **Daemon lifecycle.** There's no autostart (a Run key or Task Scheduler entry), no installer or updater, and no in-place upgrade. Upgrading keeping terminals alive would need a separate pty-host process that owns the ConPTYs.
-6. **App stubs.** Notifications play a sound only (no toast). Badge, twilight, Kass composer, haptics and app link previews are missing. Commands that only exist on macOS (`sips`, `plutil`, `mdfind`, `xed`, `open -a`, `defaults`) do nothing, and menus and text still use macOS wording.
-7. **Codex notify when midna.exe is gone.** The global entry calls midna.exe directly, so uninstalling midna without `midna hooks uninstall` also stops the previous notify command. The sh wrapper on macOS checks `-x` first.
-8. **Console windows.**
+3. **Claude Code's PowerShell tool.** On Windows agents run many commands through the PowerShell
+   tool rather than Bash. midna's hooks match every tool, so they fire, but the logic that reads
+   a command only knows `Bash`: approval rules (`Bash(rm -rf*)`), the load guard's heavy-command
+   and model checks (`guard.rs`), insights (`insights.rs`) and links (`links.rs`). Taskboard's
+   Windows branch handles the same tool (its 4ed0189: PowerShell counts as a shell, and
+   `Set-Location` as a cd).
+4. **Typed agents in PowerShell and cmd.** The adopt shims are sh scripts without an extension, which only Git Bash runs. PowerShell and cmd need `claude.cmd` / `codex.cmd` (`midna.exe shim claude %*`; `is_shim` already recognises them), though cmd mangles arguments with newlines or `|<>&` (item 2). A copy or hard link of `midna.exe` named `claude.exe` that runs `shim claude` when started under that name would avoid cmd and work in every shell; taskboard copies its `tb.exe` into `~/.local/bin` for the same reason (a symlink needs Developer Mode).
+5. **Shell integration.** `init.bash`, zsh and fish are wired up by shell name (`/`-separated, no `.exe`), so Git Bash terminals get none yet. PowerShell has no integration (prompt marks, cwd reports) at all.
+6. **Daemon lifecycle.** There's no autostart (a Run key or Task Scheduler entry), no installer or updater, and no in-place upgrade. Upgrading keeping terminals alive would need a separate pty-host process that owns the ConPTYs.
+7. **App stubs.** Notifications play a sound only (no toast). Badge, twilight, Kass composer, haptics and app link previews are missing. Commands that only exist on macOS (`sips`, `plutil`, `mdfind`, `xed`, `open -a`, `defaults`) do nothing, and menus and text still use macOS wording.
+8. **Codex notify when midna.exe is gone.** The global entry calls midna.exe directly, so uninstalling midna without `midna hooks uninstall` also stops the previous notify command. The sh wrapper on macOS checks `-x` first.
+9. **Console windows.**
    - midnad runs with a hidden console (`CREATE_NO_WINDOW`) so its git and other console children share it and no windows flash. With `DETACHED_PROCESS` each one opened a window.
    - `midna-app` is still a console-subsystem exe, so started from Explorer it would open a console window. A release build needs `windows_subsystem = "windows"`, and then the app's own child processes need `CREATE_NO_WINDOW`.
    - A daemon killed with `taskkill /F` can leave a headless `conhost.exe` (a terminal's ConPTY host) behind; a normal stop closes them.
-9. **Socket path length.** A `MIDNA_HOME` deep enough to push `midnad.sock` past 108 bytes fails with "path must be shorter than SUN_LEN". The default home is short; a deep temp dir isn't.
+10. **Socket path length.** A `MIDNA_HOME` deep enough to push `midnad.sock` past 108 bytes fails with "path must be shorter than SUN_LEN". The default home is short; a deep temp dir isn't.
 
 ## macOS side not compiled from here
 

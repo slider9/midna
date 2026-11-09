@@ -404,7 +404,7 @@ pub fn load_percent(load1: f64, cpus: u32) -> u32 {
 pub fn is_poll_loop(command: &str) -> bool {
     let mut words = command.split_whitespace();
     let Some(prog) = words.next() else { return false };
-    let base = prog.rsplit('/').next().unwrap_or(prog).trim_start_matches('-');
+    let base = crate::paths::program_name(prog).trim_start_matches('-');
     if !matches!(base, "bash" | "zsh" | "sh" | "dash" | "fish") {
         return false;
     }
@@ -470,7 +470,7 @@ fn program_words(words: &[String], class: Class) -> Option<String> {
     // Look past assignments, shell keywords and wrappers to the program they run.
     loop {
         let w = words.get(i)?;
-        let base = w.rsplit('/').next().unwrap_or(w);
+        let base = crate::paths::program_name(w);
         // The index after the flags starting at `j`; flags in `with_arg` take the next word.
         let flags = |mut j: usize, with_arg: &[&str]| {
             while let Some(f) = words.get(j).filter(|f| f.starts_with('-') && f.len() > 1) {
@@ -507,7 +507,7 @@ fn program_words(words: &[String], class: Class) -> Option<String> {
             _ => break,
         };
     }
-    let prog = words[i].rsplit('/').next().unwrap_or(&words[i]);
+    let prog = crate::paths::program_name(&words[i]);
     // The subcommand: the next word that isn't a flag or a toolchain (`cargo +nightly test`).
     let sub = words[i + 1..].iter().find(|n| !n.starts_with('-') && !n.starts_with('+')).map_or("", |s| s.as_str());
     match class {
@@ -677,8 +677,7 @@ fn shell_commands(command: &str) -> Vec<Vec<String>> {
 
 /// Whether `path` is `dir` or inside it (both absolute, compared component-wise).
 pub fn path_within(path: &str, dir: &str) -> bool {
-    let dir = dir.trim_end_matches('/');
-    !dir.is_empty() && (path == dir || path.strip_prefix(dir).is_some_and(|r| r.starts_with('/')))
+    crate::paths::is_under(path, dir)
 }
 
 /// A `git worktree lock` reason written by Claude Code for an agent worktree names the

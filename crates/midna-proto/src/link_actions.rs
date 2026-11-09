@@ -99,7 +99,7 @@ pub fn validate_item(item: &LinkMenuItem) -> Result<(), String> {
 
 /// A built-in icon's name (`checklist`), or an absolute path to an .svg or .png.
 fn valid_icon(icon: &str) -> Result<(), String> {
-    if icon.starts_with('/') {
+    if crate::paths::is_absolute(icon) {
         let lower = icon.to_ascii_lowercase();
         return if lower.ends_with(".svg") || lower.ends_with(".png") { Ok(()) } else { Err("a file icon is an .svg or .png".into()) };
     }

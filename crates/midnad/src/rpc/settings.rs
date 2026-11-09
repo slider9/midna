@@ -57,7 +57,7 @@ fn custom_script(s: &SettingSpec, value: &Value, current: &Value) -> bool {
         "ui.header.script" | "ui.row.script" | "ui.status.script" => value.as_str().is_some_and(|v| !midna_proto::settings::is_builtin_script(v)),
         "ui.status.items" | "ui.header.buttons" => {
             let had = |p: &str| current.as_array().is_some_and(|a| a.iter().any(|i| i.as_str() == Some(p)));
-            value.as_array().is_some_and(|a| a.iter().filter_map(Value::as_str).any(|i| i.starts_with('/') && !had(i)))
+            value.as_array().is_some_and(|a| a.iter().filter_map(Value::as_str).any(|i| paths::is_absolute(i) && !had(i)))
         }
         _ => false,
     }

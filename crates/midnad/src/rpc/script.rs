@@ -120,7 +120,7 @@ fn agent(s: &Session) -> Vec<Segment> {
 fn custom(path: &str, s: &Session, slot: ScriptSlot, click: bool) -> Vec<Segment> {
     // a red cross with the message on hover; a path-long message doesn't fit the bar
     let err = |m: String| vec![Segment { tooltip: Some(m), ..Segment::new("", Some(Tone::Err)).icon("cross") }];
-    if !path.starts_with('/') {
+    if !paths::is_absolute(path) {
         return err(format!("script path must be absolute: {path}"));
     }
     if !std::path::Path::new(path).is_file() {

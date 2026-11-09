@@ -67,8 +67,8 @@ pub(crate) fn toggled(items: &[String], item: &str, script: bool) -> Vec<String>
     if items.iter().any(|i| i == item) {
         return items.iter().filter(|i| *i != item).cloned().collect();
     }
-    let path = item.starts_with('/');
-    if script && (path || items.iter().any(|i| i.starts_with('/'))) {
+    let path = midna_proto::paths::is_absolute(item);
+    if script && (path || items.iter().any(|i| midna_proto::paths::is_absolute(i))) {
         return vec![item.to_string()];
     }
     let mut out = items.to_vec();
@@ -87,8 +87,8 @@ pub(crate) fn moved(items: &[String], dragged: &str, target: &str) -> Vec<String
 
 /// A chip's name: a path's file name, else the option with spaces.
 pub(crate) fn chip_label(item: &str) -> String {
-    if item.starts_with('/') {
-        return item.rsplit('/').next().unwrap_or(item).to_string();
+    if midna_proto::paths::is_absolute(item) {
+        return midna_proto::paths::base_name(item).to_string();
     }
     match item {
         "ide" => "IDE".into(),
@@ -148,7 +148,7 @@ impl SettingsWindow {
         let on = self.chips_on(key);
         let next = toggled(&on, item, is_script(key));
         // a path that goes off stays as a chip, so it can go back on
-        for p in on.iter().filter(|p| p.starts_with('/') && !next.contains(p)) {
+        for p in on.iter().filter(|p| midna_proto::paths::is_absolute(p) && !next.contains(p)) {
             if !self.chips.gone.iter().any(|(k, g)| k == key && g == p) {
                 self.chips.gone.push((key.to_string(), p.clone()));
             }
@@ -164,7 +164,7 @@ impl SettingsWindow {
         let script = is_script(&key);
         let mut row = div().id(SharedString::from(format!("chips-{key}"))).flex().flex_wrap().gap(px(6.)).w_full();
         for (n, (item, label, on)) in chips.into_iter().enumerate() {
-            let path = item.starts_with('/');
+            let path = midna_proto::paths::is_absolute(&item);
             let blocked = !on && full;
             let found = !words.is_empty() && words.iter().any(|w| label.to_lowercase().contains(w.as_str()));
             let tip = match () {
