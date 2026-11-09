@@ -50,7 +50,7 @@ fn login_shell() -> String {
 /// Windows PowerShell.
 #[cfg(windows)]
 fn login_shell() -> String {
-    let path = std::env::var("PATH").unwrap_or_default();
+    let path = crate::sys::user_path();
     let named = ["MIDNA_SHELL", "SHELL"]
         .iter()
         .filter_map(|k| std::env::var(k).ok())
@@ -219,7 +219,10 @@ pub(crate) fn mark_injected(d: &Daemon, command: &[String], env: &mut Vec<(Strin
 
 pub(crate) fn session_env(d: &Daemon, sid: &str, project: &str) -> Vec<(String, String)> {
     let cli_dir = std::path::Path::new(&d.cfg.cli_path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    #[cfg(unix)]
     let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".into());
+    #[cfg(windows)]
+    let path = crate::sys::user_path();
     let path = if cli_dir.is_empty() { path } else { format!("{cli_dir}{}{path}", crate::sys::PATH_SEP) };
     vec![
         ("MIDNA_SESSION".into(), sid.into()),
@@ -1411,7 +1414,7 @@ fn absolute_cwd(d: &Daemon, ctx: &Ctx, cwd: &str) -> Result<String, RpcError> {
     let base = ctx.session.as_deref().and_then(|sid| core.state.session(sid)).map(|s| s.agent_info.as_ref().and_then(|a| a.cwd.clone()).unwrap_or_else(|| s.cwd.clone()));
     let base = base.ok_or_else(|| RpcError::bad_params(format!("cwd {cwd:?} is relative; pass an absolute path")))?;
     let joined = std::path::Path::new(&base).join(&path);
-    Ok(std::fs::canonicalize(&joined).unwrap_or(joined).to_string_lossy().into_owned())
+    Ok(midna_proto::paths::canonical(&joined).unwrap_or(joined).to_string_lossy().into_owned())
 }
 
 pub fn home_dir() -> String {

@@ -13,7 +13,7 @@ pub fn list(d: &Daemon) -> R {
 }
 
 fn normalize(path: &str) -> String {
-    let p = std::fs::canonicalize(path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string());
+    let p = midna_proto::paths::canonical(path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string());
     if p.len() > 1 { p.trim_end_matches('/').to_string() } else { p }
 }
 
@@ -34,9 +34,10 @@ fn add_inner(d: &Daemon, actor: Actor, path: &str, name: Option<String>, auto_cr
     if !std::path::Path::new(&path).is_dir() {
         return Err(RpcError::bad_params(format!("{path} is not a directory")));
     }
-    // A project at / would cover every path; terminals there belong to root instead.
-    if path == "/" {
-        return Err(RpcError::bad_params("/ can't be a project; open a terminal there at root instead"));
+    // A project at / (or a Windows drive root) would cover every path; terminals there belong
+    // to root instead.
+    if path == "/" || (cfg!(windows) && std::path::Path::new(&path).parent().is_none()) {
+        return Err(RpcError::bad_params(format!("{path} can't be a project; open a terminal there at root instead")));
     }
     let mut core = d.core();
     if let Some(p) = core.state.projects.iter_mut().find(|p| p.path == path) {

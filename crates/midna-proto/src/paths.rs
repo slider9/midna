@@ -155,6 +155,37 @@ fn resolved(path: &Path) -> PathBuf {
     }
 }
 
+/// [`std::fs::canonicalize`], in the form midna stores and shows paths. On Windows that drops
+/// the verbatim prefix canonicalize adds (`\\?\C:\x` is `C:\x`, `\\?\UNC\host\share` is
+/// `\\host\share`) when the plain form names the same file: shorter than MAX_PATH, and no
+/// component Windows reads differently without the prefix (a trailing dot or space, a device
+/// name like `con`).
+pub fn canonical(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
+    let real = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    let real = plain(real);
+    Ok(real)
+}
+
+#[cfg(windows)]
+fn plain(p: PathBuf) -> PathBuf {
+    let Some(s) = p.to_str() else { return p };
+    let short = match (s.strip_prefix(r"\\?\UNC\"), s.strip_prefix(r"\\?\")) {
+        (Some(unc), _) => format!(r"\\{unc}"),
+        (None, Some(rest)) if rest.as_bytes().get(1) == Some(&b':') => rest.to_string(),
+        _ => return p,
+    };
+    const DEVICES: &[&str] = &[
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7",
+        "lpt8", "lpt9",
+    ];
+    let odd = short.split('\\').any(|c| {
+        let stem = c.split('.').next().unwrap_or(c);
+        (c.ends_with('.') && c != "." && c != "..") || c.ends_with(' ') || DEVICES.iter().any(|d| d.eq_ignore_ascii_case(stem))
+    });
+    if short.len() >= 260 || odd { p } else { PathBuf::from(short) }
+}
+
 pub fn state_path(home: &std::path::Path) -> PathBuf {
     home.join("state.json")
 }
@@ -166,6 +197,30 @@ pub fn events_path(home: &std::path::Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_is_a_plain_absolute_path() {
+        let c = canonical(std::env::temp_dir()).unwrap();
+        assert!(c.is_absolute() && c.is_dir(), "{}", c.display());
+        assert!(!c.to_string_lossy().starts_with(r"\\?\"), "{}", c.display());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_prefix_comes_off_only_when_the_plain_path_means_the_same() {
+        let p = |s: &str| plain(PathBuf::from(s)).to_string_lossy().into_owned();
+        assert_eq!(p(r"\\?\D:\Projects\taskboard"), r"D:\Projects\taskboard");
+        assert_eq!(p(r"\\?\C:\"), r"C:\");
+        assert_eq!(p(r"\\?\UNC\host\share\x"), r"\\host\share\x");
+        // these need the prefix to mean what they say
+        assert_eq!(p(r"\\?\C:\x\con"), r"\\?\C:\x\con");
+        assert_eq!(p(r"\\?\C:\x\nul.txt"), r"\\?\C:\x\nul.txt");
+        assert_eq!(p(r"\\?\C:\x\trailing."), r"\\?\C:\x\trailing.");
+        assert_eq!(p(r"\\?\C:\x\trailing "), r"\\?\C:\x\trailing ");
+        let long = format!(r"\\?\C:\{}", "a".repeat(300));
+        assert_eq!(p(&long), long);
+        assert_eq!(p(r"\\?\Volume{1234}\x"), r"\\?\Volume{1234}\x");
+    }
 
     #[test]
     fn dev_build_ignores_the_inherited_home_and_socket() {

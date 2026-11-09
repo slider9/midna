@@ -1174,7 +1174,7 @@ fn worktrees(a: &Args, out: OutFn) -> Res {
             a.check(&["repo"])?;
             let mut p = json!({});
             if let Some(r) = a.get("repo") {
-                p["repo"] = json!(std::fs::canonicalize(r).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| r.to_string()));
+                p["repo"] = json!(midna_proto::paths::canonical(r).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| r.to_string()));
             }
             out(&call("worktrees.list", p)?, &print::worktrees)
         }
@@ -1182,7 +1182,7 @@ fn worktrees(a: &Args, out: OutFn) -> Res {
             a.check(&["dry-run", "ignore-idle"])?;
             let mut p = json!({ "dry_run": a.has("dry-run"), "ignore_idle": a.has("ignore-idle") });
             if let Some(path) = a.pos.get(2) {
-                p["path"] = json!(std::fs::canonicalize(path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.clone()));
+                p["path"] = json!(midna_proto::paths::canonical(path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.clone()));
             }
             out(&call("worktrees.clean", p)?, &print::worktrees_clean)
         }
@@ -1850,7 +1850,7 @@ fn projects(a: &Args, out: OutFn) -> Res {
         "add" => {
             a.check(&["name"])?;
             let path = a.need(2, "directory path")?;
-            let abs = std::fs::canonicalize(path).map_err(|e| Fail::Usage(format!("{path}: {e}")))?;
+            let abs = midna_proto::paths::canonical(path).map_err(|e| Fail::Usage(format!("{path}: {e}")))?;
             let v = call("project.add", json!({ "path": abs, "name": a.get("name") }))?;
             out(&v, &|v| println!("{}", s_(v, "id")));
         }

@@ -151,7 +151,7 @@ pub fn default_branch_checkout(path: &str) -> Option<String> {
     let at = pick_default_branch(&list, origin.as_deref().map(str::trim))?;
     let top = git(path, &["rev-parse", "--show-toplevel"]);
     // git prints real paths (/private/tmp for /tmp).
-    let real = std::fs::canonicalize(path).ok()?;
+    let real = midna_proto::paths::canonical(path).ok()?;
     let sub = top.and_then(|t| real.strip_prefix(t.trim()).ok().map(Path::to_path_buf)).filter(|r| !r.as_os_str().is_empty());
     let nested = sub.map(|r| Path::new(&at.path).join(r)).filter(|p| p.is_dir());
     Some(nested.map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| at.path.clone()))

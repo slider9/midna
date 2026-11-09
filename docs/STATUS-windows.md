@@ -43,6 +43,8 @@ would build them in with `\r\n`.
 | Keep awake | IOPMAssertion | PowerCreateRequest / PowerSetRequest(SystemRequired) |
 | Secrets (webhooks) | Keychain | Credential Manager (`CredWriteW`, generic, `"{service}/{id}"`) |
 | Default shell | `$SHELL -l` | `MIDNA_SHELL`, else `SHELL` if it is a Windows path, else pwsh, else Windows PowerShell (`-NoLogo`) |
+| PATH for terminals and agents | the login shell re-reads it | `sys::user_path()`: the system's and the user's from the registry, read fresh for each terminal, then midnad's own. A tool installed while midnad runs is found |
+| Canonical paths | `std::fs::canonicalize` | `paths::canonical()` drops the `\\?\` prefix canonicalize adds, so projects and cwds are stored and shown as `D:\x` |
 | Daemon start | launchd, `--launchd` | `midnad` detaches with DETACHED_PROCESS (breakaway from the job when allowed); no autostart yet |
 | Installed binaries | `bin/current` symlink | `bin/current` is a text file naming the version dir |
 | In-place upgrade / restart | exec with the same pid, terminals kept | refused (`upgrade_windows.rs`): no exec on Windows. Stop the daemon and start the new one |
@@ -82,7 +84,11 @@ In rough order of how much they matter:
 5. **Daemon lifecycle.** There's no autostart (a Run key or Task Scheduler entry), no installer or updater, and no in-place upgrade. Upgrading keeping terminals alive would need a separate pty-host process that owns the ConPTYs.
 6. **App stubs.** Notifications play a sound only (no toast). Badge, twilight, Kass composer, haptics and app link previews are missing. Commands that only exist on macOS (`sips`, `plutil`, `mdfind`, `xed`, `open -a`, `defaults`) do nothing, and menus and text still use macOS wording.
 7. **Codex notify when midna.exe is gone.** The global entry calls midna.exe directly, so uninstalling midna without `midna hooks uninstall` also stops the previous notify command. The sh wrapper on macOS checks `-x` first.
-8. **Socket path length.** A `MIDNA_HOME` deep enough to push `midnad.sock` past 108 bytes fails with "path must be shorter than SUN_LEN". The default home is short; a deep temp dir isn't.
+8. **Console windows.**
+   - midnad runs with a hidden console (`CREATE_NO_WINDOW`) so its git and other console children share it and no windows flash. With `DETACHED_PROCESS` each one opened a window.
+   - `midna-app` is still a console-subsystem exe, so started from Explorer it would open a console window. A release build needs `windows_subsystem = "windows"`, and then the app's own child processes need `CREATE_NO_WINDOW`.
+   - A daemon killed with `taskkill /F` can leave a headless `conhost.exe` (a terminal's ConPTY host) behind; a normal stop closes them.
+9. **Socket path length.** A `MIDNA_HOME` deep enough to push `midnad.sock` past 108 bytes fails with "path must be shorter than SUN_LEN". The default home is short; a deep temp dir isn't.
 
 ## macOS side not compiled from here
 

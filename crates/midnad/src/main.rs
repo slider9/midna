@@ -299,14 +299,16 @@ fn detach(cfg: &midnad::Config, passthrough: &[String]) {
             Ok(())
         });
     }
-    // Windows: no console, its own process group, and out of the caller's job when the job
-    // allows it (a terminal's job ends everything in it when the terminal closes).
+    // Windows: a console with no window (not DETACHED_PROCESS, no console at all: then every
+    // console program midnad runs, git on each status refresh, gets a window of its own that
+    // flashes up), its own process group, and out of the caller's job when the job allows it
+    // (a terminal's job ends everything in it when the terminal closes).
     #[cfg(windows)]
     let spawned = {
         use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB).spawn().or_else(|_| {
-            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB).spawn().or_else(|_| {
+            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
             cmd.spawn()
         })
     };

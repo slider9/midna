@@ -269,8 +269,8 @@ pub fn spawn(argv: &[String], cwd: &str, env: &[(String, String)], cols: u16, ro
     let Some(prog) = argv.first() else {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"));
     };
-    let path = env.iter().find(|(k, _)| k.eq_ignore_ascii_case("PATH")).map(|(_, v)| v.clone()).or_else(|| std::env::var("PATH").ok()).unwrap_or_default();
-    let exe = which(prog, &path).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("{prog}: not found")))?;
+    let path = env.iter().find(|(k, _)| k.eq_ignore_ascii_case("PATH")).map(|(_, v)| v.clone()).unwrap_or_else(crate::sys::user_path);
+    let exe = which(prog, &path).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("{prog}: not found on PATH")))?;
     let lower = exe.to_ascii_lowercase();
     // A batch file runs through cmd.exe (CreateProcess can't start one with a pseudoconsole
     // and quoted arguments on its own).

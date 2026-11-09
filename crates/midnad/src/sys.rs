@@ -95,6 +95,27 @@ pub fn session_of(pid: i32) -> Option<i32> {
     imp::session_of(pid)
 }
 
+/// Windows: the PATH a program started now gets, read fresh. That's the system's and then the
+/// user's from the registry, followed by whatever midnad's own PATH adds. Installers write to
+/// the registry, so a `claude` installed while midnad runs is found without restarting it. It
+/// stands in for macOS's login shell, which re-reads the user's PATH for every terminal.
+#[cfg(windows)]
+pub fn user_path() -> String {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    let machine = imp::reg_string(HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment", "Path");
+    let user = imp::reg_string(HKEY_CURRENT_USER, "Environment", "Path");
+    let own = std::env::var("PATH").ok();
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<&str> = vec![];
+    for dir in [&machine, &user, &own].into_iter().flatten().flat_map(|p| p.split(';')) {
+        let dir = dir.trim();
+        if !dir.is_empty() && seen.insert(dir.trim_end_matches('\\').to_ascii_lowercase()) {
+            out.push(dir);
+        }
+    }
+    out.join(";")
+}
+
 #[cfg(unix)]
 mod imp {
     use super::Sig;
@@ -334,5 +355,45 @@ mod imp {
 
     pub fn session_of(_: i32) -> Option<i32> {
         None
+    }
+
+    /// A string value from the registry, `%VAR%`s expanded (RegGetValueW does that for
+    /// REG_EXPAND_SZ). None when it isn't there.
+    pub fn reg_string(root: windows_sys::Win32::System::Registry::HKEY, key: &str, name: &str) -> Option<String> {
+        use windows_sys::Win32::System::Registry::{RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW};
+        let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let (key, name) = (wide(key), wide(name));
+        // An environment variable is at most 32767 characters.
+        let mut buf = vec![0u16; 32768];
+        let mut bytes = (buf.len() * 2) as u32;
+        let r = unsafe {
+            RegGetValueW(root, key.as_ptr(), name.as_ptr(), RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, std::ptr::null_mut(), buf.as_mut_ptr().cast(), &mut bytes)
+        };
+        if r != 0 {
+            return None;
+        }
+        let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..n]))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    #[test]
+    fn user_path_is_the_registrys_first_then_ours_once_each() {
+        let path = super::user_path();
+        let dirs: Vec<String> = path.split(';').map(|d| d.trim_end_matches('\\').to_ascii_lowercase()).collect();
+        let windir = std::env::var("SystemRoot").unwrap().to_ascii_lowercase();
+        assert!(dirs.contains(&format!(r"{windir}\system32")), "{path}");
+        // expanded, not %SystemRoot%
+        assert!(!path.contains('%'), "{path}");
+        let mut unique = dirs.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), dirs.len(), "{path}");
+        // everything midnad's own PATH had is still there
+        for d in std::env::var("PATH").unwrap().split(';').filter(|d| !d.trim().is_empty()) {
+            assert!(dirs.contains(&d.trim().trim_end_matches('\\').to_ascii_lowercase()), "{d} missing from {path}");
+        }
     }
 }

@@ -18,7 +18,7 @@ static RUNNING: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new(
 /// launched (often `bin/current/midnad`, a symlink that an install re-points), so resolve it
 /// once at startup; `main` calls this first thing.
 pub fn running_binary() -> Option<PathBuf> {
-    RUNNING.get_or_init(|| std::env::current_exe().ok().map(|p| std::fs::canonicalize(&p).unwrap_or(p))).clone()
+    RUNNING.get_or_init(|| std::env::current_exe().ok().map(|p| midna_proto::paths::canonical(&p).unwrap_or(p))).clone()
 }
 
 pub fn bin_root(home: &Path) -> PathBuf {

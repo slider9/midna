@@ -96,12 +96,13 @@ pub fn spawn_dev_daemon() -> Result<(), String> {
     cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
-/// No console window, and not in this process's group (so it survives the app and ⌃C).
+/// A console with no window (midnad's console programs share it instead of each flashing a
+/// window of its own), and not in this process's group (so it survives the app and ⌃C).
 #[cfg(windows)]
 fn detach(cmd: &mut Command) {
     use std::os::windows::process::CommandExt;
-    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS};
-    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 }
 
 #[cfg(not(windows))]
