@@ -260,7 +260,7 @@ pub fn handoff_and_exec(d: &Arc<Daemon>, bin: &Path, reason: &str) -> String {
                 continue; // engine already stopped (session closing)
             }
             let snap = rx.recv_timeout(Duration::from_secs(5)).map_err(|_| format!("session {sid}: engine did not snapshot"))?;
-            let Some((_, rdev)) = fd_rdev(rt.fd.0) else { continue };
+            let Some((_, rdev)) = fd_rdev(rt.fd.raw()) else { continue };
             let (alive, in_turn, last_cost) = {
                 let core = d.core();
                 let alive = core.state.session(&sid).is_some_and(|s| s.pid.is_some());
@@ -277,8 +277,8 @@ pub fn handoff_and_exec(d: &Arc<Daemon>, bin: &Path, reason: &str) -> String {
                 }
                 None => None,
             };
-            fds.push(rt.fd.0);
-            sessions.push(HandoffSession { id: sid, pid: rt.pid, alive, fd: rt.fd.0, rdev, term: snap, primary_file, alt_file, in_turn, last_cost });
+            fds.push(rt.fd.raw());
+            sessions.push(HandoffSession { id: sid, pid: rt.pid, alive, fd: rt.fd.raw(), rdev, term: snap, primary_file, alt_file, in_turn, last_cost });
         }
         d.save_now();
         let from_binary = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();

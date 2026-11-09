@@ -44,14 +44,40 @@ const REDUCED_FADE: f32 = 550.;
 const REDUCED_PER_CELL: f32 = 30.;
 const REDUCED_ALPHA: f32 = 0.85;
 
-/// Only the first main window of a launch plays it.
+/// Only the first main window of a launch plays it. Off macOS it never plays: it needs the main
+/// window's layer masked (Core Animation), which only macOS has here.
 pub fn wanted() -> bool {
     static PLAYED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let want = std::env::var("MIDNA_INTRO").map(|v| v != "0").unwrap_or(true) && std::env::var("MIDNA_SNAPSHOT").is_err();
-    want && !PLAYED.swap(true, std::sync::atomic::Ordering::SeqCst)
+    cfg!(target_os = "macos") && want && !PLAYED.swap(true, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The main window's native view (`NSView` on macOS).
+#[cfg(target_os = "macos")]
+type View = objc2::runtime::AnyObject;
+#[cfg(not(target_os = "macos"))]
+type View = std::ffi::c_void;
+
+/// Windows: "Show animations in Windows" off (`SPI_GETCLIENTAREAANIMATION`).
+#[cfg(windows)]
+pub fn reduce_motion() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SPI_GETCLIENTAREAANIMATION, SystemParametersInfoW};
+    if let Ok(v) = std::env::var("MIDNA_REDUCE_MOTION") {
+        return v != "0";
+    }
+    let mut on: i32 = 1;
+    // SAFETY: SPI_GETCLIENTAREAANIMATION writes a BOOL into `on`.
+    let ok = unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&mut on as *mut i32).cast(), 0) };
+    ok != 0 && on == 0
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn reduce_motion() -> bool {
+    std::env::var("MIDNA_REDUCE_MOTION").is_ok_and(|v| v != "0")
 }
 
 /// macOS Accessibility ▸ Display ▸ Reduce motion (`MIDNA_REDUCE_MOTION=1|0` overrides).
+#[cfg(target_os = "macos")]
 pub fn reduce_motion() -> bool {
     if let Ok(v) = std::env::var("MIDNA_REDUCE_MOTION") {
         return v != "0";
@@ -223,7 +249,7 @@ impl Render for Overlay {
             let (cols, rows) = md.cells(CELL, CELL);
             let runs = revealed(cols, rows, ms, self.reduced);
             if runs != self.last_runs {
-                set_mask(self.main_view as *mut objc2::runtime::AnyObject, f64::from(size.height), &runs, CELL * md.s);
+                set_mask(self.main_view as *mut View, f64::from(size.height), &runs, CELL * md.s);
                 self.last_runs = runs;
             }
         }
@@ -361,6 +387,7 @@ fn open_overlay(m: &MainWindow, window: &Window, cx: &mut Context<MainWindow>) -
 }
 
 /// The NSWindow's own background: what shows before (or around) GPUI's first paint.
+#[cfg(target_os = "macos")]
 pub fn native_bg(window: &Window, c: Hsla) {
     let Some(w) = ns_window(window) else { return };
     let c = Rgba::from(c);
@@ -368,6 +395,38 @@ pub fn native_bg(window: &Window, c: Hsla) {
     w.setBackgroundColor(Some(&color));
 }
 
+// Off macOS the window's own background, chrome and mask are GPUI's: nothing to do.
+#[cfg(not(target_os = "macos"))]
+pub fn native_bg(_window: &Window, _c: Hsla) {}
+#[cfg(not(target_os = "macos"))]
+fn ns_view_ptr(_window: &Window) -> Option<*mut View> {
+    None
+}
+#[cfg(not(target_os = "macos"))]
+fn chrome(_window: &Window, _visible: bool) {}
+#[cfg(not(target_os = "macos"))]
+fn traffic_lights(_window: &Window, _visible: bool) {}
+#[cfg(not(target_os = "macos"))]
+fn click_through(_window: &Window) {}
+#[cfg(not(target_os = "macos"))]
+fn set_mask(_view: *mut View, _h: f64, _runs: &[(usize, usize, usize)], _cell: f32) {}
+#[cfg(not(target_os = "macos"))]
+fn clear_mask(_window: &Window) {}
+
+/// A window's native window: `NSWindow` on macOS, none elsewhere yet (nothing off macOS reaches
+/// past GPUI to the platform window).
+#[cfg(target_os = "macos")]
+pub(crate) type NativeWindow = objc2::rc::Retained<objc2_app_kit::NSWindow>;
+#[cfg(not(target_os = "macos"))]
+#[derive(Clone, Debug)]
+pub(crate) enum NativeWindow {}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn ns_window(_window: &Window) -> Option<NativeWindow> {
+    None
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn ns_window(window: &Window) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
     use objc2_app_kit::NSView;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -377,7 +436,8 @@ pub(crate) fn ns_window(window: &Window) -> Option<objc2::rc::Retained<objc2_app
     view.window()
 }
 
-fn ns_view_ptr(window: &Window) -> Option<*mut objc2::runtime::AnyObject> {
+#[cfg(target_os = "macos")]
+fn ns_view_ptr(window: &Window) -> Option<*mut View> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let handle = HasWindowHandle::window_handle(window).ok()?;
     let RawWindowHandle::AppKit(h) = handle.as_raw() else { return None };
@@ -385,12 +445,14 @@ fn ns_view_ptr(window: &Window) -> Option<*mut objc2::runtime::AnyObject> {
 }
 
 /// Show or hide the native window's shadow and traffic lights.
+#[cfg(target_os = "macos")]
 fn chrome(window: &Window, visible: bool) {
     let Some(ns) = ns_window(window) else { return };
     ns.setHasShadow(visible);
     traffic_lights(window, visible);
 }
 
+#[cfg(target_os = "macos")]
 fn traffic_lights(window: &Window, visible: bool) {
     use objc2_app_kit::NSWindowButton;
     let Some(ns) = ns_window(window) else { return };
@@ -402,47 +464,57 @@ fn traffic_lights(window: &Window, visible: bool) {
 }
 
 /// The overlay never takes clicks, focus or a shadow.
+#[cfg(target_os = "macos")]
 fn click_through(window: &Window) {
     let Some(ns) = ns_window(window) else { return };
     ns.setIgnoresMouseEvents(true);
     ns.setHasShadow(false);
 }
 
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CGPoint {
     x: f64,
     y: f64,
 }
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CGSize {
     width: f64,
     height: f64,
 }
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CGRect {
     origin: CGPoint,
     size: CGSize,
 }
+#[cfg(target_os = "macos")]
 unsafe impl objc2::Encode for CGPoint {
     const ENCODING: objc2::Encoding = objc2::Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
 }
+#[cfg(target_os = "macos")]
 unsafe impl objc2::Encode for CGSize {
     const ENCODING: objc2::Encoding = objc2::Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
 }
+#[cfg(target_os = "macos")]
 unsafe impl objc2::Encode for CGRect {
     const ENCODING: objc2::Encoding = objc2::Encoding::Struct("CGRect", &[CGPoint::ENCODING, CGSize::ENCODING]);
 }
 /// `CGPathRef`.
+#[cfg(target_os = "macos")]
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 struct CGPath(*const std::ffi::c_void);
+#[cfg(target_os = "macos")]
 unsafe impl objc2::Encode for CGPath {
     const ENCODING: objc2::Encoding = objc2::Encoding::Pointer(&objc2::Encoding::Struct("CGPath", &[]));
 }
 
+#[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGPathCreateMutable() -> *mut std::ffi::c_void;
@@ -452,7 +524,8 @@ unsafe extern "C" {
 
 /// Mask `view`'s layer (`h` points tall) to `runs` (row, first column, last column) of
 /// `cell`-point cells. Empty: nothing shows.
-fn set_mask(view: *mut objc2::runtime::AnyObject, h: f64, runs: &[(usize, usize, usize)], cell: f32) {
+#[cfg(target_os = "macos")]
+fn set_mask(view: *mut View, h: f64, runs: &[(usize, usize, usize)], cell: f32) {
     use objc2::runtime::{AnyObject, Bool};
     use objc2::{class, msg_send};
     unsafe {
@@ -482,6 +555,7 @@ fn set_mask(view: *mut objc2::runtime::AnyObject, h: f64, runs: &[(usize, usize,
     }
 }
 
+#[cfg(target_os = "macos")]
 fn clear_mask(window: &Window) {
     use objc2::runtime::AnyObject;
     use objc2::{class, msg_send};

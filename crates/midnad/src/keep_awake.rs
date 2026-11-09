@@ -407,6 +407,63 @@ pub fn set(d: &Daemon, ctx: &crate::rpc::Ctx, p: KeepAwakeSetParams) -> crate::r
 
 // ------------------------------------------------------------------ IOKit
 
+/// Windows' equivalents behind the same names: a system-required power request (it keeps the
+/// PC from idle sleep, like the IOKit assertion, and shows in `powercfg /requests` under the
+/// assertion's name), and `GetSystemPowerStatus` for the battery.
+#[cfg(windows)]
+mod iokit {
+    use midna_proto::keep_awake::Battery;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Power::{GetSystemPowerStatus, PowerClearRequest, PowerCreateRequest, PowerRequestSystemRequired, PowerSetRequest, SYSTEM_POWER_STATUS};
+    use windows_sys::Win32::System::Threading::{POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT};
+
+    /// Request handles by the id handed out (handles are pointers; ids are what callers keep).
+    static REQUESTS: Mutex<(u32, Option<HashMap<u32, isize>>)> = Mutex::new((0, None));
+
+    pub fn create(name: &str) -> Result<u32, i32> {
+        let mut reason: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut ctx = REASON_CONTEXT { Version: 0, Flags: POWER_REQUEST_CONTEXT_SIMPLE_STRING, ..Default::default() };
+        ctx.Reason.SimpleReasonString = reason.as_mut_ptr();
+        let h = unsafe { PowerCreateRequest(&ctx) };
+        if h.is_null() || h as isize == -1 {
+            return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
+        }
+        if unsafe { PowerSetRequest(h, PowerRequestSystemRequired) } == 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            unsafe { CloseHandle(h) };
+            return Err(e);
+        }
+        let mut r = REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+        r.0 = r.0.wrapping_add(1).max(1);
+        let id = r.0;
+        r.1.get_or_insert_with(HashMap::new).insert(id, h as isize);
+        Ok(id)
+    }
+
+    pub fn release(id: u32) {
+        let h = REQUESTS.lock().unwrap_or_else(|e| e.into_inner()).1.as_mut().and_then(|m| m.remove(&id));
+        if let Some(h) = h {
+            let h = h as windows_sys::Win32::Foundation::HANDLE;
+            unsafe {
+                PowerClearRequest(h, PowerRequestSystemRequired);
+                CloseHandle(h);
+            }
+        }
+    }
+
+    /// The battery: charge and whether it's on AC. None on a PC without one.
+    pub fn battery() -> Option<Battery> {
+        let mut s: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+        if unsafe { GetSystemPowerStatus(&mut s) } == 0 || s.BatteryFlag & 128 != 0 || s.BatteryFlag == 255 || s.BatteryLifePercent > 100 {
+            return None;
+        }
+        Some(Battery { percent: s.BatteryLifePercent, on_ac: s.ACLineStatus == 1 })
+    }
+}
+
+#[cfg(target_os = "macos")]
 mod iokit {
     use core_foundation::array::{CFArray, CFArrayRef};
     use core_foundation::base::{CFType, CFTypeRef, TCFType};

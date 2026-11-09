@@ -5,15 +5,47 @@
 //! midna restarted it.
 //! The human shouldn't notice it: it prints nothing, keeps Claude's exit code, and whenever
 //! midnad says no or doesn't answer, it becomes the real `claude` as typed.
+//!
+//! Windows has no exec: "becoming" the real agent means running it as a child and exiting
+//! with its code, and the shim lets Ctrl+C through to it instead of forwarding signals.
 use midna_proto::{Client, SessionAdoptEndParams, SessionAdoptParams, SessionAdoptResult};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 /// Claude's pid, for the signal handlers.
+#[cfg(unix)]
 static CHILD: AtomicI32 = AtomicI32::new(0);
+
+/// Run `real` as typed and never come back: exec on Unix, a child whose exit code is ours on
+/// Windows.
+#[cfg(unix)]
+fn become_real(real: &Path, agent: &str, args: &[String]) -> ! {
+    let e = Command::new(real).arg0(agent).args(args).exec();
+    eprintln!("{agent}: {e}");
+    std::process::exit(126)
+}
+
+#[cfg(windows)]
+fn become_real(real: &Path, agent: &str, args: &[String]) -> ! {
+    forward_signals();
+    match Command::new(real).args(args).status() {
+        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+        Err(e) => {
+            eprintln!("{agent}: {e}");
+            std::process::exit(126)
+        }
+    }
+}
+
+fn is_tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
 
 pub fn run(raw: &[String]) -> ! {
     let Some((agent, args)) = raw.split_first() else {
@@ -24,12 +56,8 @@ pub fn run(raw: &[String]) -> ! {
         eprintln!("{agent}: command not found");
         std::process::exit(127)
     };
-    let as_typed = || -> ! {
-        let e = Command::new(&real).arg0(agent).args(args).exec();
-        eprintln!("{agent}: {e}");
-        std::process::exit(126)
-    };
-    let tty = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };
+    let as_typed = || -> ! { become_real(&real, agent, args) };
+    let tty = is_tty();
     let kind = match agent.as_str() {
         "claude" => midna_proto::AgentKind::Claude,
         "codex" => midna_proto::AgentKind::Codex,
@@ -72,7 +100,37 @@ fn ask(method: &str, params: &impl serde::Serialize) -> Option<SessionAdoptResul
     serde_json::from_value(v).ok()
 }
 
+/// Run Claude in the foreground (same console) and return its exit code.
+#[cfg(windows)]
+fn run_child(agent: &str, argv: &[String], env: &std::collections::BTreeMap<String, String>, cwd: Option<&str>) -> i32 {
+    let Some((bin, args)) = argv.split_first() else { return 127 };
+    let mut cmd = Command::new(bin);
+    cmd.args(args).envs(env);
+    if let Some(dir) = cwd.filter(|d| Path::new(d).is_dir()) {
+        cmd.current_dir(dir);
+    }
+    match cmd.status() {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("{agent}: {e}");
+            126
+        }
+    }
+}
+
+/// Ctrl+C and Ctrl+Break are for the agent: the shim, on the same console, handles them by
+/// doing nothing. (A handler routine, not the "ignore" flag, which children would inherit.)
+#[cfg(windows)]
+fn forward_signals() {
+    unsafe extern "system" fn ignore(kind: u32) -> windows_sys::core::BOOL {
+        use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+        (kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT) as windows_sys::core::BOOL
+    }
+    unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(ignore), 1) };
+}
+
 /// Run Claude in the foreground (same process group and tty) and return its exit code.
+#[cfg(unix)]
 fn run_child(agent: &str, argv: &[String], env: &std::collections::BTreeMap<String, String>, cwd: Option<&str>) -> i32 {
     let Some((bin, args)) = argv.split_first() else { return 127 };
     let mut cmd = Command::new(bin);
@@ -118,6 +176,7 @@ fn run_child(agent: &str, argv: &[String], env: &std::collections::BTreeMap<Stri
     }
 }
 
+#[cfg(unix)]
 extern "C" fn pass_on(sig: libc::c_int) {
     let c = CHILD.load(Ordering::Relaxed);
     if c > 0 {
@@ -127,6 +186,7 @@ extern "C" fn pass_on(sig: libc::c_int) {
 
 /// ^C and ^\ reach Claude from the tty already. A hangup or terminate sent to the shim alone
 /// goes on to Claude, and the shim exits with it.
+#[cfg(unix)]
 fn forward_signals() {
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
@@ -160,14 +220,27 @@ fn find_real(agent: &str) -> Option<PathBuf> {
         if shims.is_some() && std::fs::canonicalize(&dir).ok() == shims {
             return None;
         }
-        let c = dir.join(agent);
-        let m = std::fs::metadata(&c).ok()?;
-        let exec = std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o111 != 0;
-        (m.is_file() && exec && !is_shim(&c)).then_some(c)
+        candidates(&dir, agent).into_iter().find(|c| !is_shim(c))
     })
 }
 
-/// midna's own shim, wherever it is (another MIDNA_HOME's on PATH too).
+/// `dir/agent`, if it is an executable file.
+#[cfg(unix)]
+fn candidates(dir: &Path, agent: &str) -> Vec<PathBuf> {
+    let c = dir.join(agent);
+    let exec = std::fs::metadata(&c).is_ok_and(|m| m.is_file() && std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o111 != 0);
+    if exec { vec![c] } else { vec![] }
+}
+
+/// Windows: `dir/agent` with each PATHEXT extension (`claude.exe`, `claude.cmd`, …).
+#[cfg(windows)]
+fn candidates(dir: &Path, agent: &str) -> Vec<PathBuf> {
+    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    exts.split(';').filter(|e| !e.is_empty()).map(|e| dir.join(format!("{agent}{}", e.to_ascii_lowercase()))).filter(|c| c.is_file()).collect()
+}
+
+/// midna's own shim, wherever it is (another MIDNA_HOME's on PATH too): the sh script, or on
+/// Windows the `.cmd` one (`midna.exe shim <agent> %*`).
 fn is_shim(p: &Path) -> bool {
-    std::fs::read(p).is_ok_and(|b| b.len() < 4096 && b.windows(14).any(|w| w == b"exec \"$cli\" sh"))
+    std::fs::read(p).is_ok_and(|b| b.len() < 4096 && (b.windows(14).any(|w| w == b"exec \"$cli\" sh") || b.windows(12).any(|w| w.eq_ignore_ascii_case(b"\" shim claud") || w.eq_ignore_ascii_case(b"\" shim codex"))))
 }

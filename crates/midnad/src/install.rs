@@ -3,8 +3,14 @@
 //! into a versioned directory and swaps the `current` symlink atomically. launchd /
 //! SMAppService (later phase) should point at `bin/current/midnad`, so `daemon.restart` and
 //! a crash restart both run the installed binary.
+//!
+//! Windows: making a symlink needs a privilege (or Developer Mode), so `bin/current` is a small
+//! text file naming the versioned directory instead, swapped the same way (write + rename).
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+
+/// `.exe` on Windows, nothing elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
 
 static RUNNING: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
@@ -19,8 +25,16 @@ pub fn bin_root(home: &Path) -> PathBuf {
     home.join("bin")
 }
 
+#[cfg(unix)]
 pub fn current_binary(home: &Path) -> PathBuf {
     bin_root(home).join("current").join("midnad")
+}
+
+#[cfg(windows)]
+pub fn current_binary(home: &Path) -> PathBuf {
+    let root = bin_root(home);
+    let name = std::fs::read_to_string(root.join("current")).unwrap_or_default();
+    root.join(name.trim()).join(format!("midnad{EXE}"))
 }
 
 /// Install the running executable. Returns the versioned directory.
@@ -33,14 +47,17 @@ pub fn install_self(home: &Path) -> std::io::Result<PathBuf> {
     midna_proto::paths::guard_write(&root)?;
     let dir = root.join(&name);
     std::fs::create_dir_all(&dir)?;
-    copy_exec(&exe, &dir.join("midnad"))?;
-    if let Some(cli) = exe.parent().map(|p| p.join("midna")).filter(|p| p.is_file()) {
-        copy_exec(&cli, &dir.join("midna"))?;
+    copy_exec(&exe, &dir.join(format!("midnad{EXE}")))?;
+    if let Some(cli) = exe.parent().map(|p| p.join(format!("midna{EXE}"))).filter(|p| p.is_file()) {
+        copy_exec(&cli, &dir.join(format!("midna{EXE}")))?;
     }
-    // Atomic swap: a new symlink renamed over the old one.
+    // Atomic swap: a new symlink (Windows: pointer file) renamed over the old one.
     let tmp = root.join(format!(".current.{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&name, &tmp)?;
+    #[cfg(windows)]
+    std::fs::write(&tmp, &name)?;
     std::fs::rename(&tmp, root.join("current"))?;
     Ok(dir)
 }
@@ -48,21 +65,25 @@ pub fn install_self(home: &Path) -> std::io::Result<PathBuf> {
 fn copy_exec(from: &Path, to: &Path) -> std::io::Result<()> {
     let tmp = to.with_extension("tmp");
     std::fs::copy(from, &tmp)?;
+    #[cfg(unix)]
     std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     std::fs::rename(&tmp, to)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::EXE;
+
     #[test]
     fn install_self_versions_and_points_current() {
-        let home = std::path::PathBuf::from(format!("/tmp/midna-inst-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("midna-inst-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let dir = super::install_self(&home).unwrap();
-        assert!(dir.join("midnad").is_file());
+        let bin = dir.join(format!("midnad{EXE}"));
+        assert!(bin.is_file());
         let cur = super::current_binary(&home);
         assert!(cur.is_file());
-        assert_eq!(std::fs::canonicalize(&cur).unwrap(), std::fs::canonicalize(dir.join("midnad")).unwrap());
+        assert_eq!(std::fs::canonicalize(&cur).unwrap(), std::fs::canonicalize(&bin).unwrap());
         // Re-installing the same binary is idempotent.
         assert_eq!(super::install_self(&home).unwrap(), dir);
         let _ = std::fs::remove_dir_all(&home);

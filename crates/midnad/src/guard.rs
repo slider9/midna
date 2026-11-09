@@ -176,16 +176,71 @@ pub fn loadavg() -> (f64, f64, f64) {
     if let Some(l) = std::env::var("MIDNA_DEBUG_LOAD").ok().and_then(|v| v.trim().parse::<f64>().ok()) {
         return (l, l, l);
     }
+    os_loadavg()
+}
+
+#[cfg(unix)]
+fn os_loadavg() -> (f64, f64, f64) {
     let mut a = [0f64; 3];
     let n = unsafe { libc::getloadavg(a.as_mut_ptr(), 3) };
     if n < 3 { (0., 0., 0.) } else { (a[0], a[1], a[2]) }
+}
+
+/// Windows has no load average. This one is the busy share of every core (from the kernel's
+/// CPU time counters) times the core count, averaged over 1, 5 and 15 minutes the way Unix
+/// decays its run queue, sampled whenever it is asked (the guard asks every few seconds).
+#[cfg(windows)]
+fn os_loadavg() -> (f64, f64, f64) {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static LAST: Mutex<Option<(Instant, [u32; 4], [f64; 3])>> = Mutex::new(None);
+    let Some(now_ticks) = cpu_ticks() else { return (0., 0., 0.) };
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    let avg = match *last {
+        None => [0.; 3],
+        Some((at, _, avg)) if now.duration_since(at).as_secs_f64() < 1. => return (avg[0], avg[1], avg[2]),
+        Some((at, before, mut avg)) => {
+            let dt = now.duration_since(at).as_secs_f64();
+            let running = busy_share(before, now_ticks) / 100. * cpus() as f64;
+            for (a, window) in avg.iter_mut().zip([60., 300., 900.]) {
+                let keep = (-dt / window).exp();
+                *a = *a * keep + running * (1. - keep);
+            }
+            avg
+        }
+    };
+    *last = Some((now, now_ticks, avg));
+    (avg[0], avg[1], avg[2])
 }
 
 pub fn cpus() -> u32 {
     std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1)
 }
 
+/// Index of the idle counter in [`cpu_ticks`].
+#[cfg(target_os = "macos")]
+const CPU_IDLE: usize = libc::CPU_STATE_IDLE as usize;
+#[cfg(not(target_os = "macos"))]
+const CPU_IDLE: usize = 2;
+
+/// Windows: user, kernel minus idle, idle, 0, in milliseconds summed over every core (wrapping
+/// like the Mach counters).
+#[cfg(windows)]
+fn cpu_ticks() -> Option<[u32; 4]> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut idle, mut kernel, mut user) = (z, z, z);
+    if unsafe { windows_sys::Win32::System::Threading::GetSystemTimes(&mut idle, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    let ms = |f: FILETIME| ((((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64) / 10_000) as u32;
+    let (idle, kernel, user) = (ms(idle), ms(kernel), ms(user));
+    Some([user, kernel.wrapping_sub(idle), idle, 0])
+}
+
 /// The kernel's CPU tick counters summed over every core: user, system, idle, nice.
+#[cfg(target_os = "macos")]
 #[allow(deprecated)] // libc's mach calls (the mach2 crate isn't worth adding for them)
 fn cpu_ticks() -> Option<[u32; 4]> {
     // mach_host_self hands out a send right each call: take one and keep it.
@@ -204,10 +259,32 @@ fn busy_share(before: [u32; 4], now: [u32; 4]) -> f64 {
     if total == 0 {
         return 0.;
     }
-    (total - d[libc::CPU_STATE_IDLE as usize]) as f64 / total as f64 * 100.
+    (total - d[CPU_IDLE]) as f64 / total as f64 * 100.
+}
+
+/// Windows: memory load (percent of physical memory in use) as the pressure (normal under
+/// 85%, warning under 95%), and page file in use beyond physical memory as swap. Windows
+/// doesn't report what its memory compression holds.
+#[cfg(windows)]
+fn memory_now() -> Memory {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return Memory { pressure: MemoryPressure::Normal, total: 0, compressed: 0, swap: 0 };
+    }
+    let level = match m.dwMemoryLoad {
+        0..85 => 1,
+        85..95 => 2,
+        _ => 4,
+    };
+    let committed = m.ullTotalPageFile.saturating_sub(m.ullAvailPageFile);
+    let resident = m.ullTotalPhys.saturating_sub(m.ullAvailPhys);
+    Memory { pressure: MemoryPressure::from_level(level), total: m.ullTotalPhys, compressed: 0, swap: committed.saturating_sub(resident) }
 }
 
 /// A sysctl by name, as `T` (an int, a struct).
+#[cfg(target_os = "macos")]
 fn sysctl<T: Copy>(name: &str) -> Option<T> {
     let name = std::ffi::CString::new(name).ok()?;
     let mut v: T = unsafe { std::mem::zeroed() };
@@ -217,6 +294,7 @@ fn sysctl<T: Copy>(name: &str) -> Option<T> {
 }
 
 /// macOS's memory pressure, physical memory, what the compressor holds and swap in use.
+#[cfg(target_os = "macos")]
 #[allow(deprecated)] // libc's mach calls (the mach2 crate isn't worth adding for them)
 fn memory_now() -> Memory {
     static HOST: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
@@ -1024,15 +1102,15 @@ fn stop_old_loops(d: &Daemon, table: &HashMap<i32, procs::Row>) {
 fn terminate(pids: &[i32]) {
     let starts: Vec<(i32, Option<i64>)> = pids.iter().map(|&p| (p, procs::table_start(p))).collect();
     for &(pid, _) in &starts {
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+        crate::sys::signal(pid, crate::sys::Sig::Term);
         // A stopped process only acts on SIGTERM once continued.
-        unsafe { libc::kill(pid, libc::SIGCONT) };
+        crate::sys::signal(pid, crate::sys::Sig::Cont);
     }
     let _ = std::thread::Builder::new().name("guard-kill".into()).spawn(move || {
         std::thread::sleep(KILL_GRACE);
         for (pid, start) in starts {
             if start.is_some() && procs::table_start(pid) == start {
-                unsafe { libc::kill(pid, libc::SIGKILL) };
+                crate::sys::signal(pid, crate::sys::Sig::Kill);
             }
         }
     });
@@ -1077,11 +1155,11 @@ pub fn pause(d: &Daemon, actor: Actor, p: SessionPauseParams, on: bool) -> Resul
     let root = root_of(d, &p.session_id)?;
     let table = procs::table();
     let pids = procs::descendants(&table, root);
-    let sig = if on { libc::SIGSTOP } else { libc::SIGCONT };
+    let sig = if on { crate::sys::Sig::Stop } else { crate::sys::Sig::Cont };
     // Stop the parents first (so none starts a new child meanwhile); continue the leaves first.
     let order: Vec<i32> = if on { pids.clone() } else { pids.iter().rev().copied().collect() };
     for pid in &order {
-        unsafe { libc::kill(*pid, sig) };
+        crate::sys::signal(*pid, sig);
     }
     let paused = on.then(|| {
         // What it was using at the last sample, for the app to show while it's paused.
@@ -1139,6 +1217,7 @@ pub fn stop_processes(d: &Daemon, actor: Actor, p: StopProcessesParams) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use std::process::{Command, Stdio};
 
     #[test]
@@ -1194,11 +1273,13 @@ mod tests {
     }
 
     /// Scheduling priority `ps` reports (background mode drops it to 4).
+    #[cfg(target_os = "macos")]
     fn pri(pid: i32) -> i32 {
         let o = Command::new("ps").args(["-o", "pri=", "-p", &pid.to_string()]).output().unwrap();
         String::from_utf8_lossy(&o.stdout).trim().parse().unwrap()
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn background_mode_skips_the_agent_and_comes_back_out() {
         let mut sh = Command::new("/bin/sh").args(["-c", "sleep 30 & wait"]).stdout(Stdio::null()).spawn().unwrap();

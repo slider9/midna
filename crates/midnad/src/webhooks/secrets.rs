@@ -8,11 +8,68 @@
 //!
 //! Secrets are cached in memory after the first read so a delivery doesn't hit the Keychain
 //! for every candidate trigger.
+//!
+//! Windows: the "keychain" is the Windows Credential Manager, a generic credential per secret
+//! named `<service>/<id>` (Control Panel ▸ Credential Manager ▸ Windows Credentials).
 use std::collections::HashMap;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Mutex;
+
+#[cfg(target_os = "macos")]
+mod keychain {
+    pub fn set(service: &str, id: &str, secret: &[u8]) -> Result<(), String> {
+        security_framework::passwords::set_generic_password(service, id, secret).map_err(|e| format!("keychain: {e}"))
+    }
+    pub fn get(service: &str, id: &str) -> Option<Vec<u8>> {
+        security_framework::passwords::get_generic_password(service, id).ok()
+    }
+    pub fn delete(service: &str, id: &str) {
+        let _ = security_framework::passwords::delete_generic_password(service, id);
+    }
+}
+
+#[cfg(windows)]
+mod keychain {
+    use windows_sys::Win32::Security::Credentials::{CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredFree, CredReadW, CredWriteW};
+
+    fn target(service: &str, id: &str) -> Vec<u16> {
+        format!("{service}/{id}").encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    pub fn set(service: &str, id: &str, secret: &[u8]) -> Result<(), String> {
+        let mut name = target(service, id);
+        let mut user: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut c: CREDENTIALW = unsafe { std::mem::zeroed() };
+        c.Type = CRED_TYPE_GENERIC;
+        c.TargetName = name.as_mut_ptr();
+        c.UserName = user.as_mut_ptr();
+        c.CredentialBlobSize = secret.len() as u32;
+        c.CredentialBlob = secret.as_ptr() as *mut u8;
+        c.Persist = CRED_PERSIST_LOCAL_MACHINE;
+        if unsafe { CredWriteW(&c, 0) } == 0 {
+            return Err(format!("credential manager: {}", std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    pub fn get(service: &str, id: &str) -> Option<Vec<u8>> {
+        let name = target(service, id);
+        let mut out: *mut CREDENTIALW = std::ptr::null_mut();
+        if unsafe { CredReadW(name.as_ptr(), CRED_TYPE_GENERIC, 0, &mut out) } == 0 || out.is_null() {
+            return None;
+        }
+        let c = unsafe { &*out };
+        let v = if c.CredentialBlob.is_null() { vec![] } else { unsafe { std::slice::from_raw_parts(c.CredentialBlob, c.CredentialBlobSize as usize) }.to_vec() };
+        unsafe { CredFree(out as *const _) };
+        Some(v)
+    }
+
+    pub fn delete(service: &str, id: &str) {
+        let name = target(service, id);
+        unsafe { CredDeleteW(name.as_ptr(), CRED_TYPE_GENERIC, 0) };
+    }
+}
 
 pub const KEYCHAIN_SERVICE: &str = "com.mrgnhnt.midna.webhook";
 pub const VAULT_SERVICE: &str = "com.mrgnhnt.midna.secret";
@@ -69,15 +126,14 @@ impl Store {
             return Err("bad id".into());
         }
         match self.mode {
-            Mode::Keychain => security_framework::passwords::set_generic_password(self.service, id, secret)
-                .map_err(|e| format!("keychain: {e}"))?,
+            Mode::Keychain => keychain::set(self.service, id, secret)?,
             Mode::File => {
                 std::fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
-                let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700));
+                let _ = crate::sys::set_private(&self.dir);
                 let path = self.dir.join(id);
                 let tmp = self.dir.join(format!(".{id}.tmp"));
                 let _ = std::fs::remove_file(&tmp);
-                let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).map_err(|e| e.to_string())?;
+                let mut f = crate::sys::private_file(std::fs::OpenOptions::new().write(true).create_new(true)).open(&tmp).map_err(|e| e.to_string())?;
                 f.write_all(secret).map_err(|e| e.to_string())?;
                 f.sync_all().map_err(|e| e.to_string())?;
                 std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
@@ -95,7 +151,7 @@ impl Store {
             return Some(s.clone());
         }
         let v = match self.mode {
-            Mode::Keychain => security_framework::passwords::get_generic_password(self.service, id).ok()?,
+            Mode::Keychain => keychain::get(self.service, id)?,
             Mode::File => std::fs::read(self.dir.join(id)).ok()?,
         };
         self.cache().insert(id.to_string(), v.clone());
@@ -108,9 +164,7 @@ impl Store {
         }
         self.cache().remove(id);
         match self.mode {
-            Mode::Keychain => {
-                let _ = security_framework::passwords::delete_generic_password(self.service, id);
-            }
+            Mode::Keychain => keychain::delete(self.service, id),
             Mode::File => {
                 let _ = std::fs::remove_file(self.dir.join(id));
             }
@@ -127,7 +181,9 @@ mod tests {
         let s = Store::new(Mode::File, &home);
         s.set("t_abc123", b"s3cret").unwrap();
         let meta = std::fs::metadata(home.join("secrets/t_abc123")).unwrap();
-        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        #[cfg(unix)]
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777, 0o600);
+        assert_eq!(meta.len(), 6);
         // A fresh store (no cache) reads it back from disk.
         assert_eq!(Store::new(Mode::File, &home).get("t_abc123").as_deref(), Some(&b"s3cret"[..]));
         s.delete("t_abc123");

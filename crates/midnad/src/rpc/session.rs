@@ -40,12 +40,68 @@ pub fn get(d: &Daemon, p: IdParams) -> R {
     ok(live(d, &s))
 }
 
+#[cfg(unix)]
 fn login_shell() -> String {
     std::env::var("SHELL").ok().filter(|s| s.starts_with('/')).unwrap_or_else(|| "/bin/zsh".into())
 }
 
+/// Windows: `MIDNA_SHELL`, or `SHELL` when it names a Windows program (Git Bash's `bash.exe`,
+/// say; an MSYS path like `/usr/bin/bash` doesn't count), else PowerShell 7 (`pwsh`), else
+/// Windows PowerShell.
+#[cfg(windows)]
+fn login_shell() -> String {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let named = ["MIDNA_SHELL", "SHELL"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .find(|s| std::path::Path::new(s).is_absolute() && std::path::Path::new(s).is_file() || (!s.contains(['/', '\\']) && crate::pty::which(s, &path).is_some()));
+    named
+        .or_else(|| crate::pty::which("pwsh", &path))
+        .or_else(|| crate::pty::which("powershell", &path))
+        .unwrap_or_else(|| "powershell.exe".into())
+}
+
+/// The shell's base name, lowercased, without `.exe`.
+fn shell_kind(shell: &str) -> String {
+    let base = shell.rsplit(['/', '\\']).next().unwrap_or(shell).to_ascii_lowercase();
+    base.strip_suffix(".exe").map(str::to_string).unwrap_or(base)
+}
+
+/// The interactive shell a new terminal runs: `$SHELL -l` on Unix; on Windows PowerShell
+/// without its banner, cmd as is, and a POSIX shell (Git Bash) as a login shell.
+pub(crate) fn login_command() -> Vec<String> {
+    let shell = login_shell();
+    let args: &[&str] = match shell_kind(&shell).as_str() {
+        "pwsh" | "powershell" => &["-NoLogo"],
+        "cmd" => &[],
+        _ => &["-l"],
+    };
+    std::iter::once(shell).chain(args.iter().map(|a| a.to_string())).collect()
+}
+
 /// Real argv to exec. Absolute programs run directly; bare names and one-string commands go
 /// through the login shell so the user's PATH (nvm, homebrew, …) applies.
+#[cfg(windows)]
+pub fn exec_argv(command: &[String]) -> Vec<String> {
+    match command {
+        // Windows: a one-string command goes through the shell; anything else runs directly
+        // (PATH is in the environment, not set up by a login profile).
+        [one] if one.contains(char::is_whitespace) => {
+            let shell = login_shell();
+            let run: Vec<&str> = match shell_kind(&shell).as_str() {
+                "pwsh" | "powershell" => vec!["-NoLogo", "-NoProfile", "-Command"],
+                "cmd" => vec!["/d", "/s", "/c"],
+                _ => vec!["-l", "-c"],
+            };
+            std::iter::once(shell).chain(run.iter().map(|a| a.to_string())).chain(std::iter::once(one.clone())).collect()
+        }
+        _ => command.to_vec(),
+    }
+}
+
+/// Real argv to exec. Absolute programs run directly; bare names and one-string commands go
+/// through the login shell so the user's PATH (nvm, homebrew, …) applies.
+#[cfg(unix)]
 pub fn exec_argv(command: &[String]) -> Vec<String> {
     let shell = login_shell();
     match command {
@@ -164,7 +220,7 @@ pub(crate) fn mark_injected(d: &Daemon, command: &[String], env: &mut Vec<(Strin
 pub(crate) fn session_env(d: &Daemon, sid: &str, project: &str) -> Vec<(String, String)> {
     let cli_dir = std::path::Path::new(&d.cfg.cli_path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".into());
-    let path = if cli_dir.is_empty() { path } else { format!("{cli_dir}:{path}") };
+    let path = if cli_dir.is_empty() { path } else { format!("{cli_dir}{}{path}", crate::sys::PATH_SEP) };
     vec![
         ("MIDNA_SESSION".into(), sid.into()),
         ("MIDNA_PROJECT".into(), project.into()),
@@ -232,7 +288,7 @@ fn open_session(d: &Arc<Daemon>, ctx: &Ctx, p: SessionOpenParams) -> Result<Sess
             }
             (launch_command(d, a, &p.agent_args, p.resume.as_deref(), p.prompt.as_deref(), &env, supervised, &cwd), Some(a))
         }
-        _ => (p.command.clone().filter(|c| !c.is_empty()).unwrap_or_else(|| vec![login_shell(), "-l".into()]), None),
+        _ => (p.command.clone().filter(|c| !c.is_empty()).unwrap_or_else(login_command), None),
     };
     let argv = if p.kind == SessionKind::Shell { crate::adopt::shell_env(d, &command, &mut env) } else { None };
     mark_injected(d, &command, &mut env);
@@ -1060,12 +1116,10 @@ pub(crate) fn after_restart(d: &Daemon, s: &Session, info: &AgentInfo, resume: b
 pub(crate) fn stop_orphans(procs: &[ProcessInfo]) {
     for p in procs.iter().filter(|p| p.task_id.is_some() && p.depth > 0) {
         if crate::procs::parent(p.pid) == Some(1) {
-            unsafe {
-                if p.pgid == p.pid {
-                    libc::kill(-p.pid, libc::SIGHUP);
-                }
-                libc::kill(p.pid, libc::SIGHUP);
+            if p.pgid == p.pid {
+                crate::sys::signal_group(p.pid, crate::sys::Sig::Hup);
             }
+            crate::sys::signal(p.pid, crate::sys::Sig::Hup);
         }
     }
 }
@@ -1079,7 +1133,7 @@ pub(crate) fn emit_agent_info(d: &Daemon, sid: &str) {
 /// Wait for a process we signalled to be reaped (the reaper thread waitpids it).
 pub(crate) fn wait_gone(pid: i32, max: std::time::Duration) {
     let t0 = std::time::Instant::now();
-    while t0.elapsed() < max && unsafe { libc::kill(pid, 0) } == 0 {
+    while t0.elapsed() < max && crate::sys::alive(pid) {
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
@@ -1123,8 +1177,8 @@ pub fn on_exit(d: &Arc<Daemon>, sid: &str, generation: u64, code: Option<i32>, s
         // Quitting with ctrl-c is a normal way out of a TUI: Codex 0.160.0 exits by re-raising
         // SIGINT after the second ctrl-c, and a shell reports that as 130. SIGHUP is what
         // `session.close` sends. Neither is a failure worth a needs-you item.
-        (Some(130), _) | (None, Some(libc::SIGINT)) => (StatusState::Exited, "exited (interrupted)".to_string()),
-        (None, Some(libc::SIGHUP)) => (StatusState::Exited, "exited (hung up)".to_string()),
+        (Some(130), _) | (None, Some(crate::sys::SIGINT)) => (StatusState::Exited, "exited (interrupted)".to_string()),
+        (None, Some(crate::sys::SIGHUP)) => (StatusState::Exited, "exited (hung up)".to_string()),
         (Some(c), _) => (StatusState::Failed, format!("exited with code {c}")),
         (None, Some(sig)) => (StatusState::Failed, format!("killed by signal {sig}")),
         _ => (StatusState::Exited, "exited".to_string()),
@@ -1144,7 +1198,7 @@ pub fn on_exit(d: &Arc<Daemon>, sid: &str, generation: u64, code: Option<i32>, s
         d.raise_needs_you(item);
     }
     // Hung up: the terminal (or midnad) is going away, so no shell to drop into.
-    let hung_up = signal == Some(libc::SIGHUP) || d.shutting_down.load(Ordering::Relaxed);
+    let hung_up = signal == Some(crate::sys::SIGHUP) || d.shutting_down.load(Ordering::Relaxed);
     if kind == SessionKind::Agent && !close_on_exit && !hung_up && d.core().state.setting_bool("agents.shell_on_exit") {
         if let Err(e) = swap_to_shell(d, sid, generation, &reason) {
             eprintln!("midnad: session {sid}: no shell after the agent exited: {e}");
@@ -1180,7 +1234,7 @@ fn swap_to_shell(d: &Arc<Daemon>, sid: &str, generation: u64, reason: &str) -> R
         t
     });
     let (cols, rows) = snap.as_ref().map_or((100, 30), |t| (t.cols, t.rows));
-    let command = vec![login_shell(), "-l".into()];
+    let command = login_command();
     let mut env = session_env(d, sid, &s.project_id);
     let argv = crate::adopt::shell_env(d, &command, &mut env);
     let launch = Launch { sid: sid.to_string(), argv: argv.unwrap_or_else(|| exec_argv(&command)), cwd: s.cwd.clone(), env, cols, rows };

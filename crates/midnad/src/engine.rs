@@ -6,7 +6,7 @@ use libghostty_vt::screen::{CellContentTag, CellSemanticContent, CellWide, RowSe
 use libghostty_vt::style::Underline;
 use libghostty_vt::terminal::{Mode, Options, Terminal};
 use midna_proto::frame::*;
-use std::os::fd::RawFd;
+use crate::pty::Writer;
 
 #[path = "engine_input.rs"]
 mod input;
@@ -35,10 +35,7 @@ pub fn set_theme_colors(c: Option<ThemeColors>) {
 }
 
 pub fn now_ns() -> u64 {
-    unsafe extern "C" {
-        fn clock_gettime_nsec_np(id: libc::clockid_t) -> u64;
-    }
-    unsafe { clock_gettime_nsec_np(libc::CLOCK_UPTIME_RAW) }
+    crate::sys::uptime_ns()
 }
 
 pub struct Engine {
@@ -51,7 +48,7 @@ pub struct Engine {
     force_full: bool,
     pub bytes: u64,
     /// Where DA/DSR replies go (re-registered when the terminal is rebuilt from a snapshot).
-    pty_fd: Option<RawFd>,
+    pty_fd: Option<Writer>,
     /// Trailing bytes of an escape sequence (or UTF-8 char) the parser has only half seen.
     /// libghostty's VT export can't carry parser state, so an upgrade replays these.
     tail: Vec<u8>,
@@ -76,7 +73,7 @@ pub struct Engine {
 
 impl Engine {
     /// `pty_fd`: where DA/DSR responses are written (None = discard).
-    pub fn new(cols: u16, rows: u16, pty_fd: Option<RawFd>) -> Engine {
+    pub fn new(cols: u16, rows: u16, pty_fd: Option<Writer>) -> Engine {
         let mut term = new_terminal(cols, rows);
         connect_pty(&mut term, pty_fd);
         let mut e = Engine {
@@ -431,10 +428,10 @@ fn new_terminal(cols: u16, rows: u16) -> Terminal<'static, 'static> {
     term
 }
 
-fn connect_pty(term: &mut Terminal<'static, 'static>, pty_fd: Option<RawFd>) {
+fn connect_pty(term: &mut Terminal<'static, 'static>, pty_fd: Option<Writer>) {
     if let Some(fd) = pty_fd {
-        let _ = term.on_pty_write(move |_t, data: &[u8]| unsafe {
-            libc::write(fd, data.as_ptr() as *const _, data.len());
+        let _ = term.on_pty_write(move |_t, data: &[u8]| {
+            fd.write(data);
         });
     }
 }
@@ -594,7 +591,7 @@ impl Engine {
     }
 
     /// An engine rebuilt from a snapshot (the new daemon image after an upgrade).
-    pub fn restored(s: &TermSnap, pty_fd: Option<RawFd>) -> Engine {
+    pub fn restored(s: &TermSnap, pty_fd: Option<Writer>) -> Engine {
         let mut e = Engine::new(s.cols.max(2), s.rows.max(2), None);
         replay(&mut e.term, s);
         // Only now route DA/DSR replies to the PTY, so replaying never answers anything.

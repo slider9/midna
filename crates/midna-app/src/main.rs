@@ -14,19 +14,25 @@ mod annotate;
 mod app;
 mod backend;
 mod commands;
+// AppKit-only modules: off macOS, `src/nonmac/` has the same API with fallbacks.
+#[cfg_attr(not(target_os = "macos"), path = "nonmac/composer.rs")]
 mod composer;
 mod dev;
 mod finder;
 mod frame;
+#[cfg_attr(not(target_os = "macos"), path = "nonmac/haptics.rs")]
 mod haptics;
 mod icons;
 mod ide;
+#[cfg_attr(not(target_os = "macos"), path = "nonmac/install.rs")]
 mod install;
+#[cfg_attr(not(target_os = "macos"), path = "nonmac/kass.rs")]
 mod kass;
 mod lifecycle;
 mod list_edit;
 mod model;
 mod notify;
+mod opener;
 mod report;
 mod settings_window;
 mod sounds;
@@ -44,6 +50,7 @@ use gpui_kit::*;
 use theme::Theme;
 
 fn main() {
+    #[cfg(unix)]
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
     if let Some(code) = lifecycle::headless(&std::env::args().collect::<Vec<_>>()) {
         std::process::exit(code);

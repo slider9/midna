@@ -1,15 +1,28 @@
 //! PTY spawn / resize / write. Spawning uses `std::process::Command` (PATH lookup, env, cwd)
-//! with a `pre_exec` that makes the slave the controlling terminal of a new session.
+//! with a `pre_exec` that makes the slave the controlling terminal of a new session. Windows
+//! uses a pseudoconsole instead (`pty_windows.rs`), behind the same [`Master`] / [`Spawned`] API.
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+#[path = "pty_windows.rs"]
+mod windows;
+#[cfg(windows)]
+pub use windows::{Master, Spawned, Writer, command_line, spawn, wait_exit, which};
 
 /// The most unread input a terminal holds. macOS stops taking a write here, wherever in the
 /// write that falls.
+#[cfg(unix)]
 const INPUT_ROOM: usize = 1022;
 /// How long a write waits for an app that has stopped reading its input.
+#[cfg(unix)]
 const ROOM_WAIT: Duration = Duration::from_secs(2);
 
 /// Inherited variables that would confuse programs in a fresh terminal (e.g. Claude Code
@@ -54,11 +67,82 @@ pub fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
     SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+#[cfg(unix)]
 pub struct Spawned {
-    pub master: RawFd,
-    pub child: Child,
+    pub master: Master,
+    pub pid: i32,
 }
 
+/// Owns the PTY master fd; closed when the last holder (reader, engine, writers) drops it.
+#[cfg(unix)]
+pub struct Master(RawFd);
+
+#[cfg(unix)]
+impl Drop for Master {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+
+/// Where DA/DSR replies go: the master fd (not owned; the [`Master`] outlives the engine).
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+pub struct Writer(RawFd);
+
+#[cfg(unix)]
+impl Writer {
+    pub fn write(&self, data: &[u8]) {
+        unsafe { libc::write(self.0, data.as_ptr() as *const _, data.len()) };
+    }
+}
+
+#[cfg(unix)]
+impl Master {
+    /// Take ownership of a master fd (one kept across an upgrade).
+    pub fn from_raw(fd: RawFd) -> Master {
+        Master(fd)
+    }
+
+    pub fn raw(&self) -> RawFd {
+        self.0
+    }
+
+    pub fn writer(&self) -> Writer {
+        Writer(self.0)
+    }
+
+    pub fn write_all(&self, b: &[u8]) -> bool {
+        write_all(self.0, b)
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) {
+        resize(self.0, cols, rows)
+    }
+
+    /// Poll (not a blocking read), so the reader notices a pause within `timeout_ms`.
+    pub fn readable(&self, timeout_ms: i32) -> bool {
+        let mut pfd = libc::pollfd { fd: self.0, events: libc::POLLIN, revents: 0 };
+        let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        !(r == 0 || (r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted))
+    }
+
+    /// Ok(0) or an error (EIO) once the child side is gone.
+    pub fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut _, buf.len()) };
+        if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(n as usize) }
+    }
+
+    /// The terminal's foreground process group, if any.
+    pub fn foreground_group(&self) -> Option<i32> {
+        let fg = unsafe { libc::tcgetpgrp(self.0) };
+        (fg > 1).then_some(fg)
+    }
+
+    /// A Unix pty ends by itself when its last process closes the slave.
+    pub fn child_exited(&self) {}
+}
+
+#[cfg(unix)]
 fn set_cloexec(fd: RawFd) {
     unsafe {
         let f = libc::fcntl(fd, libc::F_GETFD);
@@ -66,6 +150,7 @@ fn set_cloexec(fd: RawFd) {
     }
 }
 
+#[cfg(unix)]
 pub fn spawn(argv: &[String], cwd: &str, env: &[(String, String)], cols: u16, rows: u16) -> std::io::Result<Spawned> {
     let Some((prog, args)) = argv.split_first() else {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"));
@@ -104,7 +189,9 @@ pub fn spawn(argv: &[String], cwd: &str, env: &[(String, String)], cols: u16, ro
         });
     }
     match cmd.spawn() {
-        Ok(child) => Ok(Spawned { master: m, child }),
+        // The reaper waits on the pid (not the Child), so adopted sessions after an upgrade
+        // work the same way. Dropping a Child neither waits nor kills.
+        Ok(child) => Ok(Spawned { master: Master(m), pid: child.id() as i32 }),
         Err(e) => {
             unsafe { libc::close(m) };
             Err(e)
@@ -112,12 +199,14 @@ pub fn spawn(argv: &[String], cwd: &str, env: &[(String, String)], cols: u16, ro
     }
 }
 
+#[cfg(unix)]
 pub fn resize(fd: RawFd, cols: u16, rows: u16) {
     let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
     unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
 }
 
 /// Bytes the app hasn't read from its input yet.
+#[cfg(unix)]
 fn unread_input(fd: RawFd) -> Option<usize> {
     let mut n: libc::c_int = 0;
     (unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) } == 0).then_some(n as usize)
@@ -126,6 +215,7 @@ fn unread_input(fd: RawFd) -> Option<usize> {
 /// Wait for room for all of `len` bytes. A key's escape sequence that doesn't fit is cut where
 /// the room ends: an app that's behind reads `ESC [` of `ESC [ 3 ~`, gives up on it and takes the
 /// `3~` that follows for typing.
+#[cfg(unix)]
 fn wait_for_room(fd: RawFd, len: usize) {
     let by = Instant::now() + ROOM_WAIT;
     while unread_input(fd).is_some_and(|n| n + len > INPUT_ROOM) && Instant::now() < by {
@@ -135,6 +225,7 @@ fn wait_for_room(fd: RawFd, len: usize) {
 
 /// Write everything (the master fd is blocking; retries on EINTR/EAGAIN), in one piece if it can
 /// be.
+#[cfg(unix)]
 pub fn write_all(fd: RawFd, mut b: &[u8]) -> bool {
     if b.len() <= INPUT_ROOM {
         wait_for_room(fd, b.len());
@@ -155,6 +246,7 @@ pub fn write_all(fd: RawFd, mut b: &[u8]) -> bool {
 }
 
 /// Resolve a program name against PATH (for error messages before spawning).
+#[cfg(unix)]
 pub fn which(prog: &str, path: &str) -> Option<String> {
     if prog.contains('/') {
         return std::path::Path::new(prog).exists().then(|| prog.to_string());
@@ -164,7 +256,7 @@ pub fn which(prog: &str, path: &str) -> Option<String> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;

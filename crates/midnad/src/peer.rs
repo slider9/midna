@@ -10,12 +10,64 @@
 //!   debug builds only, by the `MIDNA_APP_PATH` override.
 //! - Any process running inside one of this daemon's terminals is an agent, whatever its
 //!   executable, and it can only speak for the terminal it runs in.
+//!
+//! Windows: the peer pid comes from the AF_UNIX socket (`SIO_AF_UNIX_GETPEERPID`), the
+//! executable from `QueryFullProcessImageNameW`, the ancestry from the process table. There is
+//! no code-signature check yet (an Authenticode one would go in `codesign`), so the GUI is
+//! matched by name, as in unsigned macOS builds.
+use midna_proto::ipc::UnixStream;
+#[cfg(unix)]
 use std::os::fd::RawFd;
 
+#[cfg(unix)]
 const SOL_LOCAL: libc::c_int = 0;
+#[cfg(unix)]
 const LOCAL_PEERPID: libc::c_int = 0x002;
+#[cfg(unix)]
 const LOCAL_PEERTOKEN: libc::c_int = 0x006;
 
+/// The pid of the process on the other end of `s`.
+#[cfg(unix)]
+pub fn stream_pid(s: &UnixStream) -> Option<i32> {
+    peer_pid(std::os::fd::AsRawFd::as_raw_fd(s))
+}
+
+#[cfg(windows)]
+pub fn stream_pid(s: &UnixStream) -> Option<i32> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{SIO_AF_UNIX_GETPEERPID, WSAIoctl};
+    let mut pid = 0u32;
+    let mut got = 0u32;
+    let r = unsafe {
+        WSAIoctl(
+            s.as_raw_socket() as usize,
+            SIO_AF_UNIX_GETPEERPID,
+            std::ptr::null(),
+            0,
+            &mut pid as *mut u32 as *mut _,
+            4,
+            &mut got,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    // Windows 10 fills in the pid but leaves the byte count at 0, so don't check it.
+    let _ = got;
+    (r == 0 && pid > 0).then_some(pid as i32)
+}
+
+/// The peer's audit token (macOS), None elsewhere.
+#[cfg(unix)]
+pub fn stream_token(s: &UnixStream) -> Option<[u8; 32]> {
+    peer_token(std::os::fd::AsRawFd::as_raw_fd(s))
+}
+
+#[cfg(windows)]
+pub fn stream_token(_: &UnixStream) -> Option<[u8; 32]> {
+    None
+}
+
+#[cfg(unix)]
 pub fn peer_pid(fd: RawFd) -> Option<i32> {
     let mut pid: libc::pid_t = 0;
     let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
@@ -24,6 +76,7 @@ pub fn peer_pid(fd: RawFd) -> Option<i32> {
 }
 
 /// The peer's audit token (32 bytes), which names the exact process image (no pid reuse race).
+#[cfg(unix)]
 pub fn peer_token(fd: RawFd) -> Option<[u8; 32]> {
     let mut tok = [0u8; 32];
     let mut len = tok.len() as libc::socklen_t;
@@ -31,6 +84,12 @@ pub fn peer_token(fd: RawFd) -> Option<[u8; 32]> {
     (r == 0 && len as usize == tok.len()).then_some(tok)
 }
 
+#[cfg(windows)]
+pub fn pid_path(pid: i32) -> Option<String> {
+    crate::procs::exe_path(pid)
+}
+
+#[cfg(target_os = "macos")]
 pub fn pid_path(pid: i32) -> Option<String> {
     let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut _, buf.len() as u32) };
@@ -42,6 +101,7 @@ pub fn pid_path(pid: i32) -> Option<String> {
 }
 
 /// Parent pid, or None for a gone process / pid 0.
+#[cfg(target_os = "macos")]
 pub fn parent_pid(pid: i32) -> Option<i32> {
     if pid <= 1 {
         return None;
@@ -52,7 +112,36 @@ pub fn parent_pid(pid: i32) -> Option<i32> {
     (n == size).then_some(info.pbi_ppid as i32)
 }
 
+#[cfg(windows)]
+pub fn parent_pid(pid: i32) -> Option<i32> {
+    ancestry(pid).get(1).copied()
+}
+
+/// `pid` and its ancestors, nearest first (bounded). Windows keeps a dead parent's pid in its
+/// children, and pids are reused, so a "parent" that started after the child isn't one: the
+/// chain stops there.
+#[cfg(windows)]
+pub fn ancestry(pid: i32) -> Vec<i32> {
+    let table = crate::procs::snapshot();
+    let mut out = vec![pid];
+    let (mut cur, mut cur_start) = (pid, crate::procs::start_time(pid).unwrap_or(i64::MAX));
+    while out.len() < 64 {
+        let Some(&(p, _)) = table.get(&cur) else { break };
+        if p <= 4 || out.contains(&p) || !table.contains_key(&p) {
+            break;
+        }
+        let p_start = crate::procs::start_time(p).unwrap_or(0);
+        if p_start > cur_start {
+            break;
+        }
+        out.push(p);
+        (cur, cur_start) = (p, p_start);
+    }
+    out
+}
+
 /// `pid` and its ancestors, nearest first (bounded, stops at launchd).
+#[cfg(unix)]
 pub fn ancestry(pid: i32) -> Vec<i32> {
     let mut out = vec![pid];
     let mut cur = pid;
@@ -80,7 +169,7 @@ pub fn terminal_of(pid: i32, terminals: &[(String, i32)]) -> Option<String> {
             return Some(id.clone());
         }
     }
-    let sid = unsafe { libc::getsid(pid) };
+    let sid = crate::sys::session_of(pid)?;
     terminals.iter().find(|(_, p)| sid > 1 && *p == sid).map(|(id, _)| id.clone())
 }
 
@@ -117,7 +206,7 @@ impl GuiIdentity {
 pub fn trusted_client(entries: &[String], exe: &str, pid: i32, token: Option<&[u8; 32]>, team: Option<&str>) -> Option<String> {
     let team = team.filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()));
     entries.iter().map(|e| e.trim()).find(|e| {
-        if e.starts_with('/') {
+        if std::path::Path::new(e).is_absolute() {
             return team.is_none() && canon(exe) == canon(e);
         }
         let Some(team) = team else { return false };
@@ -126,10 +215,11 @@ pub fn trusted_client(entries: &[String], exe: &str, pid: i32, token: Option<&[u
     }).map(str::to_string)
 }
 
-/// The unsigned-build convention: an executable named `midna-app`, or one inside `Midna.app`.
+/// The unsigned-build convention: an executable named `midna-app` (`midna-app.exe` on
+/// Windows), or one inside `Midna.app`.
 pub fn is_gui_name(exe: &str) -> bool {
-    let name = exe.rsplit('/').next().unwrap_or("");
-    name == "midna-app" || exe.contains("/Midna.app/Contents/MacOS/")
+    let name = exe.rsplit(['/', '\\']).next().unwrap_or("");
+    name == "midna-app" || exe.contains("/Midna.app/Contents/MacOS/") || (cfg!(windows) && name.eq_ignore_ascii_case("midna-app.exe"))
 }
 
 /// Back-compat helper used by tests: name rule, or exact path when given.
@@ -140,6 +230,24 @@ pub fn is_gui(exe: &str, app_path: Option<&str>) -> bool {
     }
 }
 
+/// No code-signature checks on Windows yet: no signed identity, no requirement, nothing
+/// satisfies one (so the GUI is matched by name and `agents.trusted_clients` by path).
+#[cfg(not(target_os = "macos"))]
+pub mod codesign {
+    pub fn own_identity() -> Option<(String, Option<String>)> {
+        None
+    }
+
+    pub fn gui_requirement() -> Option<String> {
+        None
+    }
+
+    pub fn satisfies(_pid: i32, _token: Option<&[u8; 32]>, _requirement: &str) -> bool {
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
 pub mod codesign {
     //! Thin FFI over Security.framework's code-signing API.
     use core_foundation::base::TCFType;
@@ -217,6 +325,11 @@ mod tests {
         assert!(is_gui_name("/x/target/debug/midna-app"));
         assert!(!is_gui_name("/x/target/debug/midna"));
         assert!(!is_gui_name("/x/midna-app-evil"));
+        if cfg!(windows) {
+            assert!(is_gui_name(r"C:\Users\me\AppData\Local\Programs\Midna\midna-app.exe"));
+            assert!(!is_gui_name(r"C:\x\midna.exe"));
+            assert!(!is_gui_name(r"C:\x\midna-app.exe.evil"));
+        }
     }
 
     #[test]
@@ -229,6 +342,23 @@ mod tests {
         // Running "inside" a terminal whose shell is our parent.
         assert_eq!(terminal_of(me, &[("aaaa".into(), 999_999), ("bbbb".into(), parent)]).as_deref(), Some("bbbb"));
         assert_eq!(terminal_of(me, &[("aaaa".into(), 999_999)]), None);
+    }
+
+    #[test]
+    fn stream_pid_names_the_other_end() {
+        use midna_proto::ipc::{UnixListener, UnixStream};
+        let dir = std::env::temp_dir().join(format!("mp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.sock");
+        let l = UnixListener::bind(&path).unwrap();
+        let c = UnixStream::connect(&path).unwrap();
+        let (a, _) = l.accept().unwrap();
+        let me = std::process::id() as i32;
+        assert_eq!(stream_pid(&a), Some(me), "accepted side");
+        assert_eq!(stream_pid(&c), Some(me), "connected side");
+        drop((a, c, l));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

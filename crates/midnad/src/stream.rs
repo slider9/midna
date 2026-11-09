@@ -8,7 +8,7 @@ use midna_proto::frame::ClientMsg;
 use midna_proto::{Frame, RpcError, StreamAttachParams};
 use serde_json::Value;
 use std::io::{BufReader, Write};
-use std::os::unix::net::UnixStream;
+use midna_proto::ipc::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::sync_channel;

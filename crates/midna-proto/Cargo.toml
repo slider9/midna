@@ -8,3 +8,8 @@ serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
 regex.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# AF_UNIX sockets on Windows 10 1803+ (src/ipc.rs): the same socket path and stream API as macOS.
+uds_windows = "1.2"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Time"] }

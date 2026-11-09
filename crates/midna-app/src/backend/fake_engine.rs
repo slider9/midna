@@ -5,13 +5,24 @@ use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RenderState,
 use libghostty_vt::screen::{CellContentTag, CellWide};
 use libghostty_vt::style::Underline;
 use libghostty_vt::terminal::{Mode, Options, Terminal};
+#[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(windows)]
+pub use loopback::RawFd;
 
+#[cfg(target_os = "macos")]
 pub fn now_ns() -> u64 {
     unsafe extern "C" {
         fn clock_gettime_nsec_np(id: libc::clockid_t) -> u64;
     }
     unsafe { clock_gettime_nsec_np(libc::CLOCK_UPTIME_RAW) }
+}
+
+/// Monotonic nanoseconds since the first call (only differences are used).
+#[cfg(not(target_os = "macos"))]
+pub fn now_ns() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
 }
 
 const MARKER: &[u8] = b"__MIDNA_DONE__";
@@ -35,6 +46,10 @@ impl Engine {
     pub fn new(cols: u16, rows: u16, pty_fd: Option<RawFd>) -> Engine {
         let mut term = Terminal::new(Options { cols, rows, max_scrollback: 10_000 }).unwrap();
         let _ = term.set_mode(Mode::GRAPHEME_CLUSTER, true);
+        // Windows' loopback has no app to answer: the replies would only echo onto the screen.
+        #[cfg(windows)]
+        let _ = pty_fd;
+        #[cfg(unix)]
         if let Some(fd) = pty_fd {
             term.on_pty_write(move |_t, data: &[u8]| unsafe {
                 libc::write(fd, data.as_ptr() as *const _, data.len());
@@ -209,7 +224,20 @@ impl Engine {
 
 // ------------------------------------------------------------------ PTY
 
+/// Read what the app wrote (blocking): bytes read, 0 at EOF, < 0 on error.
+#[cfg(unix)]
+pub fn pty_read(fd: RawFd, buf: &mut [u8]) -> isize {
+    unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) }
+}
+
+/// Hang up the terminal's app.
+#[cfg(unix)]
+pub fn pty_hangup(pid: i32) {
+    unsafe { libc::kill(pid, libc::SIGHUP) };
+}
+
 /// Run `script` with `/bin/sh -c` on a fresh PTY. Returns (master fd, child pid).
+#[cfg(unix)]
 pub fn spawn_pty(script: &str, cols: u16, rows: u16, env: &[(&str, &str)]) -> (RawFd, i32) {
     use std::ffi::CString;
     let sh = CString::new("/bin/sh").unwrap();
@@ -254,11 +282,13 @@ pub fn spawn_pty(script: &str, cols: u16, rows: u16, env: &[(&str, &str)]) -> (R
     }
 }
 
+#[cfg(unix)]
 pub fn pty_resize(fd: RawFd, cols: u16, rows: u16) {
     let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
     unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
 }
 
+#[cfg(unix)]
 pub fn write_all(fd: RawFd, mut b: &[u8]) {
     while !b.is_empty() {
         let n = unsafe { libc::write(fd, b.as_ptr() as *const _, b.len()) };
@@ -271,6 +301,109 @@ pub fn write_all(fd: RawFd, mut b: &[u8]) {
         }
         b = &b[n as usize..];
     }
+}
+
+/// Windows: no PTY (ConPTY is midnad's job). A fake terminal is a loopback: an in-memory pipe
+/// that starts with the screen text the script would have printed, and echoes what you type
+/// back onto the screen (↩ as a new line, ⌫ rubbing out a character). Nothing runs.
+#[cfg(windows)]
+mod loopback {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    /// A loopback's id (it stands in for the master fd).
+    pub type RawFd = i32;
+
+    #[derive(Default)]
+    struct Pipe {
+        buf: Mutex<(Vec<u8>, bool)>,
+        ready: Condvar,
+    }
+
+    static PIPES: Mutex<Option<HashMap<RawFd, Arc<Pipe>>>> = Mutex::new(None);
+    static NEXT: AtomicI32 = AtomicI32::new(1);
+
+    fn pipe(fd: RawFd) -> Option<Arc<Pipe>> {
+        PIPES.lock().unwrap().as_ref()?.get(&fd).cloned()
+    }
+
+    pub fn open(initial: &[u8]) -> RawFd {
+        let fd = NEXT.fetch_add(1, Ordering::SeqCst);
+        let p = Arc::new(Pipe::default());
+        p.buf.lock().unwrap().0.extend_from_slice(initial);
+        PIPES.lock().unwrap().get_or_insert_with(HashMap::new).insert(fd, p);
+        fd
+    }
+
+    pub fn push(fd: RawFd, b: &[u8]) {
+        let Some(p) = pipe(fd) else { return };
+        p.buf.lock().unwrap().0.extend_from_slice(b);
+        p.ready.notify_all();
+    }
+
+    pub fn close(fd: RawFd) {
+        let Some(p) = PIPES.lock().unwrap().as_mut().and_then(|m| m.remove(&fd)) else { return };
+        p.buf.lock().unwrap().1 = true;
+        p.ready.notify_all();
+    }
+
+    pub fn read(fd: RawFd, out: &mut [u8]) -> isize {
+        let Some(p) = pipe(fd) else { return 0 };
+        let mut g = p.buf.lock().unwrap();
+        while g.0.is_empty() && !g.1 {
+            g = p.ready.wait(g).unwrap();
+        }
+        let n = g.0.len().min(out.len());
+        out[..n].copy_from_slice(&g.0[..n]);
+        g.0.drain(..n);
+        n as isize
+    }
+}
+
+/// The text the fake's script prints first (`printf '%s' '<text>'; exec …`), unquoted.
+#[cfg(windows)]
+fn printed(script: &str) -> String {
+    let Some(rest) = script.strip_prefix("printf '%s' '") else { return String::new() };
+    let end = rest.find("'; exec").unwrap_or(rest.len());
+    rest[..end].replace("'\\''", "'")
+}
+
+/// Windows: a loopback holding what `script` prints (see `loopback`). Returns its id twice:
+/// as the master fd and as the "pid" that `pty_hangup` closes.
+#[cfg(windows)]
+pub fn spawn_pty(script: &str, _cols: u16, _rows: u16, _env: &[(&str, &str)]) -> (RawFd, i32) {
+    let text = printed(script).replace("\r\n", "\n").replace('\n', "\r\n");
+    let fd = loopback::open(text.as_bytes());
+    (fd, fd)
+}
+
+#[cfg(windows)]
+pub fn pty_read(fd: RawFd, buf: &mut [u8]) -> isize {
+    loopback::read(fd, buf)
+}
+
+/// Windows: close the loopback (its id is the "pid" `spawn_pty` returned).
+#[cfg(windows)]
+pub fn pty_hangup(pid: i32) {
+    loopback::close(pid);
+}
+
+#[cfg(windows)]
+pub fn pty_resize(_fd: RawFd, _cols: u16, _rows: u16) {}
+
+/// Windows: echo typed bytes back onto the screen, as a cooked tty would.
+#[cfg(windows)]
+pub fn write_all(fd: RawFd, b: &[u8]) {
+    let mut out = Vec::with_capacity(b.len());
+    for &c in b {
+        match c {
+            b'\r' => out.extend_from_slice(b"\r\n"),
+            0x7f | 0x08 => out.extend_from_slice(b"\x08 \x08"),
+            _ => out.push(c),
+        }
+    }
+    loopback::push(fd, &out);
 }
 
 impl Engine {

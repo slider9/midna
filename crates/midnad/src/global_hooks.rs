@@ -165,8 +165,20 @@ pub fn codex_script(cli: &str) -> String {
     )
 }
 
+#[cfg(unix)]
 fn codex_argv(cli: &str, previous: &[String]) -> Vec<String> {
-    let mut v = vec!["/bin/sh".to_string(), "-c".into(), codex_script(cli), CODEX_WRAPPER_NAME.into()];
+    let mut v = vec![crate::sys::posix_sh(), "-c".into(), codex_script(cli), CODEX_WRAPPER_NAME.into()];
+    v.extend(previous.iter().cloned());
+    v
+}
+
+/// Windows: no sh wrapper. Codex starts `notify` with a Windows command line, and Git Bash's
+/// runtime re-parses that line and mangles the JSON (`{"type":"x"}` arrives empty). So the
+/// notify command is midna itself, which reports and then runs the previous command (after
+/// `--`) with the payload.
+#[cfg(windows)]
+fn codex_argv(cli: &str, previous: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = [cli, "hook", "codex", "notify", GLOBAL_FLAG, "--"].map(str::to_string).into();
     v.extend(previous.iter().cloned());
     v
 }
@@ -178,7 +190,11 @@ fn notify_of(doc: &toml_edit::DocumentMut) -> Option<Vec<String>> {
 
 /// `Some(previous notify argv)` when `notify` is midna's wrapper.
 fn codex_previous(argv: &[String]) -> Option<Vec<String>> {
-    (argv.len() >= 4 && argv[0] == "/bin/sh" && argv[1] == "-c" && argv[3] == CODEX_WRAPPER_NAME).then(|| argv[4..].to_vec())
+    if cfg!(windows) && argv.len() >= 6 && argv[1..6] == ["hook", "codex", "notify", GLOBAL_FLAG, "--"] {
+        return Some(argv[6..].to_vec());
+    }
+    let sh = argv.first().is_some_and(|s| s == "/bin/sh" || *s == crate::sys::posix_sh());
+    (argv.len() >= 4 && sh && argv[1] == "-c" && argv[3] == CODEX_WRAPPER_NAME).then(|| argv[4..].to_vec())
 }
 
 fn set_notify(doc: &mut toml_edit::DocumentMut, argv: Option<Vec<String>>) {
@@ -471,7 +487,7 @@ mod tests {
     fn claude_command_is_inert_outside_midna() {
         let cmd = claude_command("/nonexistent/midna");
         let run = |envs: &[(&str, &str)]| {
-            let mut c = std::process::Command::new("/bin/sh");
+            let mut c = std::process::Command::new(crate::sys::posix_sh());
             c.arg("-c").arg(&cmd).env_remove("MIDNA_SESSION");
             for (k, v) in envs {
                 c.env(k, v);
@@ -501,12 +517,14 @@ mod tests {
         assert_eq!(codex_state(&doc, "/old/midna").0, "stale");
     }
 
+    // Windows has no sh wrapper (midna-cli's `codex_notify_runs_the_previous_command` covers it).
+    #[cfg(unix)]
     #[test]
     fn codex_wrapper_runs_previous_notify_and_skips_midna_outside() {
         let dir = std::env::temp_dir().join(format!("midna-codex-wrap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("prev.log");
-        let prev = vec!["/bin/sh".to_string(), "-c".into(), format!("echo \"$@\" > {}", log.display()), "prev".into(), "turn-ended".into()];
+        let prev = vec![crate::sys::posix_sh(), "-c".into(), format!("echo \"$@\" > '{}'", log.display()), "prev".into(), "turn-ended".into()];
         let argv = codex_argv("/nonexistent/midna", &prev);
         let o = std::process::Command::new(&argv[0]).args(&argv[1..]).arg(r#"{"type":"agent-turn-complete"}"#).env_remove("MIDNA_SESSION").output().unwrap();
         assert!(o.status.success(), "{o:?}");

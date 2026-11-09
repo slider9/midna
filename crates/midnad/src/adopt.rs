@@ -71,7 +71,10 @@ pub fn write_files(d: &Daemon) {
         if std::fs::read_to_string(&path).ok().as_deref() != Some(body) {
             let tmp = path.with_extension("tmp");
             if std::fs::write(&tmp, body).is_ok() {
+                #[cfg(unix)]
                 let _ = std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(mode));
+                #[cfg(windows)]
+                let _ = mode;
                 let _ = std::fs::rename(&tmp, &path);
             }
         }
@@ -97,7 +100,7 @@ pub fn shell_env(d: &Daemon, command: &[String], env: &mut Vec<(String, String)>
     let home = &d.cfg.home;
     let shims = shims_dir(home).to_string_lossy().into_owned();
     match env.iter_mut().find(|(k, _)| k == "PATH") {
-        Some((_, v)) => *v = format!("{shims}:{v}"),
+        Some((_, v)) => *v = format!("{shims}{}{v}", crate::sys::PATH_SEP),
         None => env.push(("PATH".into(), shims.clone())),
     }
     env.push(("MIDNA_SHIMS".into(), shims));
@@ -205,7 +208,7 @@ fn run_with_timeout(bin: &str, args: &[&str], max: Duration) -> Option<String> {
 // ------------------------------------------------------------------ adopt / end / restart
 
 fn alive(pid: i32) -> bool {
-    pid > 1 && unsafe { libc::kill(pid, 0) } == 0
+    pid > 1 && crate::sys::alive(pid)
 }
 
 /// The command midna runs for `args` typed to `bin` in `cwd`: midna's flags first (Claude's
@@ -342,10 +345,10 @@ pub fn restart(d: &Arc<Daemon>, s: &Session, resume: bool, reason: &str, actor: 
     }
     // The agent exits on SIGHUP (Claude stops its background shells itself); killed, they'd
     // live on.
-    unsafe { libc::kill(child, libc::SIGHUP) };
+    crate::sys::signal(child, crate::sys::Sig::Hup);
     crate::rpc::session::wait_gone(child, Duration::from_secs(3));
     if alive(child) {
-        unsafe { libc::kill(child, libc::SIGKILL) };
+        crate::sys::signal(child, crate::sys::Sig::Kill);
         crate::rpc::session::wait_gone(child, Duration::from_secs(2));
     }
     crate::rpc::session::stop_orphans(&procs);

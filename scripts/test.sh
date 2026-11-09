@@ -24,7 +24,27 @@ for a in "$@"; do
 done
 
 nice -n 10 cargo test ${scope[@]+"${scope[@]}"} ${cargo_args[@]+"${cargo_args[@]}"} --no-run
-if ! lockf -s -t 0 "$LOCK" true; then
-  echo "test.sh: another checkout's tests are running; waiting for $LOCK" >&2
+if command -v lockf >/dev/null 2>&1; then
+  if ! lockf -s -t 0 "$LOCK" true; then
+    echo "test.sh: another checkout's tests are running; waiting for $LOCK" >&2
+  fi
+  exec lockf -s "$LOCK" cargo test ${scope[@]+"${scope[@]}"} "$@"
 fi
-exec lockf -s "$LOCK" cargo test ${scope[@]+"${scope[@]}"} "$@"
+# No lockf (Git Bash on Windows): a lock directory holding its owner's pid. A dead owner's
+# lock is taken over.
+waited=
+until mkdir "$LOCK.d" 2>/dev/null; do
+  owner="$(cat "$LOCK.d/pid" 2>/dev/null || true)"
+  if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+    rm -rf "$LOCK.d"
+    continue
+  fi
+  if [ -z "$waited" ]; then
+    echo "test.sh: another checkout's tests are running; waiting for $LOCK.d" >&2
+    waited=1
+  fi
+  sleep 1
+done
+echo $$ > "$LOCK.d/pid"
+trap 'rm -rf "$LOCK.d"' EXIT
+cargo test ${scope[@]+"${scope[@]}"} "$@"

@@ -1158,6 +1158,8 @@ fn unshell_path(word: &str) -> Option<PathBuf> {
         let mut chars = word.chars();
         while let Some(c) = chars.next() {
             match c {
+                // Windows: a backslash is a separator unless it escapes what a shell would split on.
+                '\\' if cfg!(windows) && chars.clone().next().is_some_and(|n| !" ()'\"&;|<>$`".contains(n)) => s.push('\\'),
                 '\\' => s.push(chars.next()?),
                 c if c.is_whitespace() => return None,
                 c => s.push(c),

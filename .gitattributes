@@ -1,0 +1,7 @@
+# LF on every platform. midna embeds shell scripts and docs with include_str!, and a Windows
+# checkout with CRLF (Git for Windows' default core.autocrlf) would build them in with \r\n:
+# bash can't run those, and the skill text would carry stray \r.
+* text=auto eol=lf
+
+# Committed with CRLF upstream; leave it byte for byte.
+crates/midna-app/assets/fonts/OFL-IBMPlexSans.txt -text

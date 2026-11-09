@@ -4,9 +4,12 @@ _MIDNA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # A git worktree uses the main checkout's toolchain.
 _MIDNA_MAIN="$(git -C "$_MIDNA_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
 _MIDNA_MAIN="${_MIDNA_MAIN%/.git}"
+# Git for Windows prints D:/…, whose colon would split a PATH entry in Git Bash.
+command -v cygpath >/dev/null 2>&1 && [ -n "$_MIDNA_MAIN" ] && _MIDNA_MAIN="$(cygpath -u "$_MIDNA_MAIN")"
 [ -d "$_MIDNA_MAIN/.toolchain" ] || _MIDNA_MAIN="$_MIDNA_ROOT"
 export PATH="$_MIDNA_MAIN/.toolchain/fakebin:$_MIDNA_MAIN/.toolchain/zig:$PATH"
-export GHOSTTY_SOURCE_DIR="$_MIDNA_MAIN/.toolchain/ghostty-src"
+# Without it (Windows: no setup-toolchain.sh), libghostty-vt-sys fetches Ghostty itself.
+[ -d "$_MIDNA_MAIN/.toolchain/ghostty-src" ] && export GHOSTTY_SOURCE_DIR="$_MIDNA_MAIN/.toolchain/ghostty-src"
 # Debug builds of libghostty are ~5000x slower; always optimize it.
 export LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast
 # Each checkout keeps its own target/. Never point a worktree's CARGO_TARGET_DIR or build dir

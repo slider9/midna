@@ -53,6 +53,27 @@ pub fn app_links<'a>(text: &'a str, trim: impl Fn(&str) -> &str, app_for: &dyn F
     out
 }
 
+/// Windows: the scheme's registered handler (HKCR\<scheme> with "URL Protocol"), by the
+/// friendly name of the app it runs.
+#[cfg(windows)]
+mod ls {
+    use windows_sys::Win32::UI::Shell::{ASSOCF_IS_PROTOCOL, ASSOCSTR_FRIENDLYAPPNAME, AssocQueryStringW};
+
+    pub fn default_app(url: &str) -> Option<String> {
+        let scheme = url.split("://").next()?;
+        let wide: Vec<u16> = scheme.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut buf = vec![0u16; 512];
+        let mut len = buf.len() as u32;
+        let hr = unsafe { AssocQueryStringW(ASSOCF_IS_PROTOCOL, ASSOCSTR_FRIENDLYAPPNAME, wide.as_ptr(), std::ptr::null(), buf.as_mut_ptr(), &mut len) };
+        if hr < 0 || len == 0 {
+            return None;
+        }
+        let name = String::from_utf16_lossy(&buf[..(len as usize).saturating_sub(1)]).trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+}
+
+#[cfg(target_os = "macos")]
 mod ls {
     use core_foundation::base::TCFType;
     use core_foundation::url::{CFURL, CFURLRef};

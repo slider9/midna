@@ -741,7 +741,10 @@ fn now_unix() -> i64 {
 fn local_tm(secs: i64) -> libc::tm {
     let t: libc::time_t = secs as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    #[cfg(unix)]
     unsafe { libc::localtime_r(&t, &mut tm) };
+    #[cfg(windows)]
+    unsafe { libc::localtime_s(&mut tm, &t) };
     tm
 }
 

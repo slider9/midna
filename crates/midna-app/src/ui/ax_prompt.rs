@@ -18,6 +18,7 @@ fn trusted() -> bool {
 
 /// Kass is about to dictate into midna. Shows the card unless midna is trusted or the human
 /// already said "Not now".
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Kass is macOS only
 pub fn on_kass_begin(m: &mut MainWindow, cx: &mut Context<MainWindow>) {
     if !m.ax_prompt && !m.seen.contains(SEEN_KEY) && !trusted() {
         m.ax_prompt = true;

@@ -49,6 +49,10 @@
 //! badge, the capsule and the stack (`zones`), shows and hides it, drags it by hand and slings
 //! it. The home main window feeds it (`sync`, `push`); while it takes notifications, they
 //! aren't macOS banners.
+//!
+//! Off macOS the badge never opens (`init`): moving and clicking through a panel is AppKit
+//! here, so most of this is unused there.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_variables))]
 use crate::backend::Backend;
 use crate::icons::Icon;
 use crate::model::*;
@@ -249,6 +253,7 @@ enum Sharing {
 /// Something is watching the screen: a share (Zoom, Meet, Teams, …), a recording or Screen
 /// Sharing. macOS has no public call for it; this is the WindowServer's own (private, looked up
 /// at run time, so a macOS without it just never hides). `MIDNA_DEBUG_SHARING=1` fakes one.
+#[cfg(target_os = "macos")]
 fn screen_watched() -> bool {
     static WATCHER: std::sync::OnceLock<Option<unsafe extern "C" fn() -> bool>> = std::sync::OnceLock::new();
     if crate::dev::var("MIDNA_DEBUG_SHARING").is_ok_and(|v| v == "1") {
@@ -265,6 +270,7 @@ fn screen_watched() -> bool {
 /// running; either one's badge stays out of the way while you're in a midna).
 /// This one counts only for one of its own windows: a press on the badge can make midna the
 /// active app without it being in front of you.
+#[cfg(target_os = "macos")]
 fn midna_in_front(badge: &objc2_app_kit::NSWindow) -> bool {
     if crate::sounds::app_active() {
         let Some(mtm) = objc2::MainThreadMarker::new() else { return false };
@@ -278,6 +284,7 @@ fn midna_in_front(badge: &objc2_app_kit::NSWindow) -> bool {
 /// One of this midna's main windows is in front (`Some(true)`), or another app or another of
 /// its windows (Settings, a dialog) is (`Some(false)`); `None` when the badge itself is midna's
 /// key window (a click on it), which says neither.
+#[cfg(target_os = "macos")]
 fn here(badge: &objc2_app_kit::NSWindow, mains: &[objc2::rc::Retained<objc2_app_kit::NSWindow>]) -> Option<bool> {
     if !crate::sounds::app_active() {
         return Some(false);
@@ -292,6 +299,7 @@ fn here(badge: &objc2_app_kit::NSWindow, mains: &[objc2::rc::Retained<objc2_app_
 
 /// Where the window goes for the badge docked in midna's front main window (`DOCK` from its
 /// top right): its Cocoa origin.
+#[cfg(target_os = "macos")]
 fn dock_origin(mains: &[objc2::rc::Retained<objc2_app_kit::NSWindow>]) -> Option<(f64, f64)> {
     let w = mains.iter().find(|m| m.isVisible())?;
     let f = w.frame();
@@ -305,6 +313,12 @@ fn dock_origin(mains: &[objc2::rc::Retained<objc2_app_kit::NSWindow>]) -> Option
 /// when it's there) does. While it's on, nothing can bring midna forward (itself, an app
 /// switcher, the Dock), so it's on only while the pointer is on the badge (`Badge::tick`), and
 /// opening a terminal lifts it for a moment (`Badge::bring_forward`).
+#[cfg(not(target_os = "macos"))]
+fn prevent_activation(ns: &super::twilight::NativeWindow, _on: bool) {
+    match *ns {}
+}
+
+#[cfg(target_os = "macos")]
 fn prevent_activation(ns: &objc2_app_kit::NSWindow, on: bool) {
     use objc2::{msg_send, sel};
     unsafe {
@@ -598,7 +612,7 @@ pub struct Badge {
     shown: bool,
     zones: Zones,
     /// The window, for `bring_forward` (it's made with the badge, on the main thread).
-    ns: Option<objc2::rc::Retained<objc2_app_kit::NSWindow>>,
+    ns: Option<super::twilight::NativeWindow>,
     /// When to stop letting the badge activate midna again, after `bring_forward`.
     reprevent: Option<Instant>,
     /// A click on the badge can't activate midna (`prevent_activation`): the pointer's on it.
@@ -623,9 +637,11 @@ pub fn is_badge(window: AnyWindowHandle, cx: &App) -> bool {
     handle(cx).is_some_and(|h| h.window_id() == window.window_id())
 }
 
-/// Open the badge's window (hidden until there's something to show).
+/// Open the badge's window (hidden until there's something to show). Off macOS there's no
+/// badge yet (it's an AppKit panel moved by hand): with no window, `takes` is false and the
+/// in-app cards (`ui/toast.rs`) show notifications, as with `notify.badge` `off`.
 pub fn init(backend: Arc<dyn Backend>, cx: &mut App) {
-    if handle(cx).is_some() {
+    if handle(cx).is_some() || !cfg!(target_os = "macos") {
         return;
     }
     let display = cx.primary_display();
@@ -643,6 +659,7 @@ pub fn init(backend: Arc<dyn Backend>, cx: &mut App) {
         ..Default::default()
     };
     let h = cx.open_window(opts, |window, cx| {
+        #[cfg(target_os = "macos")]
         if let Some(ns) = super::twilight::ns_window(window) {
             // GPUI makes it a titled panel; macOS draws a titled window's rim (a light line
             // along its top) even when it's transparent, and treats its top as a titlebar.
@@ -882,12 +899,14 @@ fn ease_in(x: f32) -> f32 {
 // ------------------------------------------------------------------ the native window
 
 /// The badge's center on screen (Cocoa, y up), where the window is now.
+#[cfg(target_os = "macos")]
 fn badge_center(ns: &objc2_app_kit::NSWindow) -> (f64, f64) {
     let f = ns.frame();
     (f.origin.x + (MX + SIZE / 2.) as f64, f.origin.y + (MY + SIZE / 2.) as f64)
 }
 
 /// The screen the badge is on (the window's mostly off it at a corner), else the main one.
+#[cfg(target_os = "macos")]
 fn screen_of(ns: &objc2_app_kit::NSWindow) -> Option<objc2::rc::Retained<objc2_app_kit::NSScreen>> {
     let mtm = objc2::MainThreadMarker::new()?;
     let (x, y) = badge_center(ns);
@@ -902,6 +921,7 @@ fn screen_of(ns: &objc2_app_kit::NSWindow) -> Option<objc2::rc::Retained<objc2_a
 /// Where the window goes for the badge `inset` from `corner` of its screen's visible frame
 /// (clear of the menu bar and the Dock): its Cocoa origin. An inset too big for the screen
 /// keeps the badge on it.
+#[cfg(target_os = "macos")]
 fn origin_at(ns: &objc2_app_kit::NSWindow, corner: Corner, inset: (f64, f64)) -> Option<(f64, f64)> {
     let vf = screen_of(ns)?.visibleFrame();
     let size = SIZE as f64;
@@ -914,6 +934,7 @@ fn origin_at(ns: &objc2_app_kit::NSWindow, corner: Corner, inset: (f64, f64)) ->
 
 /// The badge's distance from `corner`'s edges of its screen's visible frame, where it is now
 /// (a free drop), kept on the screen.
+#[cfg(target_os = "macos")]
 fn inset_from(ns: &objc2_app_kit::NSWindow, corner: Corner) -> Option<(f64, f64)> {
     let vf = screen_of(ns)?.visibleFrame();
     let size = SIZE as f64;
@@ -924,6 +945,7 @@ fn inset_from(ns: &objc2_app_kit::NSWindow, corner: Corner) -> Option<(f64, f64)
     Some((ix.clamp(0., (vf.size.width - size).max(0.)).round(), iy.clamp(0., (vf.size.height - size).max(0.)).round()))
 }
 
+#[cfg(target_os = "macos")]
 fn place(ns: &objc2_app_kit::NSWindow, corner: Corner) {
     if let Some((x, y)) = origin_at(ns, corner, (PAD as f64, PAD as f64)) {
         ns.setFrameOrigin(objc2_foundation::NSPoint::new(x, y));
@@ -932,6 +954,7 @@ fn place(ns: &objc2_app_kit::NSWindow, corner: Corner) {
 
 /// The corner of its screen the badge is nearest, where the window is now (plus `ahead`: where
 /// a throw carries it).
+#[cfg(target_os = "macos")]
 fn nearest(ns: &objc2_app_kit::NSWindow, corner: Corner, ahead: (f64, f64)) -> Corner {
     let Some(screen) = screen_of(ns) else { return corner };
     let vf = screen.visibleFrame();
@@ -1905,7 +1928,18 @@ impl Badge {
             .detach();
     }
 
+    /// Off macOS the badge never opens (`init`), so it never moves or ticks.
+    #[cfg(not(target_os = "macos"))]
+    fn snap(&mut self, corner: Corner, _vel: (f64, f64), _window: &mut Window, cx: &mut Context<Self>) {
+        self.corner = corner;
+        cx.notify();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn tick(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
     /// Sling the badge to `corner`, carrying `vel` (the throw, points a second) into a spring.
+    #[cfg(target_os = "macos")]
     fn snap(&mut self, corner: Corner, vel: (f64, f64), window: &mut Window, cx: &mut Context<Self>) {
         self.corner = corner;
         cx.notify();
@@ -1927,6 +1961,7 @@ impl Badge {
 
     /// Show or hide the window, let clicks through outside the zones, age the capsules, and
     /// tell a drag from a click.
+    #[cfg(target_os = "macos")]
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ns) = super::twilight::ns_window(window) else { return };
         let now = Instant::now();
@@ -2477,6 +2512,7 @@ impl Badge {
                 MouseButton::Left,
                 cx.listener(|b, _, window, cx| {
                     b.menu = false;
+                    #[cfg(target_os = "macos")]
                     if let Some(ns) = super::twilight::ns_window(window) {
                         // Caught mid-sling: it's held where it is.
                         b.slide = None;

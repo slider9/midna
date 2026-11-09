@@ -911,7 +911,10 @@ impl TerminalView {
             }
             Act::Reveal => {
                 if !debug() {
+                    #[cfg(target_os = "macos")]
                     let _ = std::process::Command::new("/usr/bin/open").arg("-R").arg(&target).spawn();
+                    #[cfg(not(target_os = "macos"))]
+                    crate::opener::reveal(&target);
                 }
             }
             Act::NewTerminal => self.new_terminal_in(target, cx),

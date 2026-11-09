@@ -613,25 +613,72 @@ const ADD_FLAGS: &[&str] = &[
     "background", "headless", "timeout", "permission-mode", "allow-tool",
 ];
 
+/// Typing isn't echoed while this lives (the newline still is, on Unix); restored on drop.
+#[cfg(unix)]
+struct EchoOff(Option<libc::termios>);
+
+#[cfg(unix)]
+impl EchoOff {
+    fn new() -> EchoOff {
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(0, &mut t) } != 0 {
+            return EchoOff(None);
+        }
+        let mut quiet = t;
+        quiet.c_lflag &= !libc::ECHO;
+        quiet.c_lflag |= libc::ECHONL;
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &quiet) };
+        EchoOff(Some(t))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        if let Some(t) = self.0 {
+            unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) };
+        }
+    }
+}
+
+/// Windows: the console's echo input mode, off; the newline isn't echoed, so print one after.
+#[cfg(windows)]
+struct EchoOff(Option<u32>);
+
+#[cfg(windows)]
+impl EchoOff {
+    fn new() -> EchoOff {
+        use windows_sys::Win32::System::Console::{ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode};
+        let h = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        let mut mode = 0u32;
+        if unsafe { GetConsoleMode(h, &mut mode) } == 0 {
+            return EchoOff(None);
+        }
+        unsafe { SetConsoleMode(h, mode & !ENABLE_ECHO_INPUT) };
+        EchoOff(Some(mode))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode};
+        if let Some(mode) = self.0 {
+            unsafe { SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), mode) };
+            eprintln!();
+        }
+    }
+}
+
 /// Read a secret: hidden from a TTY, else all of stdin (one trailing newline dropped).
 fn read_secret(id: &str) -> Result<String, Fail> {
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
         eprint!("Webhook secret for {id} (input hidden): ");
-        let fd = 0;
-        let mut t: libc::termios = unsafe { std::mem::zeroed() };
-        let have = unsafe { libc::tcgetattr(fd, &mut t) } == 0;
-        if have {
-            let mut quiet = t;
-            quiet.c_lflag &= !libc::ECHO;
-            quiet.c_lflag |= libc::ECHONL;
-            unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
-        }
+        let echo = EchoOff::new();
         let mut line = String::new();
         let r = stdin.read_line(&mut line);
-        if have {
-            unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) };
-        }
+        drop(echo);
         r.map_err(|e| Fail::Other(e.to_string()))?;
         Ok(line.trim_end_matches(['\n', '\r']).to_string())
     } else {

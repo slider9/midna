@@ -833,6 +833,7 @@ pub fn shutdown(b: &dyn Backend) {
 mod pty {
     use super::super::fake_engine::*;
     use super::*;
+    #[cfg(unix)]
     use std::os::fd::RawFd;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{SyncSender, sync_channel};
@@ -841,7 +842,7 @@ mod pty {
 
     pub fn kill_all() {
         for pid in PIDS.lock().unwrap().drain(..) {
-            unsafe { libc::kill(pid, libc::SIGHUP) };
+            pty_hangup(pid);
         }
     }
 
@@ -947,7 +948,7 @@ mod pty {
                 .spawn(move || {
                     loop {
                         let mut buf = vec![0u8; 65536];
-                        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                        let n = pty_read(fd, &mut buf);
                         if n <= 0 {
                             let _ = txr.send(Msg::Eof);
                             break;
@@ -967,7 +968,7 @@ mod pty {
         }
 
         pub fn kill(&self) {
-            unsafe { libc::kill(self.pid, libc::SIGHUP) };
+            pty_hangup(self.pid);
         }
 
         pub fn attach(self: &Arc<Self>, sink: Arc<FrameSink>, req: AttachRequest<'_>) -> Arc<dyn TermStream> {

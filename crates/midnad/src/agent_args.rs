@@ -208,9 +208,15 @@ fn toml_str(s: &str) -> String {
 
 /// `notify=[…]` that reports to midna, then runs `theirs` with the event JSON Codex appends.
 pub fn codex_chained_notify(cli: &str, theirs: &[String]) -> String {
+    // Windows: midna runs `theirs` itself (no sh wrapper; see global_hooks::codex_argv).
+    if cfg!(windows) {
+        let mut argv: Vec<String> = [cli, "hook", "codex", "notify", "--"].map(str::to_string).into();
+        argv.extend(theirs.iter().cloned());
+        return format!("notify={}", serde_json::to_string(&argv).unwrap_or_default());
+    }
     let q = crate::hooks::sh_quote(cli);
     let script = format!(r#"for a; do last="$a"; done; if [ -x {q} ]; then {q} hook codex notify "$last" >/dev/null 2>&1; fi; if [ $# -gt 1 ]; then exec "$@"; fi"#);
-    let mut argv = vec!["/bin/sh".to_string(), "-c".into(), script, CODEX_LAUNCH_WRAPPER.into()];
+    let mut argv = vec![crate::sys::posix_sh(), "-c".into(), script, CODEX_LAUNCH_WRAPPER.into()];
     argv.extend(theirs.iter().cloned());
     format!("notify={}", serde_json::to_string(&argv).unwrap_or_default())
 }
@@ -268,19 +274,25 @@ mod tests {
         let out = combine_in(&home, "/bin/midna", AgentKind::Codex, base, &user, &Spec::builtin(AgentKind::Codex), &home);
         assert_eq!(out[4], "developer_instructions=\"Card 12\\n\\nHINT\"");
         let notify: Vec<String> = serde_json::from_str(out[2].strip_prefix("notify=").unwrap()).unwrap();
-        assert_eq!((notify[3].as_str(), &notify[4..]), (CODEX_LAUNCH_WRAPPER, &v(&["/board/notify", "x"])[..]));
+        // Unix: sh -c SCRIPT WRAPPER THEIRS…; Windows: midna hook codex notify -- THEIRS….
+        let (mark, at) = if cfg!(windows) { ("--", 4) } else { (CODEX_LAUNCH_WRAPPER, 3) };
+        assert_eq!((notify[at].as_str(), &notify[at + 1..]), (mark, &v(&["/board/notify", "x"])[..]));
         assert_eq!(&out[5..], ["-m", "o3"]);
-        // The wrapper runs the caller's command with the event JSON.
-        let log = home.join("notify.log");
-        let theirs = v(&["/bin/sh", "-c", &format!("echo \"$@\" > {}", log.display()), "prev", "turn"]);
-        let argv: Vec<String> = serde_json::from_str(codex_chained_notify("/nonexistent/midna", &theirs).strip_prefix("notify=").unwrap()).unwrap();
-        let o = std::process::Command::new(&argv[0]).args(&argv[1..]).arg("{}").env_remove("MIDNA_SESSION").output().unwrap();
-        assert!(o.status.success(), "{o:?}");
-        assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "turn {}");
+        // The wrapper runs the caller's command with the event JSON (on Windows midna-cli does,
+        // see its `codex_notify_runs_the_previous_command`).
+        if cfg!(unix) {
+            let log = home.join("notify.log");
+            let theirs = v(&[&crate::sys::posix_sh(), "-c", &format!("echo \"$@\" > '{}'", log.display()), "prev", "turn"]);
+            let argv: Vec<String> = serde_json::from_str(codex_chained_notify("/nonexistent/midna", &theirs).strip_prefix("notify=").unwrap()).unwrap();
+            let o = std::process::Command::new(&argv[0]).args(&argv[1..]).arg("{}").env_remove("MIDNA_SESSION").output().unwrap();
+            assert!(o.status.success(), "{o:?}");
+            assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "turn {}");
+        }
         // No notify of midna's (the global install covers Codex): the override still reports.
         let out = combine_in(&home, "/bin/midna", AgentKind::Codex, v(&["codex"]), &v(&["-c", "notify=[\"/n\"]"]), &Spec::builtin(AgentKind::Codex), &home);
         assert_eq!(out[1], "-c");
-        assert!(out[2].contains(CODEX_LAUNCH_WRAPPER) && out.len() == 3, "{out:?}");
+        let mark = if cfg!(windows) { r#""hook","codex","notify","--""# } else { CODEX_LAUNCH_WRAPPER };
+        assert!(out[2].contains(mark) && out.len() == 3, "{out:?}");
         let _ = std::fs::remove_dir_all(&home);
     }
 }

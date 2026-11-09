@@ -5,19 +5,18 @@ use crate::engine::{Engine, now_ns};
 use crate::pty;
 use midna_proto::Frame;
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Weak};
 
-/// Owns the PTY master fd; closed when the last holder (reader, engine, writers) drops it.
-pub struct PtyFd(pub RawFd);
-impl Drop for PtyFd {
-    fn drop(&mut self) {
-        unsafe { libc::close(self.0) };
-    }
-}
+/// The PTY master (a pseudoconsole on Windows); closed when the last holder (reader, engine,
+/// writers) drops it.
+pub type PtyFd = pty::Master;
+#[cfg(windows)]
+pub use crate::pty::wait_exit;
 
 pub enum EngineMsg {
     Bytes(Vec<u8>, u64),
@@ -59,7 +58,7 @@ pub struct RtHandle {
 
 impl RtHandle {
     pub fn write(&self, bytes: &[u8]) -> bool {
-        pty::write_all(self.fd.0, bytes)
+        self.fd.write_all(bytes)
     }
 
     /// Send a named key, encoded for the app's keyboard mode.
@@ -93,7 +92,23 @@ impl RtHandle {
         rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
     }
 
+    /// Hang up: close the pseudoconsole (CTRL_CLOSE_EVENT to everything attached), then end
+    /// the session's job if anything is still running after the grace period.
+    #[cfg(windows)]
+    pub fn kill(&self, force: bool) {
+        self.fd.hangup();
+        let fd = self.fd.clone();
+        let grace = if force { 500 } else { 3000 };
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(grace));
+            if fd.child_alive() || force {
+                fd.kill_all();
+            }
+        });
+    }
+
     /// Hang up the process group; SIGKILL after a grace period if `force`.
+    #[cfg(unix)]
     pub fn kill(&self, force: bool) {
         unsafe {
             libc::kill(-self.pid, libc::SIGHUP);
@@ -182,11 +197,11 @@ impl Settling {
     }
 }
 
-fn apply_resize(eng: &mut Engine, fd: RawFd, (c, r, cw, ch): (u16, u16, u32, u32)) {
+fn apply_resize(eng: &mut Engine, fd: &PtyFd, (c, r, cw, ch): (u16, u16, u32, u32)) {
     let (c, r) = clamp_size(c, r);
     let (cw, ch) = (cw.min(1000), ch.min(1000));
     eng.resize(c, r, cw, ch);
-    pty::resize(fd, c, r);
+    fd.resize(c, r);
 }
 
 pub fn start(d: &Arc<Daemon>, l: Launch) -> std::io::Result<RtHandle> {
@@ -198,11 +213,8 @@ pub fn start(d: &Arc<Daemon>, l: Launch) -> std::io::Result<RtHandle> {
 pub fn start_on(d: &Arc<Daemon>, mut l: Launch, snap: Option<crate::engine::TermSnap>) -> std::io::Result<RtHandle> {
     (l.cols, l.rows) = clamp_size(l.cols, l.rows);
     let sp = pty::spawn(&l.argv, &l.cwd, &l.env, l.cols, l.rows)?;
-    let pid = sp.child.id() as i32;
-    // The reaper waits on the pid (not the Child), so adopted sessions after an upgrade work
-    // the same way. Dropping a Child neither waits nor kills.
-    drop(sp.child);
-    let (m, cols, rows) = (sp.master, l.cols, l.rows);
+    let pid = sp.pid;
+    let (m, cols, rows) = (sp.master.writer(), l.cols, l.rows);
     let make: MakeEngine = match snap {
         // The caller launches at the snapshot's size: its VT is laid out for it.
         Some(s) => Box::new(move || Engine::restored(&s, Some(m))),
@@ -214,17 +226,20 @@ pub fn start_on(d: &Arc<Daemon>, mut l: Launch, snap: Option<crate::engine::Term
 /// Re-adopt a session whose PTY master fd and child survived a daemon upgrade (same PID
 /// execv) or were handed to the watchdog fallback (then the child isn't ours: exit tracking
 /// falls back to kqueue, without an exit code).
+#[cfg(unix)]
 pub fn adopt(d: &Arc<Daemon>, sid: &str, master: RawFd, pid: i32, alive: bool, snap: &crate::engine::TermSnap) -> RtHandle {
     let snap = snap.clone();
     let title = snap.title.clone();
-    run(d, sid, master, pid, alive, Box::new(move || Engine::restored(&snap, Some(master))), title)
+    let master = pty::Master::from_raw(master);
+    let w = master.writer();
+    run(d, sid, master, pid, alive, Box::new(move || Engine::restored(&snap, Some(w))), title)
 }
 
 /// Builds the engine on its own thread (libghostty's Terminal is !Send).
 type MakeEngine = Box<dyn FnOnce() -> Engine + Send>;
 
-fn run(d: &Arc<Daemon>, sid: &str, master: RawFd, pid: i32, reap: bool, eng: MakeEngine, title: String) -> RtHandle {
-    let fd = Arc::new(PtyFd(master));
+fn run(d: &Arc<Daemon>, sid: &str, master: pty::Master, pid: i32, reap: bool, eng: MakeEngine, title: String) -> RtHandle {
+    let fd = Arc::new(master);
     let generation = d.next_gen.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = sync_channel::<EngineMsg>(64);
     let activity = Arc::new(AtomicI64::new(midna_proto::time::now_unix()));
@@ -232,9 +247,9 @@ fn run(d: &Arc<Daemon>, sid: &str, master: RawFd, pid: i32, reap: bool, eng: Mak
     let h = RtHandle { tx: tx.clone(), fd: fd.clone(), pid, generation, activity: activity.clone(), kitty: kitty.clone() };
     let weak = Arc::downgrade(d);
     engine_thread(sid.to_string(), generation, eng, title, fd.clone(), rx, weak.clone(), kitty);
-    let drained = reader_thread(fd, tx, activity);
+    let drained = reader_thread(fd.clone(), tx, activity);
     if reap {
-        reaper_thread(sid.to_string(), generation, pid, weak, drained);
+        reaper_thread(sid.to_string(), generation, pid, fd, weak, drained);
     }
     h
 }
@@ -275,9 +290,7 @@ fn reader_thread(fd: Arc<PtyFd>, tx: SyncSender<EngineMsg>, activity: Arc<Atomic
                 continue;
             }
             // Poll (not a blocking read) so a pause takes effect within one interval.
-            let mut pfd = libc::pollfd { fd: fd.0, events: libc::POLLIN, revents: 0 };
-            let r = unsafe { libc::poll(&mut pfd, 1, 50) };
-            if r == 0 || (r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted) {
+            if !fd.readable(50) {
                 continue;
             }
             READS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
@@ -285,17 +298,19 @@ fn reader_thread(fd: Arc<PtyFd>, tx: SyncSender<EngineMsg>, activity: Arc<Atomic
                 READS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
                 continue;
             }
-            let n = unsafe { libc::read(fd.0, buf.as_mut_ptr() as *mut _, buf.len()) };
-            if n < 0 && matches!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) {
-                READS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                continue;
-            }
-            if n <= 0 {
-                READS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                break; // EOF / EIO: the child side is gone
-            }
+            let n = match fd.read(&mut buf) {
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) => {
+                    READS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
+                Ok(n) if n > 0 => n,
+                _ => {
+                    READS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                    break; // EOF / EIO: the child side is gone
+                }
+            };
             activity.store(midna_proto::time::now_unix(), Ordering::Relaxed);
-            let sent = tx.send(EngineMsg::Bytes(buf[..n as usize].to_vec(), now_ns())).is_ok();
+            let sent = tx.send(EngineMsg::Bytes(buf[..n].to_vec(), now_ns())).is_ok();
             READS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
             if !sent {
                 break;
@@ -305,9 +320,12 @@ fn reader_thread(fd: Arc<PtyFd>, tx: SyncSender<EngineMsg>, activity: Arc<Atomic
     done_rx
 }
 
-fn reaper_thread(sid: String, generation: u64, pid: i32, d: Weak<Daemon>, drained: Receiver<()>) {
+fn reaper_thread(sid: String, generation: u64, pid: i32, fd: Arc<PtyFd>, d: Weak<Daemon>, drained: Receiver<()>) {
     let _ = std::thread::Builder::new().name("reaper".into()).spawn(move || {
         let (code, signal) = wait_exit(pid);
+        // A pseudoconsole outlives its app: closing it ends the output, so the reader drains.
+        fd.child_exited();
+        drop(fd);
         // Let the last output reach the engine first (the exit handler reads the screen). A
         // background process still holding the PTY open keeps the reader going: don't wait long.
         let _ = drained.recv_timeout(std::time::Duration::from_millis(500));
@@ -321,6 +339,7 @@ fn reaper_thread(sid: String, generation: u64, pid: i32, d: Weak<Daemon>, draine
 /// across a same-PID execv upgrade) are reaped with waitpid. A process that isn't our child
 /// (adopted by the watchdog fallback) is watched with kqueue `EVFILT_PROC NOTE_EXIT`; macOS
 /// only reports exit statuses to the parent, so both values are None then.
+#[cfg(unix)]
 pub fn wait_exit(pid: i32) -> (Option<i32>, Option<i32>) {
     loop {
         let mut st = 0;
@@ -344,6 +363,7 @@ pub fn wait_exit(pid: i32) -> (Option<i32>, Option<i32>) {
     (None, None)
 }
 
+#[cfg(unix)]
 fn kqueue_wait_exit(pid: i32) {
     unsafe {
         let kq = libc::kqueue();
@@ -385,7 +405,7 @@ fn input_thread(sid: &str, fd: Arc<PtyFd>) -> Sender<Vec<u8>> {
     let (tx, rx) = channel::<Vec<u8>>();
     let _ = std::thread::Builder::new().name(format!("input-{sid}")).spawn(move || {
         for bytes in rx {
-            pty::write_all(fd.0, &bytes);
+            fd.write_all(&bytes);
         }
     });
     tx
@@ -406,13 +426,13 @@ fn engine_thread(sid: String, generation: u64, make: MakeEngine, title: String, 
             if matches!(m, EngineMsg::Read { .. } | EngineMsg::Snapshot(_))
                 && let Some(s) = settling.take()
             {
-                apply_resize(eng, fd.0, s.size);
+                apply_resize(eng, &fd, s.size);
             }
             match m {
                 EngineMsg::Bytes(b, t) => eng.feed(&b, t),
                 EngineMsg::Resize(c, r, cw, ch) => {
                     *settling = None;
-                    apply_resize(eng, fd.0, (c, r, cw, ch));
+                    apply_resize(eng, &fd, (c, r, cw, ch));
                 }
                 EngineMsg::SettleResize(c, r, cw, ch) => {
                     let now = Instant::now();
@@ -490,7 +510,7 @@ fn engine_thread(sid: String, generation: u64, make: MakeEngine, title: String, 
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             if let Some(s) = settling.take_if(|s| s.due()) {
-                apply_resize(&mut eng, fd.0, s.size);
+                apply_resize(&mut eng, &fd, s.size);
             }
             kitty.store(eng.kitty_flags(), Ordering::Relaxed);
             // Title (OSC 0/2) changes are reported to the daemon.

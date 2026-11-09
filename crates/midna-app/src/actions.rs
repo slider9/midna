@@ -484,6 +484,7 @@ pub struct BoundWhen(HashMap<&'static str, Option<String>>);
 impl Global for BoundWhen {}
 
 /// Where a `keys.*` shortcut works as bound now: its when clause, or `None` for anywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the composer's (macOS only)
 pub fn when_clause(cx: &App, setting: &str) -> Option<String> {
     match cx.try_global::<BoundWhen>().and_then(|b| b.0.get(setting)) {
         Some(w) => w.clone(),

@@ -2,7 +2,7 @@
 use crate::daemon::{Config, Daemon};
 use midna_proto::*;
 use serde_json::json;
-use std::os::unix::net::{UnixListener, UnixStream};
+use midna_proto::ipc::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -67,14 +67,14 @@ pub fn stop_daemon(d: &Daemon) -> bool {
 /// session — not just the shell's own group, so background jobs and a monitor's children go
 /// too — then SIGKILL the groups still alive after a grace period. Processes that left the
 /// session (setsid, daemons) are not ours to kill. Synchronous, so it finishes before exit.
+#[cfg(unix)]
 pub fn hangup_all(rts: &[crate::term::RtHandle]) {
     const GRACE: Duration = Duration::from_millis(1500);
     let me = unsafe { libc::getpgrp() };
     let leaders: Vec<i32> = rts.iter().map(|r| r.pid).filter(|&p| p > 1).collect();
     let mut groups: Vec<i32> = vec![];
     for rt in rts {
-        let fg = unsafe { libc::tcgetpgrp(rt.fd.0) };
-        if fg > 1 {
+        if let Some(fg) = rt.fd.foreground_group() {
             groups.push(fg);
         }
     }
@@ -107,18 +107,44 @@ pub fn hangup_all(rts: &[crate::term::RtHandle]) {
     }
 }
 
+/// Windows: close every terminal's pseudoconsole (CTRL_CLOSE_EVENT to everything attached),
+/// then end each session's job if its app is still running after the grace period.
+#[cfg(windows)]
+pub fn hangup_all(rts: &[crate::term::RtHandle]) {
+    const GRACE: Duration = Duration::from_millis(1500);
+    for rt in rts {
+        rt.fd.hangup();
+    }
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < GRACE && rts.iter().any(|r| r.fd.child_alive()) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for rt in rts {
+        rt.fd.kill_all();
+    }
+}
+
 /// Make `dir` private to this user (0700), creating it if needed.
+#[cfg(unix)]
 pub fn secure_dir(dir: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
+/// Windows: create it; a folder under `%LOCALAPPDATA%` is already the user's alone.
+#[cfg(windows)]
+pub fn secure_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
 /// Bind the control socket with mode 0600. The socket's directory is made 0700 when it is
 /// MIDNA_HOME or one we create (never a shared dir like /tmp that MIDNA_SOCKET may point into).
 /// The umask is tightened around bind() so the socket never exists with looser permissions.
+/// (An AF_UNIX socket file on Windows is a reparse point that `exists()` can't follow, hence
+/// `symlink_metadata`.)
 fn bind(socket: &std::path::Path, home: &std::path::Path) -> std::io::Result<UnixListener> {
-    if socket.exists() {
+    if std::fs::symlink_metadata(socket).is_ok() {
         if UnixStream::connect(socket).is_ok() {
             return Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, format!("a daemon is already listening on {}", socket.display())));
         }
@@ -128,11 +154,13 @@ fn bind(socket: &std::path::Path, home: &std::path::Path) -> std::io::Result<Uni
         && (dir == home || !dir.exists()) {
             secure_dir(dir)?;
         }
+    #[cfg(unix)]
     let old = unsafe { libc::umask(0o077) };
     let l = UnixListener::bind(socket);
+    #[cfg(unix)]
     unsafe { libc::umask(old) };
     let l = l?;
-    std::fs::set_permissions(socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    crate::sys::set_private(socket)?;
     Ok(l)
 }
 
@@ -147,6 +175,7 @@ pub fn start(cfg: Config) -> std::io::Result<Handle> {
 
 /// Start, optionally resuming an upgrade handoff (inherited listener + PTYs).
 pub fn start_with(mut cfg: Config, resume: Option<crate::upgrade::Resume>) -> std::io::Result<Handle> {
+    #[cfg(unix)]
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
     let mut kept = std::collections::HashMap::new();
     if let Some(r) = &resume {
@@ -161,6 +190,7 @@ pub fn start_with(mut cfg: Config, resume: Option<crate::upgrade::Resume>) -> st
         Some(l) => l,
         None => bind(&d.cfg.socket, &d.cfg.home)?,
     };
+    #[cfg(unix)]
     d.listener_fd.store(std::os::fd::AsRawFd::as_raw_fd(&listener), Ordering::SeqCst);
     crate::hooks::write_claude_settings(&d);
     crate::adopt::write_files(&d);

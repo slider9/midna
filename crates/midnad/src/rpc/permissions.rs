@@ -5,12 +5,42 @@ use super::{R, ok};
 use crate::daemon::Daemon;
 use midna_proto::*;
 
+#[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> bool;
 }
 
+/// The Windows Settings page for a permission name.
+#[cfg(windows)]
+pub fn pane_url(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "notifications" => "ms-settings:notifications",
+        "login-items" => "ms-settings:startupapps",
+        _ => return None,
+    })
+}
+
+/// Windows has no Accessibility grant to ask for; notifications and starting at login are the
+/// app's, and neither is wired up on Windows yet.
+#[cfg(windows)]
+pub fn status(_d: &Daemon) -> R {
+    let entry = |name: &str, state: &str, detail: &str| PermissionEntry {
+        name: name.into(),
+        state: state.into(),
+        detail: detail.into(),
+        open_cli: format!("midna permissions open {name}"),
+    };
+    ok(PermissionsStatus {
+        permissions: vec![
+            entry("notifications", "not_requested", "midna posts no Windows notifications yet, so there is nothing to grant"),
+            entry("login-items", "disabled", "midnad doesn't start at sign-in on Windows yet; the app starts it when it opens"),
+        ],
+    })
+}
+
 /// The System Settings URL for a permission name (shared with the CLI's `permissions open`).
+#[cfg(target_os = "macos")]
 pub fn pane_url(name: &str) -> Option<&'static str> {
     Some(match name {
         "accessibility" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
@@ -20,6 +50,7 @@ pub fn pane_url(name: &str) -> Option<&'static str> {
     })
 }
 
+#[cfg(target_os = "macos")]
 pub fn status(_d: &Daemon) -> R {
     let ax = unsafe { AXIsProcessTrusted() };
     // launchd sets XPC_SERVICE_NAME to the job label for processes it starts.

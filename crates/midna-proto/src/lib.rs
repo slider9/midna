@@ -7,6 +7,7 @@ pub mod client;
 pub mod cron;
 pub mod error;
 pub mod image_chips;
+pub mod ipc;
 pub mod frame;
 pub mod keep_awake;
 pub mod link_actions;

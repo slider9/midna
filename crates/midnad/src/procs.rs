@@ -4,6 +4,15 @@
 use midna_proto::{BackgroundTask, ProcessInfo, time};
 use std::collections::HashMap;
 
+#[cfg(windows)]
+#[path = "procs_windows.rs"]
+mod windows;
+#[cfg(windows)]
+pub use windows::{all_pids, command_line, cpu_ns, cwd, exe_path, footprint, listening_pids, set_background, snapshot, start_time};
+#[cfg(windows)]
+use windows::{all_bsd, bsd_info};
+
+#[cfg(target_os = "macos")]
 pub fn all_pids() -> Vec<i32> {
     let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
     if n <= 0 {
@@ -23,6 +32,7 @@ struct Bsd {
 }
 
 /// A process's working directory.
+#[cfg(target_os = "macos")]
 pub fn cwd(pid: i32) -> Option<String> {
     let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
@@ -34,6 +44,13 @@ pub fn cwd(pid: i32) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned()).filter(|p| p.starts_with('/'))
 }
 
+/// Every process we may inspect, with its [`Bsd`] info.
+#[cfg(target_os = "macos")]
+fn all_bsd() -> Vec<(i32, Bsd)> {
+    all_pids().into_iter().filter(|&p| p > 0).filter_map(|p| bsd_info(p).map(|b| (p, b))).collect()
+}
+
+#[cfg(target_os = "macos")]
 fn bsd_info(pid: i32) -> Option<Bsd> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
@@ -67,12 +84,14 @@ pub fn name(pid: i32) -> Option<String> {
 /// Put `pid` into macOS's background mode (lowest CPU priority, efficiency cores, throttled
 /// disk) or take it back out. Unlike a nice value, a user can undo it. Children started later
 /// inherit it; ones already running don't.
+#[cfg(target_os = "macos")]
 pub fn set_background(pid: i32, on: bool) -> bool {
     let prio = if on { libc::PRIO_DARWIN_BG } else { 0 };
     unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid as libc::id_t, prio) == 0 }
 }
 
 /// Full argv joined by spaces (KERN_PROCARGS2), or None when the OS won't say.
+#[cfg(target_os = "macos")]
 pub fn command_line(pid: i32) -> Option<String> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut size: libc::size_t = 0;
@@ -88,6 +107,7 @@ pub fn command_line(pid: i32) -> Option<String> {
 }
 
 /// KERN_PROCARGS2 layout: argc (i32), the exec path, NUL padding, then argc NUL-terminated args.
+#[cfg(target_os = "macos")]
 fn parse_procargs2(buf: &[u8]) -> Option<String> {
     let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?) as usize;
     let mut rest = &buf[4..];
@@ -101,14 +121,7 @@ fn parse_procargs2(buf: &[u8]) -> Option<String> {
 
 /// Every process under `root` (itself first, then children depth-first, oldest first).
 pub fn tree(root: i32) -> Vec<ProcessInfo> {
-    let mut table: HashMap<i32, Bsd> = HashMap::new();
-    for pid in all_pids() {
-        if pid > 0
-            && let Some(b) = bsd_info(pid)
-        {
-            table.insert(pid, b);
-        }
-    }
+    let table: HashMap<i32, Bsd> = all_bsd().into_iter().collect();
     let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
     for (&pid, b) in &table {
         if pid != b.ppid {
@@ -158,12 +171,8 @@ pub struct Row {
 /// Every process we may inspect (other users' are left out).
 pub fn table() -> HashMap<i32, Row> {
     let mut out = HashMap::new();
-    for pid in all_pids() {
-        if pid > 0
-            && let Some(b) = bsd_info(pid)
-        {
-            out.insert(pid, Row { pid, ppid: b.ppid, name: b.name, start: b.start, cpu_ns: cpu_ns(pid).unwrap_or(0), memory: footprint(pid).unwrap_or(0) });
-        }
+    for (pid, b) in all_bsd() {
+        out.insert(pid, Row { pid, ppid: b.ppid, name: b.name, start: b.start, cpu_ns: cpu_ns(pid).unwrap_or(0), memory: footprint(pid).unwrap_or(0) });
     }
     out
 }
@@ -194,6 +203,7 @@ pub fn table_start(pid: i32) -> Option<i64> {
 
 /// A process's memory footprint (what Activity Monitor calls Memory: resident, compressed and
 /// GPU memory it owns), in bytes.
+#[cfg(target_os = "macos")]
 pub fn footprint(pid: i32) -> Option<u64> {
     let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
     let got = unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V2, &mut info as *mut _ as *mut libc::rusage_info_t) };
@@ -201,6 +211,7 @@ pub fn footprint(pid: i32) -> Option<u64> {
 }
 
 /// CPU time a process has used (user + system), in nanoseconds.
+#[cfg(target_os = "macos")]
 #[allow(deprecated)] // libc's mach_timebase_info (the mach2 crate isn't worth adding for it)
 pub fn cpu_ns(pid: i32) -> Option<u64> {
     let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
@@ -242,12 +253,14 @@ pub fn tag_tasks(procs: &mut [ProcessInfo], tasks: &[BackgroundTask]) {
 }
 
 /// Pids with a TCP socket listening on `port`, any address. Empty when lsof can't say.
+#[cfg(target_os = "macos")]
 pub fn listening_pids(port: u16) -> Vec<i32> {
     let out = std::process::Command::new("/usr/sbin/lsof").args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fp"]).output();
     out.map(|o| parse_lsof_pids(&String::from_utf8_lossy(&o.stdout))).unwrap_or_default()
 }
 
 /// `lsof -Fp` output: one `p<pid>` line per process.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_lsof_pids(out: &str) -> Vec<i32> {
     let mut pids: Vec<i32> = out.lines().filter_map(|l| l.strip_prefix('p')?.trim().parse().ok()).collect();
     pids.dedup();
@@ -280,6 +293,7 @@ pub fn server_name(name: &str, command: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn procargs2() {
         let mut b = 3i32.to_ne_bytes().to_vec();
@@ -291,14 +305,17 @@ mod tests {
     #[test]
     fn own_tree() {
         let me = std::process::id() as i32;
-        let mut child = std::process::Command::new("/bin/sleep").arg("7.25").spawn().unwrap();
+        #[cfg(unix)]
+        let (mut child, want) = (std::process::Command::new("/bin/sleep").arg("7.25").spawn().unwrap(), "sleep 7.25");
+        #[cfg(windows)]
+        let (mut child, want) = (std::process::Command::new("ping").args(["-n", "8", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap(), "-n 8 127.0.0.1");
         let t = tree(me);
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(t[0].pid, me);
         let c = t.iter().find(|p| p.pid == child.id() as i32).expect("child listed");
         assert_eq!((c.ppid, c.depth), (me, 1));
-        assert!(c.command.contains("sleep 7.25"), "{c:?}");
+        assert!(c.command.contains(want), "{c:?}");
     }
 
     #[test]

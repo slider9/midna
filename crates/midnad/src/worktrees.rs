@@ -227,7 +227,7 @@ fn git_activity(path: &str) -> Option<i64> {
 }
 
 fn pid_alive(pid: i32) -> bool {
-    pid > 0 && (unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+    crate::sys::alive(pid)
 }
 
 // ------------------------------------------------------------------ scan

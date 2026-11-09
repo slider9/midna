@@ -19,7 +19,8 @@ struct Main {
     id: EntityId,
     entity: WeakEntity<MainWindow>,
     handle: AnyWindowHandle,
-    ns: Option<objc2::rc::Retained<objc2_app_kit::NSWindow>>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // for the badge (macOS only)
+    ns: Option<crate::ui::twilight::NativeWindow>,
 }
 
 #[derive(Default)]
@@ -93,7 +94,8 @@ pub fn register(entity: WeakEntity<MainWindow>, id: EntityId, window: &Window, c
 }
 
 /// The main windows' AppKit windows, most recently focused first (the badge docks only in these).
-pub fn ns_windows(cx: &mut App) -> Vec<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn ns_windows(cx: &mut App) -> Vec<crate::ui::twilight::NativeWindow> {
     shared(cx).borrow().mains.iter().filter_map(|m| m.ns.clone()).collect()
 }
 

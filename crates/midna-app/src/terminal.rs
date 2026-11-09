@@ -94,6 +94,7 @@ pub fn share_live_agents(sessions: &[crate::model::Session]) {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the composer's (macOS only)
 pub fn image_paste_inline() -> bool {
     IMAGE_PASTE_INLINE.load(Ordering::Relaxed)
 }
@@ -285,7 +286,14 @@ fn key_msg_now(ks: &Keystroke, held: bool) -> Option<KeyMsg> {
     Some(k)
 }
 
+/// Off macOS GPUI's keystroke already carries what was typed: nothing to correct.
+#[cfg(not(target_os = "macos"))]
+fn current_event_chars(_ks: &Keystroke) -> Option<(String, bool)> {
+    None
+}
+
 /// The characters of the key event being handled, and whether Caps Lock is on.
+#[cfg(target_os = "macos")]
 fn current_event_chars(ks: &Keystroke) -> Option<(String, bool)> {
     use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSEventType};
     let m = &ks.modifiers;
@@ -2564,7 +2572,10 @@ pub(crate) fn open_file(backend: Arc<dyn Backend>, session: String, path: String
     std::thread::spawn(move || {
         let editor = login_editor();
         let Some(editor) = editor else {
+            #[cfg(target_os = "macos")]
             let _ = std::process::Command::new("/usr/bin/open").arg(&path).status();
+            #[cfg(not(target_os = "macos"))]
+            crate::opener::open(&path);
             return;
         };
         let q = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));

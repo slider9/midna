@@ -283,7 +283,23 @@ pub fn debug_annotate(m: &mut MainWindow, session: String, window: &mut Window, 
     .detach();
 }
 
+/// Topmost (above other apps' normal windows) or not, for the native window.
+#[cfg(windows)]
+fn set_level(window: &Window, on_top: bool) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos};
+    let Ok(handle) = HasWindowHandle::window_handle(window) else { return };
+    let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
+    let after = if on_top { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    // SAFETY: GPUI's own HWND, alive while `window` is; only its z-order changes.
+    unsafe { SetWindowPos(h.hwnd.get() as _, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn set_level(_window: &Window, _on_top: bool) {}
+
 /// Floating (above other apps' normal windows) or normal level for the native window.
+#[cfg(target_os = "macos")]
 fn set_level(window: &Window, on_top: bool) {
     use objc2_app_kit::{NSFloatingWindowLevel, NSNormalWindowLevel, NSView};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};

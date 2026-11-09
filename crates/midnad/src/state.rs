@@ -196,11 +196,11 @@ impl State {
     }
 }
 
-/// Random lowercase hex id (arc4random).
+/// Random lowercase hex id (arc4random; ProcessPrng on Windows).
 pub fn hex_id(len: usize) -> String {
     let mut s = String::with_capacity(len);
     while s.len() < len {
-        s.push_str(&format!("{:08x}", unsafe { libc::arc4random() }));
+        s.push_str(&format!("{:08x}", crate::sys::random_u32()));
     }
     s.truncate(len);
     s

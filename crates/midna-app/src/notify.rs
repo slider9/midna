@@ -27,17 +27,32 @@
 //! `userInfo`; buttons come from a `UNNotificationCategory` registered for that set of labels
 //! (with a custom dismiss action, so a dismissal is reported too). A click, button or dismissal
 //! comes back as `Clicked::response`, which the app reports with `notify.respond`.
+//!
+//! Off macOS the banners aren't there yet: the `fallback` module at the bottom keeps the same
+//! API, plays sounds through `crate::sounds`, and opens URLs with `crate::opener`.
+#[cfg(target_os = "macos")]
 use block2::{DynBlock, RcBlock};
 use midna_proto::notify::{Posted, Response, ResponseKind};
+#[cfg(target_os = "macos")]
 use objc2::rc::Retained;
+#[cfg(target_os = "macos")]
 use objc2::runtime::{Bool, NSObject, NSObjectProtocol, ProtocolObject};
+#[cfg(target_os = "macos")]
 use objc2::{AnyThread, define_class, msg_send};
+#[cfg(target_os = "macos")]
 use objc2_app_kit::NSSound;
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSArray, NSBundle, NSDictionary, NSError, NSSet, NSString, NSURL, NSUserDefaults};
+#[cfg(target_os = "macos")]
 use objc2_user_notifications::*;
+#[cfg(target_os = "macos")]
 use std::ptr::NonNull;
+#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicI8, Ordering};
+#[cfg(target_os = "macos")]
 use std::sync::{Mutex, OnceLock};
+#[cfg(not(target_os = "macos"))]
+pub use fallback::*;
 
 /// A notification was clicked: select this terminal (empty = none), and show this needs-you
 /// item if it was about one. A `notify.send` one may open a URL instead, and reports what the
@@ -76,6 +91,7 @@ pub fn respond(backend: &std::sync::Arc<dyn crate::backend::Backend>, id: &str, 
 }
 
 /// Open a notification's URL with whatever handles it (the browser, Finder, another app).
+#[cfg(target_os = "macos")]
 pub fn open_url(url: &str) {
     let url = url.to_string();
     std::thread::spawn(move || {
@@ -84,25 +100,34 @@ pub fn open_url(url: &str) {
 }
 
 /// The request identifier for a `notify.send` id (so the same id replaces it).
+#[cfg(target_os = "macos")]
 fn request_id(id: &str) -> String {
     format!("id:{id}")
 }
 
 /// Button `label`'s action identifier.
+#[cfg(target_os = "macos")]
 const ACTION_PREFIX: &str = "action:";
 /// The `userInfo` key holding `{id, open}` as JSON.
+#[cfg(target_os = "macos")]
 const INFO_KEY: &str = "midna";
 /// Categories registered for sets of buttons, oldest first (at most CATEGORIES_MAX).
+#[cfg(target_os = "macos")]
 static CATEGORIES: Mutex<Vec<(String, Vec<String>)>> = Mutex::new(Vec::new());
+#[cfg(target_os = "macos")]
 const CATEGORIES_MAX: usize = 64;
 
+#[cfg(target_os = "macos")]
 static CLICKS: OnceLock<async_channel::Sender<Clicked>> = OnceLock::new();
 /// `UNAuthorizationStatus` as last seen (-1 = not checked yet).
+#[cfg(target_os = "macos")]
 static STATUS: AtomicI8 = AtomicI8::new(-1);
 /// `UNNotificationSetting` for sounds as last seen (1 = the human turned midna's sounds off).
+#[cfg(target_os = "macos")]
 static SOUNDS: AtomicI8 = AtomicI8::new(-1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // off macOS it's always `Dev`
 pub enum Permission {
     /// A dev build: notifications go through osascript.
     Dev,
@@ -113,6 +138,7 @@ pub enum Permission {
 }
 
 /// What macOS says about midna's notification permission (Settings ▸ Permissions).
+#[cfg(target_os = "macos")]
 pub fn permission() -> Permission {
     if !native() {
         return Permission::Dev;
@@ -126,6 +152,7 @@ pub fn permission() -> Permission {
 }
 
 /// Running from Midna.app with a bundle id (the only case `UNUserNotificationCenter` works).
+#[cfg(target_os = "macos")]
 fn native() -> bool {
     static NATIVE: OnceLock<bool> = OnceLock::new();
     *NATIVE.get_or_init(|| {
@@ -135,6 +162,7 @@ fn native() -> bool {
 }
 
 /// Install the click delegate and read the current permission. Call once, at launch.
+#[cfg(target_os = "macos")]
 pub fn start(clicks: async_channel::Sender<Clicked>) {
     let _ = CLICKS.set(clicks);
     if !native() {
@@ -149,6 +177,7 @@ pub fn start(clicks: async_channel::Sender<Clicked>) {
 }
 
 /// Re-read the permission (the human may have changed it in System Settings).
+#[cfg(target_os = "macos")]
 pub fn refresh_permission() {
     if !native() {
         return;
@@ -163,6 +192,7 @@ pub fn refresh_permission() {
 
 /// Ask macOS for permission now (onboarding), without posting anything. Asking again once
 /// decided returns at once without a prompt.
+#[cfg(target_os = "macos")]
 pub fn request_permission() {
     if !native() {
         return;
@@ -175,6 +205,7 @@ pub fn request_permission() {
 }
 
 /// Show one notification about `session` (None: about midna in general).
+#[cfg(target_os = "macos")]
 pub fn post(p: &Posted, session: Option<&str>) {
     if !native() {
         return post_osascript(p);
@@ -230,6 +261,7 @@ pub fn post(p: &Posted, session: Option<&str>) {
 
 /// The category for a set of buttons (none: only the custom dismiss action), registered with
 /// the center the first time it's used.
+#[cfg(target_os = "macos")]
 fn category_for(actions: &[String]) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -263,6 +295,7 @@ fn category_for(actions: &[String]) -> String {
 }
 
 /// Take a `notify.send` notification out of Notification Center (`notify.withdraw`).
+#[cfg(target_os = "macos")]
 pub fn withdraw(id: &str) {
     if !native() {
         return;
@@ -274,6 +307,7 @@ pub fn withdraw(id: &str) {
 }
 
 /// Take every midna notification out of Notification Center (`notify.clear`, ⌘K).
+#[cfg(target_os = "macos")]
 pub fn clear_all() {
     if native() {
         UNUserNotificationCenter::currentNotificationCenter().removeAllDeliveredNotifications();
@@ -282,6 +316,7 @@ pub fn clear_all() {
 
 /// Take `session`'s notifications out of Notification Center: you're looking at its terminal
 /// now (selected it, or brought midna forward on it). Matches the thread identifier `post` sets.
+#[cfg(target_os = "macos")]
 pub fn clear(session: &str) {
     if !native() || STATUS.load(Ordering::Relaxed) < 2 {
         return;
@@ -301,12 +336,14 @@ pub fn clear(session: &str) {
     UNUserNotificationCenter::currentNotificationCenter().getDeliveredNotificationsWithCompletionHandler(&done);
 }
 
+#[cfg(target_os = "macos")]
 fn play_posted(p: &Posted) {
     if let (true, Some(file)) = (p.sound, p.sound_file.as_deref()) {
         play(file, p.volume.unwrap_or(100));
     }
 }
 
+#[cfg(target_os = "macos")]
 thread_local! {
     /// Sounds still playing (an NSSound dropped mid-play may stop).
     static PLAYING: std::cell::RefCell<Vec<Retained<NSSound>>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -315,6 +352,7 @@ thread_local! {
 /// Play a sound file at `volume` (0–100) as loud as a notification would: scaled by the Mac's
 /// alert volume (System Settings ▸ Sound), which notification sounds follow. Also Settings'
 /// preview. Main thread.
+#[cfg(target_os = "macos")]
 pub fn play(file: &str, volume: u8) {
     let Some(sound) = NSSound::initWithContentsOfFile_byReference(NSSound::alloc(), &NSString::from_str(file), true) else {
         return;
@@ -328,6 +366,7 @@ pub fn play(file: &str, volume: u8) {
 }
 
 /// The alert volume, 0–1 (unset until the human first moves the slider: full).
+#[cfg(target_os = "macos")]
 fn alert_volume() -> f32 {
     let defaults = NSUserDefaults::standardUserDefaults();
     let key = NSString::from_str("com.apple.sound.beep.volume");
@@ -335,6 +374,7 @@ fn alert_volume() -> f32 {
 }
 
 /// A copy of an imported image to attach (the system takes the file it's given).
+#[cfg(target_os = "macos")]
 fn attachment(image: &str) -> Option<Retained<UNNotificationAttachment>> {
     let src = std::path::Path::new(image);
     let dir = std::env::temp_dir().join("midna-notify");
@@ -352,6 +392,7 @@ fn attachment(image: &str) -> Option<Retained<UNNotificationAttachment>> {
 }
 
 /// Dev builds: osascript shows no image; the sound plays here, at its volume.
+#[cfg(target_os = "macos")]
 fn post_osascript(p: &Posted) {
     let q = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let mut script = format!("display notification \"{}\" with title \"{}\"", q(&midna_proto::notify::plain_body(&p.body)), q(&p.title));
@@ -364,6 +405,7 @@ fn post_osascript(p: &Posted) {
     });
 }
 
+#[cfg(target_os = "macos")]
 define_class!(
     /// `UNUserNotificationCenterDelegate`: show banners while midna is frontmost too (the
     /// app already skipped the terminal you're looking at), and turn a click into `Clicked`.
@@ -428,6 +470,59 @@ pub fn show(p: &Posted, looking: bool) -> Show {
         (false, true) if p.push => Show::SoundOnly,
         _ => Show::Nothing,
     }
+}
+
+/// Off macOS: no banners yet (a Windows toast needs an AppUserModelID registered by an
+/// installer), so `post` only plays the notification's sound, like a dev build without a
+/// bundle, and clicks never arrive. URLs open with `crate::opener`.
+#[cfg(not(target_os = "macos"))]
+mod fallback {
+    use super::{Clicked, Permission};
+    use midna_proto::notify::Posted;
+
+    /// There's no permission to ask for: report a dev build, which Settings explains.
+    pub fn permission() -> Permission {
+        Permission::Dev
+    }
+
+    pub fn start(_clicks: async_channel::Sender<Clicked>) {}
+
+    pub fn refresh_permission() {}
+
+    pub fn request_permission() {}
+
+    /// The banner isn't shown; its sound plays here, at its volume.
+    pub fn post(p: &Posted, _session: Option<&str>) {
+        if let (true, Some(file)) = (p.sound, p.sound_file.as_deref()) {
+            play(file, p.volume.unwrap_or(100));
+        }
+    }
+
+    pub fn withdraw(_id: &str) {}
+
+    pub fn clear_all() {}
+
+    pub fn clear(_session: &str) {}
+
+    pub fn open_url(url: &str) {
+        crate::opener::open(url);
+    }
+
+    /// Play a sound file. Windows: `PlaySoundW`, which plays one sound at a time (a new one
+    /// cuts off the last) and has no volume of its own, so `volume` only silences at 0.
+    #[cfg(windows)]
+    pub fn play(file: &str, volume: u8) {
+        use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME, SND_NODEFAULT};
+        if volume == 0 {
+            return;
+        }
+        let wide: Vec<u16> = file.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: a NUL-terminated path; SND_ASYNC copies what it needs before returning.
+        unsafe { PlaySoundW(wide.as_ptr(), std::ptr::null_mut(), SND_FILENAME | SND_ASYNC | SND_NODEFAULT) };
+    }
+
+    #[cfg(not(windows))]
+    pub fn play(_file: &str, _volume: u8) {}
 }
 
 #[cfg(test)]

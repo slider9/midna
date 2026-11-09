@@ -11,7 +11,6 @@ use crate::rpc::Ctx;
 use crate::state::hex_id;
 use midna_proto::*;
 use serde_json::{Value, json};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -76,7 +75,7 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?.write_all(bytes)
+    crate::sys::private_file(std::fs::OpenOptions::new().write(true).create(true).truncate(true)).open(path)?.write_all(bytes)
 }
 
 fn new_delivery(source: TriggerSource, event: &str, guid: &str) -> Delivery {

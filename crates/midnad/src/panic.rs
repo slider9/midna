@@ -49,11 +49,7 @@ pub fn start(d: &Arc<Daemon>) {
 
 /// When this boot started, unix seconds.
 fn boot_time() -> i64 {
-    let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
-    let mut size = std::mem::size_of::<libc::timeval>();
-    let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
-    let r = unsafe { libc::sysctl(mib.as_mut_ptr(), 2, &mut tv as *mut _ as *mut libc::c_void, &mut size, std::ptr::null_mut(), 0) };
-    if r == 0 { tv.tv_sec } else { 0 }
+    crate::sys::boot_time()
 }
 
 /// The newest panic report in `dirs` written at or after `since` (unix seconds).

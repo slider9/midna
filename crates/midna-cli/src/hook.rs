@@ -4,6 +4,8 @@
 //!           Claude's decision JSON (allow/deny/ask) only when midna has an opinion.
 //!   claude statusline: reports cost, prints a short status line.
 //!   codex notify '<json>': Codex's legacy notify (payload is the last argv).
+//!   codex notify -- PREV… '<json>': the same, then runs the notify command that was there
+//!           before with the payload (Windows, where no sh wrapper does that).
 //!
 //! Never breaks the agent: every failure exits 0 without output. `--global` marks the entries
 //! `midna hooks install` writes into the agents' global config.
@@ -19,9 +21,21 @@ pub fn run(a: &Args) -> Res {
     if !matches!(agent.as_str(), "claude" | "codex") {
         return Err(Fail::Usage(format!("unknown agent `{agent}`")));
     }
+    let notify = a.pos.get(2).map(String::as_str) == Some("notify");
+    let r = report(a, &agent);
+    if notify && let Some((payload, previous)) = a.rest.split_last()
+        && let Some((prog, args)) = previous.split_first()
+    {
+        let code = std::process::Command::new(prog).args(args).arg(payload).status().map_or(127, |s| s.code().unwrap_or(1));
+        std::process::exit(code);
+    }
+    r
+}
+
+fn report(a: &Args, agent: &str) -> Res {
     let arg_event = a.pos.get(2).cloned();
     let raw = if arg_event.as_deref() == Some("notify") {
-        a.pos.last().cloned().unwrap_or_default()
+        a.rest.last().or(a.pos.last()).cloned().unwrap_or_default()
     } else {
         let mut s = String::new();
         let _ = std::io::stdin().read_to_string(&mut s);

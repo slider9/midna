@@ -10,7 +10,7 @@ use midna_proto::client::{Client, ClientError, Notification};
 use midna_proto::frame::{Frame, TAG_WANT, encode_input, encode_resize};
 use serde_json::Value;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use midna_proto::ipc::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -295,7 +295,7 @@ impl Drop for DaemonStream {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
-    use std::os::unix::net::UnixListener;
+    use midna_proto::ipc::UnixListener;
     use std::time::Instant;
 
     /// A stand-in midnad: `slow` answers after 1.5 s, `pending` answers like a call waiting on

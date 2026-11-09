@@ -100,6 +100,9 @@ pub fn folder_of(url: &str) -> Option<String> {
             rest.split('&').find_map(|kv| kv.strip_prefix("path="))?
         }
     };
+    // Windows: `file:///C:/x` names `C:/x`.
+    #[cfg(windows)]
+    let raw = raw.strip_prefix('/').filter(|r| r.as_bytes().get(1) == Some(&b':')).unwrap_or(raw);
     let path = PathBuf::from(percent_decode(raw));
     let dir = if path.is_dir() { path } else { path.parent()?.to_path_buf() };
     let s = dir.to_string_lossy().trim_end_matches('/').to_string();
@@ -156,6 +159,22 @@ fn open_shell(m: &mut MainWindow, dir: String, cx: &mut Context<MainWindow>) {
 mod tests {
     use super::{folder_of, percent_decode, uninstall, MARKER};
 
+    /// Windows file URLs carry a drive (`file:///C:/…`).
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_urls_become_folders() {
+        use std::path::PathBuf;
+        assert_eq!(percent_decode("C:/a%20b"), "C:/a b");
+        let tmp = std::env::temp_dir();
+        let t = tmp.to_string_lossy().trim_end_matches('\\').to_string();
+        let url = |p: &str| format!("file:///{}", p.replace('\\', "/"));
+        // PathBuf compares by components: `/` and `\` alike, a trailing one ignored.
+        assert_eq!(folder_of(&url(&t)).map(PathBuf::from), Some(tmp.clone()));
+        assert_eq!(folder_of(&url(&format!("{t}\\missing%20file.txt"))).map(PathBuf::from), Some(tmp));
+    }
+
+    /// Unix paths (the canonical temp dir on Windows is a `\\?\` path, which takes no `/`).
+    #[cfg(unix)]
     #[test]
     fn file_urls_become_folders() {
         assert_eq!(percent_decode("/a%20b/%E2%9C%93"), "/a b/✓");

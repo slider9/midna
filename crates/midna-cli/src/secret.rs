@@ -153,6 +153,9 @@ fn exec(a: &Args) -> Res {
     for t in [out_t, err_t].into_iter().flatten() {
         let _ = t.join();
     }
-    use std::os::unix::process::ExitStatusExt;
-    std::process::exit(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))
+    #[cfg(unix)]
+    let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+    #[cfg(windows)]
+    let signal: Option<i32> = None;
+    std::process::exit(status.code().unwrap_or_else(|| 128 + signal.unwrap_or(1)))
 }

@@ -9,6 +9,7 @@ use crate::state::hex_id;
 use midna_proto::*;
 use serde_json::json;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
 /// Explicit, else the caller's terminal's project, else the project whose folder holds `cwd`
@@ -311,8 +312,13 @@ fn write_file(path: &std::path::Path, text: &str, new: bool) -> std::io::Result<
     let dir = path.parent().ok_or_else(|| std::io::Error::other("no parent directory"))?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let tmp = dir.join(format!(".{name}.midna-{}", hex_id(4)));
-    let mode = if new { 0o600 } else { std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path)?.permissions()) & 0o7777 };
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    opts.mode(if new { 0o600 } else { std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path)?.permissions()) & 0o7777 });
+    #[cfg(windows)]
+    let _ = new;
+    let mut f = opts.open(&tmp)?;
     let res = f.write_all(text.as_bytes()).and_then(|_| f.sync_all()).and_then(|_| std::fs::rename(&tmp, path));
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);

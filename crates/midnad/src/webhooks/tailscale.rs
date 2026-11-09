@@ -21,7 +21,8 @@ pub fn find_cli(override_path: Option<&str>) -> Option<String> {
         return Some(APP_CLI.into());
     }
     let path = std::env::var("PATH").unwrap_or_default();
-    path.split(':').map(|d| std::path::Path::new(d).join("tailscale")).find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned())
+    let exe = format!("tailscale{}", std::env::consts::EXE_SUFFIX);
+    path.split(crate::sys::PATH_SEP).map(|d| std::path::Path::new(d).join(&exe)).find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Run argv directly (no shell) with a timeout. Returns (exit code if it exited, stdout+stderr).
@@ -206,9 +207,10 @@ mod tests {
 
     #[test]
     fn run_capture_times_out() {
-        let (code, _) = run_capture(&["/bin/sleep".into(), "5".into()], Duration::from_millis(100));
+        let sh = crate::sys::posix_sh();
+        let (code, _) = run_capture(&[sh.clone(), "-c".into(), "sleep 5".into()], Duration::from_millis(100));
         assert_eq!(code, None);
-        let (code, out) = run_capture(&["/bin/sh".into(), "-c".into(), "echo hi; echo err >&2".into()], Duration::from_secs(5));
+        let (code, out) = run_capture(&[sh, "-c".into(), "echo hi; echo err >&2".into()], Duration::from_secs(5));
         assert_eq!(code, Some(0));
         assert!(out.contains("hi") && out.contains("err"));
     }

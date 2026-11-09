@@ -3,6 +3,8 @@
 //! The "claude" and "codex" are shell scripts that record their argv, answer `--help` with the
 //! real help texts (Claude Code 2.1.289, Codex 0.160.0), exit 0 on SIGHUP like the agents, and
 //! exit 3 once a `quit` file appears (`mcp …` and `exec …` exit at once).
+// Windows has no sh shims for typed agents yet (docs/STATUS-windows.md).
+#![cfg(unix)]
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};

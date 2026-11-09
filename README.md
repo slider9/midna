@@ -110,7 +110,7 @@ crates/
 docs/
   ARCHITECTURE.md   the build contract        DECISIONS.md   why things are the way they are
   SECURITY.md       human/agent boundary      RELEASING.md   build, sign, publish, install
-  STATUS-*.md       per-area status (foundation, app, agents, triggers, upgrade, packaging)
+  STATUS-*.md       per-area status (foundation, app, agents, triggers, upgrade, packaging, windows)
   design/           approved screen boards    screens/       screenshots
 packaging/       build-app.sh, make-update.sh, notarize.sh, gen-update-key.sh, e2e/, release-tool/
 scripts/        smoke.sh, release.sh, set-version.sh, setup-toolchain.sh, build-dmg.sh

@@ -56,6 +56,21 @@ pub fn start(m: &mut MainWindow, window: &mut Window, cx: &mut Context<MainWindo
 
 /// ⌘ is held right now, read from the keyboard state rather than events: the release event
 /// can miss GPUI (another responder holding focus), and a missed release must not quit.
+/// Windows: GPUI's `cmd` is the Windows key.
+#[cfg(windows)]
+fn cmd_down() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LWIN, VK_RWIN};
+    // SAFETY: plain reads of the keyboard state; the high bit is "down now".
+    unsafe { GetAsyncKeyState(VK_LWIN as i32) < 0 || GetAsyncKeyState(VK_RWIN as i32) < 0 }
+}
+
+/// No keyboard state to read: a hold only quits through its events.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn cmd_down() -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
 fn cmd_down() -> bool {
     objc2_app_kit::NSEvent::modifierFlags_class().contains(objc2_app_kit::NSEventModifierFlags::Command)
 }

@@ -72,7 +72,29 @@ pub fn local_offset_secs() -> i64 {
     local_offset_at(now_unix())
 }
 
+/// Seconds east of UTC for the local timezone at unix time `t` (follows DST changes): the
+/// difference between `t` as UTC and as local time, converted by the system's rules for that
+/// date (`SystemTimeToTzSpecificLocalTime`).
+#[cfg(windows)]
+pub fn local_offset_at(t: i64) -> i64 {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+    // FILETIME counts 100ns ticks since 1601-01-01.
+    let ticks = (t + 11_644_473_600).max(0) as u64 * 10_000_000;
+    let ft = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+    let mut utc: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    let mut local: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    if unsafe { FileTimeToSystemTime(&ft, &mut utc) } == 0 || unsafe { SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) } == 0 {
+        return 0;
+    }
+    let secs = |s: &SYSTEMTIME| {
+        days_from_civil(s.wYear as i64, s.wMonth as u32, s.wDay as u32) * 86_400 + s.wHour as i64 * 3600 + s.wMinute as i64 * 60 + s.wSecond as i64
+    };
+    secs(&local) - secs(&utc)
+}
+
 /// Seconds east of UTC for the local timezone at unix time `t` (follows DST changes).
+#[cfg(not(windows))]
 pub fn local_offset_at(t: i64) -> i64 {
     unsafe extern "C" {
         fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;

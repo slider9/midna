@@ -409,6 +409,7 @@ mod tests {
         assert!(scale_wav(b"RIFF\0\0\0\0WAVEdata\0\0\0\0".to_vec(), 50).is_none(), "no fmt chunk");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn renders_system_sounds_once() {
         let home = std::env::temp_dir().join(format!("midna-render-{}", std::process::id()));
@@ -420,6 +421,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn banner_sounds_are_named_files_in_one_folder() {
         let home = std::env::temp_dir().join(format!("midna-banner-{}", std::process::id()));

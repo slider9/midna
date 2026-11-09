@@ -208,8 +208,11 @@ fn write_sets_a_dotenv_key() {
     // A new file is private.
     let o = d.midna(&["secret", "write", "STRIPE_SECRET_KEY", "new.env"], Some(&dir));
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
-    use std::os::unix::fs::PermissionsExt;
-    assert_eq!(std::fs::metadata(dir.join("new.env")).unwrap().permissions().mode() & 0o777, 0o600);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(dir.join("new.env")).unwrap().permissions().mode() & 0o777, 0o600);
+    }
     let list = d.human().call_value("secret.list", json!({})).unwrap();
     assert_eq!(list[0]["written_to"].as_array().unwrap().len(), 2);
 }

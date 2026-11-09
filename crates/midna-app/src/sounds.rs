@@ -79,9 +79,25 @@ fn resolve(setting: &dyn Fn(&str) -> Value, home: &Path, kind: &str, active: boo
     (volume > 0).then_some((file, volume as u8))
 }
 
+#[cfg(target_os = "macos")]
 pub fn app_active() -> bool {
     let Some(mtm) = objc2::MainThreadMarker::new() else { return false };
     objc2_app_kit::NSApplication::sharedApplication(mtm).isActive()
+}
+
+/// Whether the foreground window is one of ours.
+#[cfg(windows)]
+pub fn app_active() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let mut pid = 0u32;
+    // SAFETY: GetForegroundWindow may return null, which GetWindowThreadProcessId tolerates.
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut pid) };
+    pid == std::process::id()
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn app_active() -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -96,7 +112,10 @@ mod tests {
 
     /// A MIDNA_HOME holding the Twilight sounds (copied from the repo, as midnad installs them).
     fn home() -> PathBuf {
-        let home = std::env::temp_dir().join(format!("midna-app-sounds-{}", std::process::id()));
+        // One per call: tests run at once, and Windows won't copy over a file another has open.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let home = std::env::temp_dir().join(format!("midna-app-sounds-{}-{n}", std::process::id()));
         let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("../midnad/assets/sounds/twilight");
         for name in notify::TWILIGHT {
             let to = notify::twilight_path(&home, name).unwrap();

@@ -27,7 +27,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -521,15 +520,8 @@ fn model(d: &Daemon, project_id: &str, folder: &str, argv: &[String], prompt: &s
         }
     }
     cmd.env_remove("MIDNA_SESSION").env("TERM", "dumb").env("MIDNA_CLEANUP", "1").env("GH_PROMPT_DISABLED", "1").env("GIT_TERMINAL_PROMPT", "0");
-    unsafe {
-        cmd.pre_exec(|| {
-            // Its own process group, so a timeout stops everything it started.
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    // Its own process group, so a timeout stops everything it started.
+    crate::sys::new_group(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| format!("could not start claude: {e}"))?;
     if let Some(mut w) = child.stdin.take() {
         let _ = w.write_all(prompt.as_bytes());
@@ -554,12 +546,12 @@ fn model(d: &Daemon, project_id: &str, folder: &str, argv: &[String], prompt: &s
         }
         match killed {
             None if began.elapsed() >= timeout => {
-                unsafe { libc::kill(-pid, libc::SIGTERM) };
+                crate::sys::signal_group(pid, crate::sys::Sig::Term);
                 killed = Some(Instant::now());
             }
-            Some(k) if k.elapsed() >= Duration::from_secs(5) => unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            },
+            Some(k) if k.elapsed() >= Duration::from_secs(5) => {
+                crate::sys::signal_group(pid, crate::sys::Sig::Kill);
+            }
             _ => {}
         }
         std::thread::sleep(Duration::from_millis(200));

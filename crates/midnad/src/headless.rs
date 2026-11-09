@@ -14,7 +14,6 @@ use crate::daemon::Daemon;
 use midna_proto::*;
 use serde_json::json;
 use std::io::Read;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -62,8 +61,10 @@ impl Runs {
         if let Some(a) = crate::peer::ancestry(pid).into_iter().find_map(of) {
             return Some(a);
         }
-        let sid = unsafe { libc::getsid(pid) };
-        if sid > 1 { of(sid) } else { None }
+        match crate::sys::session_of(pid) {
+            Some(sid) if sid > 1 => of(sid),
+            _ => None,
+        }
     }
 }
 
@@ -143,16 +144,8 @@ pub fn start(d: &Arc<Daemon>, t: &Trigger, delivery_id: &str, project_id: &str, 
         Err(e) => return failed(run, e),
     };
     cmd.stdout(writer).stderr(writer2);
-    unsafe {
-        cmd.pre_exec(|| {
-            // Its own process group, so a timeout stops everything it started.
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-            Ok(())
-        });
-    }
+    // Its own process group, so a timeout stops everything it started.
+    crate::sys::new_group(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return failed(run, e),
@@ -205,11 +198,11 @@ pub fn start(d: &Arc<Daemon>, t: &Trigger, delivery_id: &str, project_id: &str, 
             match killed_at {
                 None if began.elapsed() >= timeout => {
                     timed_out = true;
-                    unsafe { libc::kill(-pid, libc::SIGTERM) };
+                    crate::sys::signal_group(pid, crate::sys::Sig::Term);
                     killed_at = Some(Instant::now());
                 }
                 Some(k) if k.elapsed() >= Duration::from_secs(5) => {
-                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    crate::sys::signal_group(pid, crate::sys::Sig::Kill);
                 }
                 _ => {}
             }
@@ -228,7 +221,7 @@ pub fn start(d: &Arc<Daemon>, t: &Trigger, delivery_id: &str, project_id: &str, 
         match status {
             Some(s) => {
                 run.exit_code = s.code();
-                run.signal = s.signal();
+                run.signal = crate::sys::exit_signal(&s);
             }
             None => run.error = Some("lost track of the process".into()),
         }

@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+use crate::ipc::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 

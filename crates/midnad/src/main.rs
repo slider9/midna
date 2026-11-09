@@ -158,10 +158,30 @@ fn upgrade_client(cfg: &midnad::Config, path: &str) {
     }
 }
 
+#[cfg(unix)]
 static SIGNAL_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Windows: Ctrl+C, Ctrl+Break or closing the console window stop the daemon (hanging up
+/// every terminal). There's no graceful restart to fall back from. A detached daemon has no
+/// console, so only `midna daemon stop` reaches it.
+#[cfg(windows)]
+fn install_signals(d: std::sync::Arc<midnad::daemon::Daemon>) {
+    static DAEMON: std::sync::OnceLock<std::sync::Arc<midnad::daemon::Daemon>> = std::sync::OnceLock::new();
+    let _ = DAEMON.set(d);
+    // Windows runs the handler on a thread of its own, so it may block while the daemon stops.
+    unsafe extern "system" fn on_ctrl(_kind: u32) -> windows_sys::core::BOOL {
+        if let Some(d) = DAEMON.get() {
+            eprintln!("midnad: console closed or interrupted: stopping (hanging up every terminal)");
+            midnad::server::stop_daemon(d);
+        }
+        1
+    }
+    unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(on_ctrl), 1) };
+}
 
 /// Signals go through a self-pipe to a normal thread (a handoff can't run in a handler).
 /// SIGTERM: graceful restart, falling back to a stop. SIGINT: stop.
+#[cfg(unix)]
 fn install_signals(d: std::sync::Arc<midnad::daemon::Daemon>) {
     let mut p = [0; 2];
     if unsafe { libc::pipe(p.as_mut_ptr()) } != 0 {
@@ -219,6 +239,10 @@ fn install_signals(d: std::sync::Arc<midnad::daemon::Daemon>) {
 /// (installing ourselves first if there is none) — a crash restart or a login then runs the
 /// version the last upgrade chose, and `daemon.restart` finds us under `bin/`. launchd gives us
 /// no useful stdout/stderr, so both go to `$MIDNA_HOME/midnad.log`.
+#[cfg(windows)]
+fn launchd_setup(_cfg: &midnad::Config, _passthrough: &[String]) {}
+
+#[cfg(unix)]
 fn launchd_setup(cfg: &midnad::Config, passthrough: &[String]) {
     use std::os::unix::ffi::OsStrExt;
     let _ = std::fs::create_dir_all(&cfg.home);
@@ -257,8 +281,8 @@ fn launchd_setup(cfg: &midnad::Config, passthrough: &[String]) {
 }
 
 fn detach(cfg: &midnad::Config, passthrough: &[String]) {
-    use std::os::unix::process::CommandExt;
-    if std::os::unix::net::UnixStream::connect(&cfg.socket).is_ok() {
+    use midna_proto::ipc::UnixStream;
+    if UnixStream::connect(&cfg.socket).is_ok() {
         eprintln!("midnad already running on {}", cfg.socket.display());
         return;
     }
@@ -267,19 +291,34 @@ fn detach(cfg: &midnad::Config, passthrough: &[String]) {
     let out = std::fs::OpenOptions::new().create(true).append(true).open(&log).expect("open midnad.log");
     let mut cmd = std::process::Command::new(std::env::current_exe().expect("current exe"));
     cmd.arg("--foreground").args(passthrough).stdin(std::process::Stdio::null()).stdout(out.try_clone().unwrap()).stderr(out);
+    #[cfg(unix)]
     unsafe {
+        use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
             libc::setsid();
             Ok(())
         });
     }
-    if let Err(e) = cmd.spawn() {
+    // Windows: no console, its own process group, and out of the caller's job when the job
+    // allows it (a terminal's job ends everything in it when the terminal closes).
+    #[cfg(windows)]
+    let spawned = {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB).spawn().or_else(|_| {
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+            cmd.spawn()
+        })
+    };
+    #[cfg(unix)]
+    let spawned = cmd.spawn();
+    if let Err(e) = spawned {
         eprintln!("midnad: could not start: {e}");
         std::process::exit(1);
     }
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(5) {
-        if std::os::unix::net::UnixStream::connect(&cfg.socket).is_ok() {
+        if UnixStream::connect(&cfg.socket).is_ok() {
             println!("midnad started ({})", cfg.socket.display());
             return;
         }

@@ -1,5 +1,6 @@
 //! Where midna lives on disk. Socket: `MIDNA_SOCKET`, else `$MIDNA_HOME/midnad.sock`.
-//! Home: `MIDNA_HOME`, else `~/Library/Application Support/com.mrgnhnt.midna`.
+//! Home: `MIDNA_HOME`, else `~/Library/Application Support/com.mrgnhnt.midna` on macOS and
+//! `%LOCALAPPDATA%\com.mrgnhnt.midna` on Windows.
 //!
 //! Midna Dev (`scripts/dev-app.sh`) is built with its home baked in ([`DEV_HOME`]). It ignores
 //! `MIDNA_HOME` / `MIDNA_SOCKET`, which every Midna terminal exports pointing at production,
@@ -23,13 +24,45 @@ pub fn is_dev() -> bool {
     DEV_HOME.is_some()
 }
 
-fn user_home() -> PathBuf {
+#[cfg(not(windows))]
+pub fn user_home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+/// `%USERPROFILE%` (Git Bash's `HOME` can point elsewhere, so it comes second).
+#[cfg(windows)]
+pub fn user_home() -> PathBuf {
+    ["USERPROFILE", "HOME"]
+        .iter()
+        .find_map(|k| std::env::var_os(k).filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Where per-user app data lives: `~/Library/Application Support` on macOS,
+/// `%LOCALAPPDATA%` on Windows (local, not roaming: it holds sockets and logs).
+#[cfg(not(windows))]
+pub fn app_data_dir() -> PathBuf {
+    user_home().join("Library/Application Support")
+}
+
+#[cfg(windows)]
+pub fn app_data_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| user_home().join("AppData").join("Local"))
 }
 
 /// The installed Midna's home, whatever this build is.
 pub fn production_home() -> PathBuf {
-    user_home().join("Library/Application Support").join(BUNDLE_ID)
+    app_data_dir().join(BUNDLE_ID)
+}
+
+/// Where the Windows installer puts Midna: `%LOCALAPPDATA%\Programs\Midna` (per user, no admin).
+#[cfg(windows)]
+pub fn windows_install_dir() -> PathBuf {
+    app_data_dir().join("Programs").join("Midna")
 }
 
 pub fn midna_home() -> PathBuf {
@@ -58,6 +91,7 @@ fn resolve_socket(dev: Option<&str>, env: Option<std::ffi::OsString>, home: Path
 }
 
 /// What Midna Dev must never write: production's home, CLI link, Quick Action and app bundle.
+#[cfg(not(windows))]
 pub fn production_paths() -> Vec<PathBuf> {
     let home = user_home();
     vec![
@@ -67,6 +101,12 @@ pub fn production_paths() -> Vec<PathBuf> {
         home.join("Library/LaunchAgents").join(format!("{DAEMON_LABEL}.plist")),
         PathBuf::from("/Applications/Midna.app"),
     ]
+}
+
+/// What Midna Dev must never write on Windows: production's home, install dir and CLI.
+#[cfg(windows)]
+pub fn production_paths() -> Vec<PathBuf> {
+    vec![production_home(), windows_install_dir(), user_home().join(".local").join("bin").join("midna.exe")]
 }
 
 /// Midna Dev refuses to write `path` when it is, or is inside, one of production's
@@ -151,12 +191,16 @@ mod tests {
         let dev = tmp.join("dev");
         std::fs::create_dir_all(prod.join("bin")).unwrap();
         std::fs::create_dir_all(&dev).unwrap();
-        std::os::unix::fs::symlink(&prod, dev.join("sneaky")).unwrap();
         let protected = [prod.clone()];
         assert!(check_write(&prod, &protected).is_err());
         assert!(check_write(&prod.join("bin/current"), &protected).is_err(), "inside, not yet existing");
         assert!(check_write(&dev.join("../prod/bin"), &protected).is_err(), "via ..");
-        assert!(check_write(&dev.join("sneaky/bin/current"), &protected).is_err(), "via a symlink");
+        // Windows needs a privilege (or Developer Mode) to make a symlink.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&prod, dev.join("sneaky")).unwrap();
+            assert!(check_write(&dev.join("sneaky/bin/current"), &protected).is_err(), "via a symlink");
+        }
         assert!(check_write(&dev.join("bin/current"), &protected).is_ok());
         assert!(check_write(&tmp.join("prod-other"), &protected).is_ok(), "a sibling sharing the prefix");
         std::fs::remove_dir_all(&tmp).unwrap();

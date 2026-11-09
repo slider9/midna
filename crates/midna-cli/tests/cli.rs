@@ -177,6 +177,20 @@ fn hook_bridge_prints_claude_decision() {
 }
 
 #[test]
+fn codex_notify_runs_the_previous_command() {
+    // `notify --global -- PREV… <json>` is what `hooks install` writes on Windows: it reports
+    // (nothing to report to here) and then runs PREV with the payload, keeping its exit code.
+    let prev: &[&str] = if cfg!(windows) { &["cmd.exe", "/d", "/c", "exit", "7"] } else { &["/bin/sh", "-c", "exit 7"] };
+    let payload = r#"{"type":"agent-turn-complete","input-messages":["hi"]}"#;
+    let args: Vec<&str> = ["hook", "codex", "notify", "--global", "--"].iter().chain(prev).copied().chain([payload]).collect();
+    let o = midna("/tmp/midna-no-such.sock", &args, None, None);
+    assert_eq!(code(&o), 7, "{o:?}");
+    // With nothing to chain it is a quiet success.
+    let o = midna("/tmp/midna-no-such.sock", &["hook", "codex", "notify", "--global", "--", payload], None, None);
+    assert_eq!((code(&o), stdout(&o)), (0, String::new()), "{o:?}");
+}
+
+#[test]
 fn global_hook_stands_down_when_midna_injected_its_own() {
     let d = D::start();
     let s = d.sock();

@@ -1246,6 +1246,14 @@ fn capitalize(s: &str) -> String {
 }
 
 /// AXIsProcessTrusted: whether midna may use Accessibility (Kass input editing, window moves).
+/// Off macOS there's no such grant to ask for.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn accessibility_trusted() -> bool {
+    true
+}
+
+/// AXIsProcessTrusted: whether midna may use Accessibility (Kass input editing, window moves).
+#[cfg(target_os = "macos")]
 pub(crate) fn accessibility_trusted() -> bool {
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
@@ -3365,7 +3373,10 @@ fn clock_at(at: Instant) -> String {
     let when = std::time::SystemTime::now() - at.elapsed();
     let t = when.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    #[cfg(unix)]
     unsafe { libc::localtime_r(&t, &mut tm) };
+    #[cfg(windows)]
+    unsafe { libc::localtime_s(&mut tm, &t) };
     let (h, ap) = match tm.tm_hour {
         0 => (12, "AM"),
         h @ 1..=11 => (h, "AM"),

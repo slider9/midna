@@ -3985,6 +3985,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3996,6 +3997,7 @@ dependencies = [
  "midnad",
  "serde",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4006,6 +4008,8 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "uds_windows",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4024,6 +4028,7 @@ dependencies = [
  "sha2 0.10.9",
  "tiny_http",
  "toml_edit 0.25.15+spec-1.1.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

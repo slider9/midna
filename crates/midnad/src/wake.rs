@@ -161,6 +161,10 @@ fn ident(d: &Daemon) -> Option<String> {
     if d.wake.inner().fake.is_some() {
         return Some("com.mrgnhnt.midna.test".into());
     }
+    // Windows: no scheduled wake yet (it would be a waitable timer that resumes the PC).
+    if cfg!(windows) {
+        return None;
+    }
     let name = d.cfg.home.file_name()?.to_str()?;
     let app = name == "com.mrgnhnt.midna" || name.strip_prefix("com.mrgnhnt.midna.").is_some_and(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_lowercase()));
     (app && d.cfg.owns_process).then(|| name.to_string())
@@ -387,7 +391,13 @@ fn grant_script(user: &str, id: &str, remove: bool) -> String {
     )
 }
 
+#[cfg(windows)]
+fn user_name() -> Option<String> {
+    None
+}
+
 /// This user's login name (sudoers needs it), checked to be a plain name.
+#[cfg(unix)]
 fn user_name() -> Option<String> {
     let pw = unsafe { libc::getpwuid(libc::getuid()) };
     if pw.is_null() {
@@ -492,6 +502,7 @@ mod tests {
     }
 
     /// The helper refuses anything but `wake|cancel 'MM/DD/YY HH:MM:SS'`, before pmset runs.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_helper_checks_its_arguments() {
         let dir = std::env::temp_dir().join(format!("midna-wake-{}", std::process::id()));

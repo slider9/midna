@@ -75,6 +75,7 @@ impl TerminalView {
     }
 
     /// The composer is about to send `text` here (with ↩). True = the sheet took it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the composer is macOS only
     pub fn submit_checks_secrets(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let took = self.paste_checks_secrets(text.trim_end_matches(['\n', '\r']), window, cx);
         if let Some(s) = self.secret_sheet.as_mut().filter(|_| took) {

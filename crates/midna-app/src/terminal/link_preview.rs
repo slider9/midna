@@ -500,7 +500,10 @@ impl TerminalView {
     fn preview_reveal(&mut self, cx: &mut Context<Self>) {
         let Some(l) = self.card_link() else { return };
         if crate::dev::var_os("MIDNA_DEBUG_TERM").is_none() {
+            #[cfg(target_os = "macos")]
             let _ = std::process::Command::new("/usr/bin/open").arg("-R").arg(&l.target).spawn();
+            #[cfg(not(target_os = "macos"))]
+            crate::opener::reveal(&l.target);
         }
         self.preview_flash("Revealed in Finder", false, cx);
     }
@@ -1489,7 +1492,18 @@ fn run_preview(path: &Path, args: &[String], url: &str, timeout: Duration) -> Op
     ok.then(|| parse_app_preview(&out)).flatten()
 }
 
+/// Off macOS there's no Launch Services to ask: no default app, so no app preview.
+#[cfg(not(target_os = "macos"))]
+mod ls {
+    use std::path::PathBuf;
+
+    pub fn default_app(_url: &str) -> Option<PathBuf> {
+        None
+    }
+}
+
 /// Launch Services' default app for a URL, as `midnad`'s `schemes.rs` names it for `session.link_at`.
+#[cfg(target_os = "macos")]
 mod ls {
     use core_foundation_sys::base::{CFRelease, CFTypeRef, kCFAllocatorDefault};
     use core_foundation_sys::string::{CFStringCreateWithBytes, kCFStringEncodingUTF8};
@@ -1534,8 +1548,40 @@ mod ls {
     }
 }
 
+/// Run `cmd`, keeping at most `limit` bytes of its output; killed after `timeout`. Windows has
+/// no process groups to kill: only `cmd` itself goes, and the read ends with the timeout's
+/// kill (a child it left holding the pipe keeps the reader thread, not the caller).
+#[cfg(windows)]
+fn run_capped(mut cmd: std::process::Command, limit: usize, timeout: Duration) -> Option<(bool, Vec<u8>)> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).creation_flags(CREATE_NO_WINDOW).spawn().ok()?;
+    let mut out = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = vec![];
+        let _ = (&mut out).take(limit as u64).read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let until = Instant::now() + timeout;
+    let ok = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st.success(),
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(40)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    Some((ok, rx.recv_timeout(until.saturating_duration_since(Instant::now()).max(Duration::from_millis(200))).ok()?))
+}
+
 /// Run `cmd`, keeping at most `limit` bytes of its output; killed after `timeout`, with anything
 /// it started (in its own process group, so a child holding the pipe can't outlive it).
+#[cfg(unix)]
 fn run_capped(mut cmd: std::process::Command, limit: usize, timeout: Duration) -> Option<(bool, Vec<u8>)> {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
@@ -1846,9 +1892,11 @@ fn decode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg_attr(not(unix), allow(unused_imports))] // the script-running tests are Unix only
     use super::{AppPreview, Body, Check, FILE_LINES, Link, RunState, Tone, duration, excerpt, fade, fetchable, github_issue, github_pr, github_run, load, load_pattern, page_meta, parse_app_preview, parse_issue, parse_pr, parse_preview_command, parse_run, path_title, pattern_command, preview_command, run_pattern_on, run_preview, unix_time, url_title};
     use serde_json::json;
     use std::path::Path;
+    #[cfg_attr(not(unix), allow(unused_imports))]
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2031,6 +2079,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn script(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2038,6 +2087,8 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// App bundles, `sh` scripts and `plutil`: macOS only.
+    #[cfg(target_os = "macos")]
     #[test]
     fn bundles_declare_their_preview() {
         let dir = std::env::temp_dir().join(format!("midna-app-preview-{}", std::process::id()));
@@ -2075,6 +2126,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `sh` scripts as the commands: Unix only.
+    #[cfg(unix)]
     #[test]
     fn link_patterns_fill_the_card() {
         let dir = std::env::temp_dir().join(format!("midna-app-pattern-{}", std::process::id()));
@@ -2114,6 +2167,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn pattern_previews_are_cached() {
         let dir = std::env::temp_dir().join(format!("midna-app-pattern-cache-{}", std::process::id()));

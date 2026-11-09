@@ -224,6 +224,13 @@ pub fn apply(staged: &Path, installed: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Off macOS there's no installed bundle to update yet (the app always runs in dev mode).
+#[cfg(not(target_os = "macos"))]
+fn swap(_a: &Path, _b: &Path) -> Result<(), String> {
+    Err("updates aren't available on this platform yet".into())
+}
+
+#[cfg(target_os = "macos")]
 fn swap(a: &Path, b: &Path) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
     let ca = std::ffi::CString::new(a.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
@@ -251,6 +258,7 @@ fn swap(a: &Path, b: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn entry() -> FeedEntry {
         FeedEntry {
             version: "0.1.1".into(),
@@ -265,6 +273,8 @@ mod tests {
         }
     }
 
+    /// The feed is for macOS builds (`check_entry` checks the macOS version).
+    #[cfg(target_os = "macos")]
     #[test]
     fn signature_roundtrip_and_tamper() {
         use ring::signature::KeyPair;
@@ -300,6 +310,7 @@ mod tests {
         assert_eq!(feed_url("https://h/{channel}.json", "beta"), "https://h/beta.json");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn swap_exchanges_directories() {
         let tmp = std::env::temp_dir().join(format!("midna-swap-{}", std::process::id()));

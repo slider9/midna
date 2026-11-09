@@ -14,8 +14,7 @@ use crate::peer;
 use crate::rpc::{self, Ctx, Role};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
+use midna_proto::ipc::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -100,14 +99,7 @@ impl OutTx {
             return true;
         }
         let Some(s) = &self.sock else { return false };
-        let mut b = [0u8; 1];
-        // SAFETY: a one-byte peek into a local buffer on a socket we own.
-        let n = unsafe { libc::recv(s.as_raw_fd(), b.as_mut_ptr().cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
-        match n {
-            0 => true,
-            n if n > 0 => false,
-            _ => matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECONNRESET | libc::ENOTCONN | libc::EPIPE | libc::EBADF)),
-        }
+        peer_closed(s)
     }
 
     /// Bytes queued and not yet written (tests).
@@ -177,13 +169,45 @@ pub fn read_line_bounded(r: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) ->
     }
 }
 
+/// Has the peer hung up (or been cut off)? A one-byte peek that never blocks or consumes.
+#[cfg(unix)]
+fn peer_closed(s: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut b = [0u8; 1];
+    // SAFETY: a one-byte peek into a local buffer on a socket we own.
+    let n = unsafe { libc::recv(s.as_raw_fd(), b.as_mut_ptr().cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+    match n {
+        0 => true,
+        n if n > 0 => false,
+        _ => matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECONNRESET | libc::ENOTCONN | libc::EPIPE | libc::EBADF)),
+    }
+}
+
+/// Windows has no MSG_DONTWAIT: poll first (no wait), and peek only when there is something to
+/// read (data, or the end of the stream).
+#[cfg(windows)]
+fn peer_closed(s: &UnixStream) -> bool {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{MSG_PEEK, POLLERR, POLLHUP, POLLRDNORM, WSAPOLLFD, WSAPoll, recv};
+    let sock = s.as_raw_socket() as usize;
+    let mut p = WSAPOLLFD { fd: sock, events: POLLRDNORM, revents: 0 };
+    if unsafe { WSAPoll(&mut p, 1, 0) } <= 0 {
+        return false;
+    }
+    if p.revents & (POLLHUP | POLLERR) != 0 {
+        return true;
+    }
+    let mut b = [0u8; 1];
+    unsafe { recv(sock, b.as_mut_ptr(), 1, MSG_PEEK as i32) <= 0 }
+}
+
 /// The connection's role: the GUI is human, unless it runs inside one of this daemon's
 /// terminals (then an agent launched it, e.g. `Midna.app/Contents/MacOS/midna-app` typed into
 /// a midna shell). Everything else is an agent.
-fn base_role(d: &Daemon, fd: i32, pid: Option<i32>) -> Role {
+fn base_role(d: &Daemon, token: Option<[u8; 32]>, pid: Option<i32>) -> Role {
     let (Some(pid), Some(exe)) = (pid, pid.and_then(peer::pid_path)) else { return Role::Agent };
     let gui = peer::GuiIdentity { app_path: d.cfg.app_path.clone(), requirement: d.cfg.gui_requirement.clone() };
-    if !gui.matches(&exe, pid, peer::peer_token(fd).as_ref()) {
+    if !gui.matches(&exe, pid, token.as_ref()) {
         return Role::Agent;
     }
     if peer::terminal_of(pid, &d.terminal_pids()).is_some() {
@@ -198,7 +222,7 @@ const TRUSTED_CLIENT_METHODS: &[&str] = &["session.answer_question"];
 /// The `agents.trusted_clients` entry this caller matches, for a method that honors it. Only an
 /// agent-role process outside every midna terminal that claimed no terminal qualifies, so an
 /// agent (or anything it starts) can never pass as the human's client.
-fn trusted_client(d: &Daemon, method: &str, ctx: &Ctx, fd: i32) -> Option<String> {
+fn trusted_client(d: &Daemon, method: &str, ctx: &Ctx, token: Option<[u8; 32]>) -> Option<String> {
     if !TRUSTED_CLIENT_METHODS.contains(&method) || ctx.role != Role::Agent || ctx.session.is_some() || ctx.as_actor.is_some() {
         return None;
     }
@@ -209,13 +233,13 @@ fn trusted_client(d: &Daemon, method: &str, ctx: &Ctx, fd: i32) -> Option<String
     }
     let exe = peer::pid_path(pid)?;
     let team = peer::codesign::own_identity().and_then(|(_, t)| t);
-    peer::trusted_client(&entries, &exe, pid, peer::peer_token(fd).as_ref(), team.as_deref())
+    peer::trusted_client(&entries, &exe, pid, token.as_ref(), team.as_deref())
 }
 
 pub fn serve(d: Arc<Daemon>, s: UnixStream, conn_id: u64) {
-    let fd = s.as_raw_fd();
-    let pid = peer::peer_pid(s.as_raw_fd());
-    let role = base_role(&d, s.as_raw_fd(), pid);
+    let token = peer::stream_token(&s);
+    let pid = peer::stream_pid(&s);
+    let role = base_role(&d, token, pid);
     let (Ok(ws), Ok(ctl)) = (s.try_clone(), s.try_clone()) else { return };
     let (tx, rx) = OutTx::pair();
     let tx = OutTx { sock: Some(Arc::new(ctl)), ..tx };
@@ -276,7 +300,7 @@ pub fn serve(d: Arc<Daemon>, s: UnixStream, conn_id: u64) {
             Err(e) => Err(e),
             Ok(()) => {
                 if !claimed {
-                    ctx.client = trusted_client(&d, &method, &ctx, fd);
+                    ctx.client = trusted_client(&d, &method, &ctx, token);
                 }
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rpc::call(&d, &ctx, &method, params))).unwrap_or_else(|p| {
                 let what = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
