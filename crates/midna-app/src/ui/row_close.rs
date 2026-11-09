@@ -200,7 +200,7 @@ pub fn line(m: &MainWindow, s: &Session, t: &Theme, cx: &mut Context<MainWindow>
                     .pt(px(3.))
                     .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(if busy { t.need } else { t.dim }).child(text))
                     .child(
-                        super::screen_kit::btn(t, SharedString::from(format!("row-keep-{}", s.id)), "Cancel")
+                        super::screen_kit::btn_base(t, SharedString::from(format!("row-keep-{}", s.id)), "Cancel")
                             .h(px(24.))
                             .px(px(9.))
                             .text_color(t.dim)

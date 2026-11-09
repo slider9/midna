@@ -80,7 +80,9 @@ pub fn btn(t: &Theme, id: impl Into<ElementId>, label: impl Into<SharedString>) 
     btn_base(t, id, label).hover(move |s| s.bg(raised))
 }
 
-fn btn_base(t: &Theme, id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
+/// [`btn`] without its hover style, for a button that wants its own: GPUI takes one hover
+/// style per element (a second `.hover()` fails its debug assertion).
+pub fn btn_base(t: &Theme, id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
     div()
         .id(id)
         .flex()
