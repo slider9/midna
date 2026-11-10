@@ -46,6 +46,8 @@ pub const ZSHENV: &str = include_str!("shell/zshenv.zsh");
 pub const BASH_INIT: &str = include_str!("shell/init.bash");
 /// fish's `vendor_conf.d` file in midna shells (its data dir is first in `XDG_DATA_DIRS`).
 pub const FISH_CONF: &str = include_str!("shell/midna.fish");
+/// What PowerShell runs once its profiles have (Windows; see [`powershell_argv`]).
+pub const POWERSHELL_INIT: &str = include_str!("shell/midna.ps1");
 
 /// The agents a shell terminal hands to midna.
 pub const AGENTS: [AgentKind; 2] = [AgentKind::Claude, AgentKind::Codex];
@@ -60,6 +62,40 @@ fn bash_init(home: &Path) -> PathBuf {
 
 fn fish_data(home: &Path) -> PathBuf {
     home.join("shell").join("fish")
+}
+
+#[cfg(windows)]
+fn powershell_init(home: &Path) -> PathBuf {
+    home.join("shell").join("powershell").join("midna.ps1")
+}
+
+/// PowerShell (`powershell` or `pwsh`, with only the flags midna starts it with) made to run
+/// `init` after its profiles and stay: `-NoExit -EncodedCommand`. The command reads the file
+/// and runs its text, which no execution policy stops (a policy blocks script files, and
+/// Windows ships with `Restricted`).
+#[cfg(windows)]
+pub fn powershell_argv(argv: &[String], init: &Path) -> Option<Vec<String>> {
+    let plain = argv[1..].iter().all(|a| a.eq_ignore_ascii_case("-NoLogo") || a.eq_ignore_ascii_case("-NoProfile"));
+    if !plain {
+        return None;
+    }
+    let path = init.to_string_lossy().replace('\'', "''");
+    let command = format!(". ([ScriptBlock]::Create([IO.File]::ReadAllText('{path}')))");
+    let utf16: Vec<u8> = command.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    Some(argv.iter().cloned().chain(["-NoExit".into(), "-EncodedCommand".into(), base64(&utf16)]).collect())
+}
+
+#[cfg(windows)]
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            out.push(if i <= c.len() { ABC[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
 }
 
 /// (Re)write the shims and the shells' startup files (daemon start).
@@ -89,6 +125,8 @@ pub fn write_files(d: &Daemon) {
     write(zsh_dir(home).join(".zshenv"), ZSHENV, 0o644);
     write(bash_init(home), BASH_INIT, 0o644);
     write(fish_data(home).join("fish").join("vendor_conf.d").join("midna.fish"), FISH_CONF, 0o644);
+    #[cfg(windows)]
+    write(powershell_init(home), POWERSHELL_INIT, 0o644);
 }
 
 /// Windows: only Git Bash runs the sh shims, but every shell (PowerShell, cmd) runs an .exe.
@@ -151,7 +189,10 @@ pub fn shell_env(d: &Daemon, command: &[String], env: &mut Vec<(String, String)>
     env.push(("MIDNA_SHIMS".into(), shims));
     let argv = crate::rpc::session::exec_argv(command);
     let shell = argv.first().cloned().unwrap_or_default();
-    match shell.rsplit('/').next().unwrap_or("") {
+    // `bash`, also as Git Bash's `C:\Program Files\Git\bin\bash.exe`.
+    match midna_proto::paths::program_name(&shell) {
+        #[cfg(windows)]
+        name if name.eq_ignore_ascii_case("powershell") || name.eq_ignore_ascii_case("pwsh") => powershell_argv(&argv, &powershell_init(home)),
         "zsh" => {
             if let Ok(z) = std::env::var("ZDOTDIR") {
                 env.push(("MIDNA_ZDOTDIR".into(), z));

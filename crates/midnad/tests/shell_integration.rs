@@ -3,8 +3,7 @@
 //! here are stand-ins that print what they were asked to run. A shell that isn't installed
 //! (fish, often) is skipped, unless `MIDNA_TEST_FISH` names one.
 //!
-//! Unix only: on Windows the typed-agent shims are sh scripts only Git Bash could run, and no
-//! shell gets midna's startup files yet (docs/STATUS-windows.md, "Not done yet" 3 and 4).
+//! Unix only: `shell_integration_windows.rs` covers Windows PowerShell and Git Bash.
 #![cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
