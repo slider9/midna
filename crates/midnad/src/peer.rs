@@ -120,17 +120,26 @@ pub fn parent_pid(pid: i32) -> Option<i32> {
 /// `pid` and its ancestors, nearest first (bounded). Windows keeps a dead parent's pid in its
 /// children, and pids are reused, so a "parent" that started after the child isn't one: the
 /// chain stops there.
+///
+/// Each process is asked for its parent itself; a snapshot of every process (tens of ms) is
+/// taken only when one can't be opened, since every agent call walks this.
 #[cfg(windows)]
 pub fn ancestry(pid: i32) -> Vec<i32> {
-    let table = crate::procs::snapshot();
+    let mut table: Option<std::collections::HashMap<i32, (i32, String)>> = None;
     let mut out = vec![pid];
     let (mut cur, mut cur_start) = (pid, crate::procs::start_time(pid).unwrap_or(i64::MAX));
     while out.len() < 64 {
-        let Some(&(p, _)) = table.get(&cur) else { break };
-        if p <= 4 || out.contains(&p) || !table.contains_key(&p) {
+        let parent = crate::procs::parent_of(cur).or_else(|| table.get_or_insert_with(crate::procs::snapshot).get(&cur).map(|&(p, _)| p));
+        let Some(p) = parent else { break };
+        if p <= 4 || out.contains(&p) {
             break;
         }
-        let p_start = crate::procs::start_time(p).unwrap_or(0);
+        // A parent that's gone ends the chain; one that can't be opened but runs counts.
+        let p_start = match crate::procs::start_time(p) {
+            Some(s) => s,
+            None if crate::sys::alive(p) => 0,
+            None => break,
+        };
         if p_start > cur_start {
             break;
         }

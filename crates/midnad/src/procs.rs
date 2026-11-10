@@ -8,7 +8,7 @@ use std::collections::HashMap;
 #[path = "procs_windows.rs"]
 mod windows;
 #[cfg(windows)]
-pub use windows::{all_pids, command_line, cpu_ns, cwd, exe_path, footprint, listening_pids, set_background, snapshot, start_time};
+pub use windows::{all_pids, command_line, cpu_ns, cwd, exe_path, footprint, listening_pids, parent_of, set_background, snapshot, start_time};
 #[cfg(windows)]
 use windows::{all_bsd, bsd_info};
 

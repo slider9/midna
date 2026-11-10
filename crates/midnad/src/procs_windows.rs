@@ -6,7 +6,7 @@
 use super::Bsd;
 use std::collections::HashMap;
 use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
 };
@@ -15,7 +15,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
 use windows_sys::Win32::System::Threading::{
-    GetProcessTimes, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, OpenProcess, PROCESS_BASIC_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION,
+    GetExitCodeProcess, GetProcessTimes, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, OpenProcess, PROCESS_BASIC_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_VM_READ, QueryFullProcessImageNameW, SetPriorityClass,
 };
 
@@ -99,9 +99,55 @@ pub(super) fn all_bsd() -> Vec<(i32, Bsd)> {
         .collect()
 }
 
+/// One process, asked of the process itself: far cheaper than a snapshot of every process,
+/// which hooks would otherwise take several of per call. A snapshot only for one that can't
+/// be opened (another user's, a protected one).
 pub(super) fn bsd_info(pid: i32) -> Option<Bsd> {
+    if let Some(b) = own_info(pid) {
+        return Some(b);
+    }
+    if !crate::sys::alive(pid) {
+        return None;
+    }
     let (ppid, name) = snapshot().remove(&pid)?;
     Some(Bsd { ppid, pgid: pid, name, start: start_time(pid).unwrap_or(0) })
+}
+
+fn own_info(pid: i32) -> Option<Bsd> {
+    let h = Handle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let ppid = basic_parent(&h)?;
+    let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut c, mut e, mut k, mut u) = (z, z, z, z);
+    if unsafe { GetProcessTimes(h.0, &mut c, &mut e, &mut k, &mut u) } == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(h.0, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) } == 0 {
+        return None;
+    }
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    let file = path.rsplit('\\').next().unwrap_or(&path);
+    Some(Bsd { ppid, pgid: pid, name: strip_exe(file), start: filetime_unix(&c) })
+}
+
+/// Its parent pid, while it runs: an exited process that something still holds a handle to
+/// answers too, but isn't in a snapshot.
+fn basic_parent(h: &Handle) -> Option<i32> {
+    let mut code = 0u32;
+    if unsafe { GetExitCodeProcess(h.0, &mut code) } == 0 || code != STILL_ACTIVE as u32 {
+        return None;
+    }
+    let mut pbi: PROCESS_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut len = 0u32;
+    let st = unsafe { NtQueryInformationProcess(h.0, ProcessBasicInformation, &mut pbi as *mut _ as *mut _, std::mem::size_of_val(&pbi) as u32, &mut len) };
+    (st >= 0).then_some(pbi.InheritedFromUniqueProcessId as i32)
+}
+
+/// A process's parent pid, asked of the process (None when it's gone or can't be opened).
+/// Windows keeps a dead parent's pid here, which may since belong to another process.
+pub fn parent_of(pid: i32) -> Option<i32> {
+    basic_parent(&Handle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?)
 }
 
 /// The full path of a process's executable.
@@ -246,6 +292,25 @@ mod tests {
         assert_eq!(cwd(me).map(|c| c.to_ascii_lowercase()), Some(here.trim_end_matches('\\').to_ascii_lowercase()));
         assert!(footprint(me).is_some_and(|m| m > 0));
         assert!(cpu_ns(me).is_some());
+    }
+
+    /// Asked of the process itself, a process reads as the snapshot has it; a gone one is gone.
+    #[test]
+    fn one_process_reads_as_the_snapshot_has_it() {
+        let me = std::process::id() as i32;
+        let mut child = std::process::Command::new("cmd.exe").args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"]).spawn().unwrap();
+        let kid = child.id() as i32;
+        let table = snapshot();
+        for pid in [me, kid] {
+            let own = own_info(pid).expect("opens");
+            let (ppid, name) = table.get(&pid).cloned().unwrap();
+            assert_eq!((own.ppid, own.name.to_ascii_lowercase()), (ppid, name.to_ascii_lowercase()), "pid {pid}");
+            assert_eq!(parent_of(pid), Some(ppid));
+        }
+        assert_eq!(parent_of(kid), Some(me));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(bsd_info(kid).is_none() && parent_of(kid).is_none());
     }
 
     #[test]
