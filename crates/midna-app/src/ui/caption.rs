@@ -33,7 +33,7 @@ const ICONS: &str = "Segoe MDL2 Assets";
 #[cfg(windows)]
 fn row(t: &Theme, window: &Window) -> Stateful<Div> {
     let (max_glyph, max_id) = if window.is_maximized() { ("\u{E923}", "caption-restore") } else { ("\u{E922}", "caption-max") };
-    let fg = if window.is_window_active() { t.dim } else { t.dim.opacity(0.6) };
+    let fg = if crate::windows::in_use(window) { t.dim } else { t.dim.opacity(0.6) };
     div()
         .id("caption")
         .flex()

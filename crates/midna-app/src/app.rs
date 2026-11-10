@@ -335,7 +335,7 @@ impl MainWindow {
             }
         }));
         cx.observe_window_activation(window, |m, window, cx| {
-            if window.is_window_active() {
+            if crate::windows::in_use(window) {
                 crate::windows::focused(m.id, cx);
                 if let Some(s) = m.selected.as_deref() {
                     crate::notify::clear(s);
@@ -1433,7 +1433,7 @@ impl MainWindow {
         if !self.marked.contains(&id) {
             self.marked.clear();
         }
-        if window.is_window_active() {
+        if crate::windows::in_use(window) {
             crate::notify::clear(&id);
             self.seen(&id, cx);
         }

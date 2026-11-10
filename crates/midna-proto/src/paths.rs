@@ -10,7 +10,11 @@ use std::path::{Component, Path, PathBuf};
 pub const BUNDLE_ID: &str = "com.mrgnhnt.midna";
 pub const DAEMON_LABEL: &str = "com.mrgnhnt.midna.daemon";
 /// System Settings ▸ Notifications opened on midna's own page (not the list of every app).
+#[cfg(not(windows))]
 pub const NOTIFICATIONS_PANE: &str = "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=com.mrgnhnt.midna";
+/// Windows Settings ▸ System ▸ Notifications & actions (it has no page per app).
+#[cfg(windows)]
+pub const NOTIFICATIONS_PANE: &str = "ms-settings:notifications";
 
 /// Midna Dev's home, set at build time (`packaging/build-app.sh --dev-home DIR`). Some = this
 /// build is Midna Dev.

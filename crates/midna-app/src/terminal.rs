@@ -2620,7 +2620,7 @@ impl TerminalView {
 
     /// The terminal being typed in: focused, in the active window.
     fn live(&self, window: &Window) -> bool {
-        self.focus.is_focused(window) && (window.is_window_active() || crate::dev::var_os("MIDNA_DEBUG_TERM").is_some())
+        self.focus.is_focused(window) && (crate::windows::in_use(window) || crate::dev::var_os("MIDNA_DEBUG_TERM").is_some())
     }
 
     /// Report focus changes (window activation included) to apps using mode 1004.
@@ -2786,7 +2786,7 @@ impl Render for TerminalView {
         }
         let focused = self.focus.is_focused(window);
         // Dev runs (MIDNA_DEBUG_TERM) don't activate the window; count it as active.
-        let active = window.is_window_active() || crate::dev::var_os("MIDNA_DEBUG_TERM").is_some();
+        let active = crate::windows::in_use(window) || crate::dev::var_os("MIDNA_DEBUG_TERM").is_some();
         self.report_focus(focused && active);
         let pal = Palette { fg: theme.fg, cursor: theme.fg.opacity(0.55), selection: theme.selection };
         let term_bg = theme.term;

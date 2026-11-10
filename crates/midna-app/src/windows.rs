@@ -292,10 +292,33 @@ pub fn on_screen(session: &str, window: &Window, me: EntityId, my_selected: Opti
     let Some(reg) = cx.try_global::<Windows>().map(|w| w.0.clone()) else { return false };
     let r = reg.borrow();
     match r.place(session) {
-        Some(id) if id == me => window.is_window_active() && my_selected == Some(session),
-        Some(id) => r.main(id).is_some_and(|m| cx.active_window() == Some(m.handle) && m.entity.upgrade().is_some_and(|e| e.read(cx).selected.as_deref() == Some(session))),
+        Some(id) if id == me => in_use(window) && my_selected == Some(session),
+        Some(id) => r.main(id).is_some_and(|m| active_window(cx) == Some(m.handle) && m.entity.upgrade().is_some_and(|e| e.read(cx).selected.as_deref() == Some(session))),
         None => false,
     }
+}
+
+/// Whether `window` is the window you're using: active, with midna in front. GPUI on Windows
+/// calls a window active while it's its thread's active window, which it stays when another
+/// app comes in front or it's minimized.
+pub fn in_use(window: &Window) -> bool {
+    window.is_window_active() && in_front()
+}
+
+/// `cx.active_window()`, None while another app is in front (see `in_use`).
+pub fn active_window(cx: &App) -> Option<AnyWindowHandle> {
+    cx.active_window().filter(|_| in_front())
+}
+
+#[cfg(windows)]
+fn in_front() -> bool {
+    crate::sounds::app_active()
+}
+
+/// Elsewhere GPUI's own answer already says so.
+#[cfg(not(windows))]
+fn in_front() -> bool {
+    true
 }
 
 /// A daemon `window.command` for main window `id` (the one showing its target).

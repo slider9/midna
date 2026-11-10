@@ -28,8 +28,9 @@
 //! (with a custom dismiss action, so a dismissal is reported too). A click, button or dismissal
 //! comes back as `Clicked::response`, which the app reports with `notify.respond`.
 //!
-//! Off macOS the banners aren't there yet: the `fallback` module at the bottom keeps the same
-//! API, plays sounds through `crate::sounds`, and opens URLs with `crate::opener`.
+//! Windows shows toasts through `notify_windows.rs`, with the same API. Elsewhere there are no
+//! banners yet: the `fallback` module at the bottom keeps the API and opens URLs with
+//! `crate::opener`.
 #[cfg(target_os = "macos")]
 use block2::{DynBlock, RcBlock};
 use midna_proto::notify::{Posted, Response, ResponseKind};
@@ -51,8 +52,13 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicI8, Ordering};
 #[cfg(target_os = "macos")]
 use std::sync::{Mutex, OnceLock};
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub use fallback::*;
+#[cfg(windows)]
+#[path = "notify_windows.rs"]
+mod toasts;
+#[cfg(windows)]
+pub use toasts::*;
 
 /// A notification was clicked: select this terminal (empty = none), and show this needs-you
 /// item if it was about one. A `notify.send` one may open a URL instead, and reports what the
@@ -127,7 +133,7 @@ static STATUS: AtomicI8 = AtomicI8::new(-1);
 static SOUNDS: AtomicI8 = AtomicI8::new(-1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // off macOS it's always `Dev`
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only macOS has Dev and NotAsked
 pub enum Permission {
     /// A dev build: notifications go through osascript.
     Dev,
@@ -472,10 +478,8 @@ pub fn show(p: &Posted, looking: bool) -> Show {
     }
 }
 
-/// Off macOS: no banners yet (a Windows toast needs an AppUserModelID registered by an
-/// installer), so `post` only plays the notification's sound, like a dev build without a
-/// bundle, and clicks never arrive. URLs open with `crate::opener`.
-#[cfg(not(target_os = "macos"))]
+/// Neither macOS nor Windows: no banners, sounds or clicks. URLs open with `crate::opener`.
+#[cfg(not(any(target_os = "macos", windows)))]
 mod fallback {
     use super::{Clicked, Permission};
     use midna_proto::notify::Posted;
@@ -491,12 +495,7 @@ mod fallback {
 
     pub fn request_permission() {}
 
-    /// The banner isn't shown; its sound plays here, at its volume.
-    pub fn post(p: &Posted, _session: Option<&str>) {
-        if let (true, Some(file)) = (p.sound, p.sound_file.as_deref()) {
-            play(file, p.volume.unwrap_or(100));
-        }
-    }
+    pub fn post(_p: &Posted, _session: Option<&str>) {}
 
     pub fn withdraw(_id: &str) {}
 
@@ -508,20 +507,6 @@ mod fallback {
         crate::opener::open(url);
     }
 
-    /// Play a sound file. Windows: `PlaySoundW`, which plays one sound at a time (a new one
-    /// cuts off the last) and has no volume of its own, so `volume` only silences at 0.
-    #[cfg(windows)]
-    pub fn play(file: &str, volume: u8) {
-        use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME, SND_NODEFAULT};
-        if volume == 0 {
-            return;
-        }
-        let wide: Vec<u16> = file.encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: a NUL-terminated path; SND_ASYNC copies what it needs before returning.
-        unsafe { PlaySoundW(wide.as_ptr(), std::ptr::null_mut(), SND_FILENAME | SND_ASYNC | SND_NODEFAULT) };
-    }
-
-    #[cfg(not(windows))]
     pub fn play(_file: &str, _volume: u8) {}
 }
 

@@ -169,7 +169,7 @@ pub fn activate(session: &str, cx: &mut App) -> bool {
 /// Whether `session`'s pop-out is the window you're using.
 pub fn is_active(session: &str, cx: &App) -> bool {
     let h = cx.try_global::<Popped>().and_then(|p| p.0.get(session).copied());
-    h.is_some_and(|h| cx.active_window() == Some(h.into()))
+    h.is_some_and(|h| crate::windows::active_window(cx) == Some(h.into()))
 }
 
 /// Close `session`'s pop-out, if it has one (its terminal is being closed).
@@ -227,7 +227,7 @@ pub fn open(m: &mut MainWindow, session: String, window: &mut Window, cx: &mut C
             cx.observe_global::<crate::annotate::Outbox>(|_, cx| cx.notify()).detach();
             // Focused: its terminal's notifications are read.
             cx.observe_window_activation(window, |p: &mut PopOut, window, _| {
-                if window.is_window_active() {
+                if crate::windows::in_use(window) {
                     crate::notify::clear(&p.session);
                 }
             })

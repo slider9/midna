@@ -56,12 +56,15 @@ would build them in with `\r\n`.
 | Title bar | hidden; AppKit draws the traffic lights and drags by the top | hidden; `ui/caption.rs` draws a 32px row above each window: the caption (`WindowControlArea::Drag`: move, Snap, double-click) and minimise / maximise / close |
 | App icon | the bundle's `Midna.icns` | `packaging/assets/Midna.ico` (from `make-icon.py`) linked in as icon resource 1 by `midna-app/build.rs`, where GPUI loads the window icon from |
 | Shortcuts | ⌘ | Ctrl+Shift in the terminal's place, plain Ctrl where there's no terminal (see Shortcuts below) |
+| Notifications (app) | `UNUserNotificationCenter`; osascript in dev builds | WinRT toasts (`midna-app/src/notify_windows.rs`) under an AppUserModelID the app registers for the user at launch, `HKCU\Software\Classes\AppUserModelId\com.mrgnhnt.midna` with the name and icon (debug builds and Midna Dev: `com.mrgnhnt.midna.dev`, "Midna Dev"). No installer or shortcut needed. Group = the terminal (`clear`), tag = `notify.send`'s id (replace, `withdraw`). Clicks and buttons, from a banner or Action Center, come through a COM activator the app serves (`CustomActivator`; the toast's own `Activated` event never fires for a click on its body in Action Center), with what to report carried as JSON in the toast's arguments. A release build registers itself as the activator's server, so a click starts it if it isn't running. Dismissals come from the toast's `Dismissed` event. A sound file plays through `PlaySoundW` beside a silent toast. Windows has no prompt: the permission is whether the human turned midna's toasts off |
+| "You're looking at it" | `is_window_active` | `windows::in_use` / `windows::active_window`: also midna must be the foreground app. GPUI's Windows backend calls a window active while it's its thread's active window, which it stays after another app comes in front or it's minimized |
 
 Codex's notify can't go through a sh wrapper on Windows: Git Bash's runtime re-parses a native
 command line and mangles JSON (`{"type":"x"}` arrives empty, `a"b` turns into `a\b`).
 
 Windows production paths (`midna_proto::paths::production_paths`): `%LOCALAPPDATA%\com.mrgnhnt.midna`,
-`%LOCALAPPDATA%\Programs\Midna`, `~\.local\bin\midna.exe`. Nothing is installed there yet.
+`%LOCALAPPDATA%\Programs\Midna`, `~\.local\bin\midna.exe`. Nothing is installed there yet. A release
+build of the app also registers the toast app id `com.mrgnhnt.midna` (above); debug builds never do.
 
 ## Shortcuts
 
@@ -112,13 +115,14 @@ shortcut list and the menus and hints you see most are done.
   - `midna-cli`: all 51 unit tests and every integration test pass: `cli` 13, `mcp` 4, `secrets_cli` 6 (including `secret exec` masking), `system_wait` 1, `triggers_cli` 3, and `adopt_windows` 3 (a typed `claude` adopted and restarted in PowerShell, and in cmd; the fake agent is the test binary as `claude.exe`). `adopt.rs` (sh fakes) is Unix only.
   - midnad integration tests (`crates/midnad/tests/*.rs`): 189 of 200 pass (4 ignored: three helpers the tests run as programs, and one ignored on every platform). What fails and why is item 2 under "Not done yet".
 - Agent calls are as quick as on macOS: 0.3 ms an agent RPC and 0.6 ms an `agent.hook` against a test daemon (0.1 ms for a human's call), with one terminal or five. They were 20 ms and 88 ms, because finding the caller's terminal and agent took a snapshot of every process (about 10 ms each), up to a few dozen times a hook.
-  - `midna-app`: 350 unit tests, including key dispatch through GPUI with this platform's defaults.
+  - `midna-app`: 354 unit tests, including key dispatch through GPUI with this platform's defaults, and toast XML that Windows' own parser takes.
 - End to end, with `midnad.exe --foreground` on a temp `MIDNA_HOME` and the real `midna.exe`:
   - Terminals open and run commands for Windows PowerShell 5.1 (the default shell), cmd and Git Bash. `send` and `read --screen` work, `list` shows the console titles, and cwd is honoured.
   - A terminal's `PATH` is midna's shims dir followed by the inherited entries. `MIDNA_SESSION` and `TERM_PROGRAM=midna` are set.
   - `midna` run inside a terminal claims its terminal, and midnad checks the claim against the caller's pid and its ancestry.
   - `close` ends the terminal. Killing the daemon by PID leaves none of its descendants alive (conhost, the shells).
 - The app builds and draws through DirectX, and it has started a dev midnad and connected to it. Its windows move, snap, minimise, maximise and close through the title row, which was checked with `WM_NCHITTEST`. The exe carries the icon, so the taskbar shows it.
+- Toasts, in the real app on a temp home with the app in the background (read back from Windows' toast history): `notify test` and `notify send` post under `com.mrgnhnt.midna.dev`, with buttons. Sending the same id again replaces the toast, `withdraw` and `notify clear` take toasts away, and `notify clear --session` takes only that terminal's. A notification for the selected terminal still shows while midna is minimized. Clicked by hand in Action Center, with a full-screen game in front: a toast's body brought midna forward on its terminal, a button's label reached a waiting `notify send --wait`, and closing a toast with its X answered `dismissed`.
 
 ## Not done yet
 
@@ -133,7 +137,12 @@ In rough order of how much they matter:
    - **Intermittent: typed input gets lost.** Bytes sent to a fresh Git Bash terminal sometimes go missing: the first (`stream_attach_frames_roundtrip` once read `cho streamed-…`), a `\0` typed in a command, or the final Enter (`stream_keys_scroll_and_selection` fails about two runs in three). `steps_for_a_refused_prompt_clear_it_from_the_input_box`, `apps_register_their_own_link_patterns`, `another_terminals_id_is_a_link_to_it` and `a_gui_size_undone_at_once_never_reaches_the_app` fail now and then too, in a full run only. Until the client set its read timeout on the reader's socket handle as well (a clone is a handle of its own on Windows), a lost frame hung `stream_attach_frames_roundtrip` for good instead of failing it.
 3. **Shell integration.** `init.bash`, zsh and fish are wired up by shell name (`/`-separated, no `.exe`), so Git Bash terminals get none yet. PowerShell has no integration (prompt marks, cwd reports) at all.
 4. **Daemon lifecycle.** There's no autostart (a Run key or Task Scheduler entry), no installer or updater, and no in-place upgrade. Upgrading keeping terminals alive would need a separate pty-host process that owns the ConPTYs.
-5. **App stubs.** Notifications play a sound only (no toast). Badge, twilight, Kass composer, haptics and app link previews are missing. Commands that only exist on macOS (`sips`, `plutil`, `mdfind`, `xed`, `open -a`, `defaults`) do nothing, and menus and text still use macOS wording.
+5. **App stubs.** Badge, twilight, Kass composer, haptics and app link previews are missing. Commands that only exist on macOS (`sips`, `plutil`, `mdfind`, `xed`, `open -a`, `defaults`) do nothing, and menus and text still use macOS wording. Notifications show as toasts, but:
+   - midnad's own notifications (`via: system`, no app connected) use osascript and afplay, so on Windows nothing shows.
+   - Starting the app from a click after it quit is registered only by release builds (`LocalServer32`), and hasn't been tried: there is no release build yet. A debug build's toast does nothing then. A dismissal while the app isn't running isn't reported.
+   - A toast holds at most 5 buttons, so `notify send` with 6 loses the last one.
+   - `PlaySoundW` has no volume (`volume` 0 silences, anything else is full), and plays one sound at a time.
+   - Sounds are skipped when Windows reports quiet hours, presentation mode or a full-screen app (`SHQueryUserNotificationState`). Whether Focus assist reports that way hasn't been checked.
 6. **Codex notify when midna.exe is gone.** The global entry calls midna.exe directly, so uninstalling midna without `midna hooks uninstall` also stops the previous notify command. The sh wrapper on macOS checks `-x` first.
 7. **Console windows.**
    - midnad runs with a hidden console (`CREATE_NO_WINDOW`) so its git and other console children share it and no windows flash. With `DETACHED_PROCESS` each one opened a window.
