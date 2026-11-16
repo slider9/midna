@@ -128,6 +128,15 @@ fn codex_notify_replay_skips_title_turn() {
     assert!(ev[0]["data"]["prompt"].as_str().unwrap().contains("echo midna-codex-two"));
 }
 
+/// Terminals run in Windows' own ConPTY, not the `conpty.dll` midnad uses when it has one
+/// (`pty_windows.rs`): Windows 10's keeps an app's kitty keyboard push to itself.
+fn old_conpty() -> bool {
+    #[cfg(windows)]
+    return midnad::pty::conpty().dll.is_none();
+    #[cfg(not(windows))]
+    return false;
+}
+
 /// Claude Code turns on the kitty keyboard protocol; from then on only `CSI 13 u` submits
 /// (a bare CR inserts a newline). `session.input {enter}` must encode Enter for the app's mode.
 #[test]
@@ -143,9 +152,9 @@ fn input_enter_follows_kitty_keyboard_mode() {
     let kitty = open(&mut h, true);
     let legacy = open(&mut h, false);
     std::thread::sleep(std::time::Duration::from_millis(500));
-    if cfg!(windows) {
-        // ConPTY keeps the app's push to itself (it has no kitty keys to give an app), so midnad
-        // never sees it and Enter stays a CR.
+    if old_conpty() {
+        // Windows 10's own ConPTY keeps the app's push to itself (it has no kitty keys to give an
+        // app), so midnad never sees it and Enter stays a CR.
         call(&mut h, "session.input", json!({ "id": kitty, "text": "abcde", "enter": true }));
         call(&mut h, "session.input", json!({ "id": legacy, "text": "abcde", "enter": true }));
         wait_for(5, "kitty enter", || read(&mut h, &kitty).contains("e  \\r").then_some(()));
@@ -171,9 +180,9 @@ fn input_submits_by_default_and_on_a_trailing_newline() {
     };
     let (default, newline) = (open(&mut h), open(&mut h));
     std::thread::sleep(std::time::Duration::from_millis(500));
-    if cfg!(windows) {
-        // ConPTY keeps the app's kitty push to itself, so Enter is a CR there (and a trailing
-        // newline is that CR, never an LF). Five letters fill dd's 6 bytes.
+    if old_conpty() {
+        // Windows 10's own ConPTY keeps the app's kitty push to itself, so Enter is a CR there
+        // (and a trailing newline is that CR, never an LF). Five letters fill dd's 6 bytes.
         call(&mut h, "session.input", json!({ "id": default, "text": "abcde" }));
         call(&mut h, "session.input", json!({ "id": newline, "text": "bcdef\n", "enter": false }));
         wait_for(5, "default enter", || read(&mut h, &default).contains("e  \\r").then_some(()));

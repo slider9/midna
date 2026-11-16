@@ -386,15 +386,9 @@ fn register() {
     }
 }
 
-/// Set a string value under `HKEY_CURRENT_USER` (None: the key's default value), creating the key.
 fn set_value(key: &str, value: Option<&str>, data: &str) {
-    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW};
-    let (k, v, d) = (wide(key), value.map(wide), wide(data));
-    let v = v.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
-    // SAFETY: NUL-terminated UTF-16 strings; REG_SZ's size counts the NUL, in bytes.
-    let err = unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, k.as_ptr(), v, REG_SZ, d.as_ptr().cast(), (d.len() * 2) as u32) };
-    if err != 0 {
-        eprintln!("notify: registry {key}: {}", std::io::Error::from_raw_os_error(err as i32));
+    if let Err(e) = crate::winreg::set_string(key, value, data) {
+        eprintln!("notify: registry {key}: {e}");
     }
 }
 

@@ -124,10 +124,15 @@ fn queued_restart_waits_for_background_work_then_resumes() {
     let costs = call(&mut h, "events.list", json!({ "filter": { "kinds": ["agent.cost"] } }));
     assert_eq!(costs.as_array().unwrap().len(), 1, "{costs}");
 
-    // Processes under the terminal: the script and its sleep.
-    let procs = call(&mut h, "session.processes", json!({ "id": sid }));
-    let procs = procs.as_array().unwrap();
-    assert!(procs.iter().any(|p| p["depth"] == 1 && p["command"].as_str().unwrap().contains("sleep 300")), "{procs:?}");
+    // Processes under the terminal: the script and its sleep. (Not on Windows: Git Bash runs
+    // `sleep` from a forked copy of itself that has already exited, so in Windows' process
+    // tree the sleep has no parent and isn't under the terminal.)
+    #[cfg(unix)]
+    {
+        let procs = call(&mut h, "session.processes", json!({ "id": sid }));
+        let procs = procs.as_array().unwrap();
+        assert!(procs.iter().any(|p| p["depth"] == 1 && p["command"].as_str().unwrap().contains("sleep 300")), "{procs:?}");
+    }
 
     // An update is installed: when_idle queues the restart without asking.
     call(&mut h, "settings.set", json!({ "key": "agents.restart_on_update", "value": "when_idle" }));

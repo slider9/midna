@@ -107,10 +107,15 @@ pub fn production_paths() -> Vec<PathBuf> {
     ]
 }
 
-/// What Midna Dev must never write on Windows: production's home, install dir and CLI.
+/// What Midna Dev must never write on Windows: production's home, install dir, CLI and Start
+/// menu entry.
 #[cfg(windows)]
 pub fn production_paths() -> Vec<PathBuf> {
-    vec![production_home(), windows_install_dir(), user_home().join(".local").join("bin").join("midna.exe")]
+    let mut paths = vec![production_home(), windows_install_dir(), user_home().join(".local").join("bin").join("midna.exe")];
+    if let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {
+        paths.push(PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Midna.lnk"));
+    }
+    paths
 }
 
 /// Midna Dev refuses to write `path` when it is, or is inside, one of production's

@@ -1008,6 +1008,9 @@ impl TerminalView {
                 if let Some(argv) = item.run {
                     let mut cmd = std::process::Command::new(&argv[0]);
                     cmd.args(&argv[1..]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+                    // A console program gets no window of its own (a GUI one is unaffected).
+                    #[cfg(windows)]
+                    std::os::windows::process::CommandExt::creation_flags(&mut cmd, windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
                     if let Some(cwd) = s.get("cwd").and_then(Value::as_str).filter(|c| Path::new(c).is_dir()) {
                         cmd.current_dir(cwd);
                     }

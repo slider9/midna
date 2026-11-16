@@ -317,6 +317,11 @@ impl Worker {
                 self.send(Msg::Install(Some(e)));
             }
         }
+        // Windows: the Start menu entry (macOS lists the app wherever it was put).
+        #[cfg(windows)]
+        if let Err(e) = install::add_to_start_menu(bundle) {
+            log(&format!("start menu: {e}"));
+        }
         // 2. the login item
         let mut login = install::register(bundle);
         log(&format!("login item: {login:?}"));
@@ -536,21 +541,50 @@ impl Worker {
 /// Headless subcommands of the bundle executable (no window):
 /// - `--login-item-status`: print the SMAppService state.
 /// - `--uninstall`: stop midnad (`daemon.stop`, which hangs up every terminal), unregister the
-///   login item and remove our `midna` CLI link. MIDNA_HOME's data is left in place.
+///   login item and remove our `midna` CLI link. MIDNA_HOME's data is left in place. (Windows:
+///   also the CLI copy and the Start menu entry.)
+/// - `--start-daemon` (Windows, what the login entry runs): start the installed midnad, with no
+///   window, unless it's already answering.
+/// - `--quit` (Windows, any build): ask the app using this MIDNA_HOME to quit; exit 1 when none
+///   is running.
 ///
 /// Returns the exit code when one of them ran.
 pub fn headless(args: &[String]) -> Option<i32> {
     let cmd = args.get(1)?.as_str();
-    if !matches!(cmd, "--login-item-status" | "--uninstall") {
+    let windows_only = matches!(cmd, "--start-daemon" | "--quit");
+    if !matches!(cmd, "--login-item-status" | "--uninstall" | "--start-daemon" | "--quit") || (windows_only && !cfg!(windows)) {
         return None;
     }
+    // A release build has no console of its own: print to the one it was run from, if any.
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
+    }
+    #[cfg(windows)]
+    if cmd == "--quit" {
+        return Some(if crate::instance::ask_to_quit() { 0 } else { 1 });
+    }
     let Mode::Installed { bundle } = install::mode() else {
-        eprintln!("midna-app {cmd}: only works from inside Midna.app");
+        eprintln!("midna-app {cmd}: only works from inside {}", if cfg!(windows) { "an installed Midna" } else { "Midna.app" });
         return Some(2);
     };
     if cmd == "--login-item-status" {
         println!("{:?}", install::login_status(&bundle));
         return Some(0);
+    }
+    #[cfg(windows)]
+    if cmd == "--start-daemon" {
+        if install::socket_alive(&crate::backend::daemon::socket_path()) {
+            return Some(0);
+        }
+        return match install::start_daemon() {
+            Ok(()) => Some(0),
+            Err(e) => {
+                log(&format!("--start-daemon: {e}"));
+                eprintln!("midna-app --start-daemon: {e}");
+                Some(1)
+            }
+        };
     }
     let socket = crate::backend::daemon::socket_path();
     if let Ok(mut c) = midna_proto::Client::connect(&socket) {
@@ -577,6 +611,10 @@ pub fn headless(args: &[String]) -> Option<i32> {
     let link = install::cli_link_dir().join("midna");
     if std::fs::read_link(&link).is_ok_and(|t| t.ends_with("bin/current/midna")) && std::fs::remove_file(&link).is_ok() {
         println!("removed {}", link.display());
+    }
+    #[cfg(windows)]
+    for removed in [install::unlink_cli(), install::remove_from_start_menu()].into_iter().flatten() {
+        println!("removed {}", removed.display());
     }
     Some(code)
 }

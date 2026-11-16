@@ -9,6 +9,10 @@
 //! - `MIDNA_NO_ACTIVATE=1` — don't take focus on launch (automated screenshots).
 //! - `MIDNA_DEV=1` — dev mode even inside a bundle: no install / login item / updates; a missing
 //!   midnad is spawned from next to this binary (`MIDNA_NO_SPAWN=1` to skip). See `lifecycle.rs`.
+//!
+//! A Windows release build is a GUI program: started from Explorer it opens no console window.
+//! Debug builds keep theirs, for panics and logs.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 mod actions;
 mod annotate;
 mod app;
@@ -24,6 +28,8 @@ mod frame;
 mod haptics;
 mod icons;
 mod ide;
+#[cfg(windows)]
+mod instance;
 #[cfg_attr(not(target_os = "macos"), path = "nonmac/install.rs")]
 mod install;
 #[cfg_attr(not(target_os = "macos"), path = "nonmac/kass.rs")]
@@ -44,6 +50,8 @@ mod theme;
 mod ui;
 mod updater;
 mod windows;
+#[cfg(windows)]
+mod winreg;
 
 use actions::*;
 use gpui_kit::*;
@@ -81,6 +89,21 @@ fn main() {
         });
         // ⌘Q outside the main window (Settings, pop-outs) has no hold overlay: quit at once.
         cx.on_action(|_: &HoldToQuit, cx| cx.dispatch_action(&Quit));
+        // Windows: `midna-app.exe --quit` (instance.rs) quits the same way.
+        #[cfg(windows)]
+        {
+            let (qtx, qrx) = async_channel::bounded::<()>(1);
+            instance::on_quit_request(move || {
+                let _ = qtx.try_send(());
+            });
+            cx.spawn(async move |cx| {
+                if qrx.recv().await.is_ok() {
+                    lifecycle::log("quit: asked by --quit");
+                    cx.update(|cx| cx.dispatch_action(&Quit));
+                }
+            })
+            .detach();
+        }
         // A window with nothing focused (the overload window, a subagent's) dispatches keys to
         // its root node only, which is above the root div's own CloseWindow handler, so ⌘W
         // lands here. The window is mid-dispatch (taken out of the app), so close it after.

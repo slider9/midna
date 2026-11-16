@@ -5,7 +5,8 @@
 //! a crash restart both run the installed binary.
 //!
 //! Windows: making a symlink needs a privilege (or Developer Mode), so `bin/current` is a small
-//! text file naming the versioned directory instead, swapped the same way (write + rename).
+//! text file naming the versioned directory instead, swapped the same way (write + rename). The
+//! newer ConPTY's files beside midnad.exe go with it (`pty::CONPTY_FILES`).
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -51,17 +52,30 @@ pub fn current_cli(home: &Path) -> PathBuf {
 
 /// Install the running executable. Returns the versioned directory.
 pub fn install_self(home: &Path) -> std::io::Result<PathBuf> {
-    let exe = std::env::current_exe()?;
-    let bytes = std::fs::read(&exe)?;
+    install(&std::env::current_exe()?, home)
+}
+
+/// Install the midnad at `exe` and what's beside it.
+fn install(exe: &Path, home: &Path) -> std::io::Result<PathBuf> {
+    let bytes = std::fs::read(exe)?;
     let hash: String = Sha256::digest(&bytes).iter().take(4).map(|b| format!("{b:02x}")).collect();
     let name = format!("{}-{hash}", midna_proto::VERSION);
     let root = bin_root(home);
     midna_proto::paths::guard_write(&root)?;
     let dir = root.join(&name);
     std::fs::create_dir_all(&dir)?;
-    copy_exec(&exe, &dir.join(format!("midnad{EXE}")))?;
+    copy_exec(exe, &dir.join(format!("midnad{EXE}")))?;
     if let Some(cli) = exe.parent().map(|p| p.join(format!("midna{EXE}"))).filter(|p| p.is_file()) {
         copy_exec(&cli, &dir.join(format!("midna{EXE}")))?;
+    }
+    // Skipped when the copy there is the same: a daemon running from `dir` has them in use, and
+    // Windows won't replace a file that's in use.
+    #[cfg(windows)]
+    for name in crate::pty::CONPTY_FILES {
+        let (from, to) = (exe.with_file_name(name), dir.join(name));
+        if from.is_file() && !same_bytes(&from, &to) {
+            copy_exec(&from, &to)?;
+        }
     }
     // Atomic swap: a new symlink (Windows: pointer file) renamed over the old one.
     let tmp = root.join(format!(".current.{}", std::process::id()));
@@ -72,6 +86,14 @@ pub fn install_self(home: &Path) -> std::io::Result<PathBuf> {
     std::fs::write(&tmp, &name)?;
     std::fs::rename(&tmp, root.join("current"))?;
     Ok(dir)
+}
+
+#[cfg(windows)]
+fn same_bytes(a: &Path, b: &Path) -> bool {
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) if x.len() == y.len() => std::fs::read(a).ok().is_some_and(|a| std::fs::read(b).ok().is_some_and(|b| a == b)),
+        _ => false,
+    }
 }
 
 fn copy_exec(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -99,5 +121,36 @@ mod tests {
         // Re-installing the same binary is idempotent.
         assert_eq!(super::install_self(&home).unwrap(), dir);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_newer_conpty_goes_with_midnad_and_one_in_use_stays() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!("midna-inst-conpty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (bundle, home) = (root.join("bundle"), root.join("home"));
+        std::fs::create_dir_all(&bundle).unwrap();
+        let exe = bundle.join("midnad.exe");
+        std::fs::write(&exe, "midnad").unwrap();
+        let dir = super::install(&exe, &home).unwrap();
+        assert!(!dir.join("conpty.dll").exists(), "none beside it, none installed");
+
+        for name in crate::pty::CONPTY_FILES {
+            std::fs::write(bundle.join(name), name).unwrap();
+        }
+        assert_eq!(super::install(&exe, &home).unwrap(), dir);
+        for name in crate::pty::CONPTY_FILES {
+            assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), name);
+        }
+        // A daemon running from there has them open the way a loaded DLL is (no sharing for
+        // delete): installing the same files again leaves them be.
+        let held: Vec<_> = crate::pty::CONPTY_FILES
+            .iter()
+            .map(|name| std::fs::OpenOptions::new().read(true).share_mode(1 /* FILE_SHARE_READ */).open(dir.join(name)).unwrap())
+            .collect();
+        assert_eq!(super::install(&exe, &home).unwrap(), dir);
+        drop(held);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

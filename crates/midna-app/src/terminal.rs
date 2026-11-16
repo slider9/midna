@@ -2676,7 +2676,8 @@ fn login_editor() -> Option<String> {
     EDITOR
         .get_or_init(|| {
             let from_env = std::env::var("VISUAL").ok().or_else(|| std::env::var("EDITOR").ok()).filter(|s| !s.trim().is_empty());
-            if from_env.is_some() {
+            // Windows has no login shell to ask.
+            if from_env.is_some() || cfg!(windows) {
                 return from_env;
             }
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());

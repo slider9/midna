@@ -121,10 +121,17 @@ fn main() {
         detach(&cfg, &passthrough);
         return;
     }
+    #[cfg(windows)]
+    let cfg = work_in_home(cfg);
     match midnad::start_with(cfg.clone(), resume) {
         Ok(h) => {
             let c = &h.daemon.cfg;
             eprintln!("midnad {} listening on {} (home {}, pid {})", midna_proto::VERSION, c.socket.display(), c.home.display(), std::process::id());
+            #[cfg(windows)]
+            match &midnad::pty::conpty().dll {
+                Some(dll) => eprintln!("midnad: terminals run in {}", dll.display()),
+                None => eprintln!("midnad: terminals run in Windows' own ConPTY"),
+            }
             install_signals(h.daemon.clone());
             h.wait();
         }
@@ -241,6 +248,20 @@ fn install_signals(d: std::sync::Arc<midnad::daemon::Daemon>) {
 /// no useful stdout/stderr, so both go to `$MIDNA_HOME/midnad.log`.
 #[cfg(windows)]
 fn launchd_setup(_cfg: &midnad::Config, _passthrough: &[String]) {}
+
+/// Windows: work in the home rather than wherever midnad was started (the app's folder, or a
+/// project's when a terminal started it). Windows won't rename or delete a folder a running
+/// process works in, and the terminals' console hosts inherit it. Relative paths are made
+/// absolute first, so they still name the same files.
+#[cfg(windows)]
+fn work_in_home(mut cfg: midnad::Config) -> midnad::Config {
+    if let (Ok(home), Ok(socket)) = (std::path::absolute(&cfg.home), std::path::absolute(&cfg.socket)) {
+        (cfg.home, cfg.socket) = (home, socket);
+        let _ = std::fs::create_dir_all(&cfg.home);
+        let _ = std::env::set_current_dir(&cfg.home);
+    }
+    cfg
+}
 
 #[cfg(unix)]
 fn launchd_setup(cfg: &midnad::Config, passthrough: &[String]) {
