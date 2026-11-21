@@ -3,11 +3,13 @@
 
 Draws `sent: <text>` for each submitted message, then the input box: a `❯` row between two
 rules. Typed and pasted text goes in the box, Enter (`\\r` or kitty `CSI 13 u`) submits it,
-ctrl-c (`\\x03` or kitty `CSI 99;5 u`) clears it.
+ctrl-c (`\\x03` or kitty `CSI 99;5 u`) clears it. Like Claude, its title spins (`◐`) while it
+works on a submitted message, here for a moment, and then shows it stopped (`✳`).
 """
 import os
 import re
 import sys
+import threading
 try:
     import tty
 except ImportError:  # Windows
@@ -26,11 +28,23 @@ def setraw():
     k.SetConsoleMode(k.GetStdHandle(-11), 7)
 
 out = sys.stdout
+lock = threading.Lock()
 sent = []
 box = ""
 
 
+def title(t):
+    with lock:
+        out.write(f"\x1b]0;{t}\x07")
+        out.flush()
+
+
 def draw():
+    with lock:
+        redraw()
+
+
+def redraw():
     cols, _ = os.get_terminal_size()
     rows = ["  fake input box", ""] + [f"sent: {s}" for s in sent] + [""]
     buf = "\x1b[H\x1b[2J" + "\r\n".join(r[:cols] for r in rows)
@@ -60,6 +74,8 @@ def main():
             elif tok in ("\r", "\x1b[13u"):
                 sent.append(box.replace("\n", " / "))
                 box = ""
+                title("◐ fake")
+                threading.Timer(0.8, title, ("✳ fake",)).start()
             elif tok in ("\x03", "\x1b[99;5u"):
                 box = ""
             elif tok.isprintable():

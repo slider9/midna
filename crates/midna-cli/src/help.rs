@@ -307,7 +307,9 @@ pub static VERBS: &[Verb] = &[
         summary: "queue messages midna types into a terminal once its agent is ready (follow-ups, sequencing)",
         details: "A queued message is typed (and Enter pressed, unless --no-enter) once it is first in line, its\n\
                   `when` holds and the agent is ready for input: not working or waiting on the human, no dialog\n\
-                  on screen, nothing typed in its input box. Then the next one goes. Every verb defaults to your\n\
+                  on screen, nothing typed in its input box. Into Claude it is `sent` once Claude has started\n\
+                  on it; one that never shows in its input box, or that Claude never starts on, fails (and\n\
+                  holds the queue). Then the next one goes. Every verb defaults to your\n\
                   own terminal; --session <id> targets another. The human sees the queue on the terminal and can\n\
                   edit, reorder or remove it.\n\
                   Use it to leave yourself a follow-up you can't send mid-turn (`queue add /compact`, then\n\

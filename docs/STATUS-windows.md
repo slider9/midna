@@ -43,6 +43,18 @@ runs, when `conpty.dll` and `OpenConsole.exe` sit beside `midnad.exe` (`pty_wind
 the same way. `MIDNA_CONPTY=<path to a conpty.dll>` picks one, and `MIDNA_CONPTY=system` uses
 Windows' own regardless. midnad's log says which one its terminals run in.
 
+Once, on the newer ConPTY, a queued multi-line message vanished on its way into Claude Code
+2.1.329. Taskboard's code-review findings for T58 went in at 23:05:52 on 2026-11-20 as one paste
+and an Enter. Nothing reached the input box, the scrollback or the conversation, and no
+`UserPromptSubmit` came, but the queue called it `sent`. Six other multi-line messages that week
+arrived, and 20 trial pastes into Claude 2.1.330 all showed, so the cause is unknown. Into
+Claude's input box the queue now checks delivery (`queue::deliver`, for every platform). The
+text has to show in the box, or it's typed once more. After Enter, Claude has to start on it
+(status, turn or title), or Enter is pressed once more while the text is still in the box.
+Otherwise the message fails with a needs-you item instead of counting as sent. In the same
+terminal the screen once lagged: a ctrl-u that cleared the box showed only with the next key
+pressed.
+
 ### Installing
 
 `packaging/build-windows.sh` builds release binaries and assembles a folder,

@@ -8,6 +8,12 @@
 //! on its own thread; one message per terminal at a time. A message that can't be typed stays
 //! first as `failed` and holds the queue until it is retried, sent now or removed.
 //!
+//! Into Claude's input box a message is `sent` only once Claude has it (`deliver`): the typed
+//! text has to show in the box before Enter, and after Enter Claude has to start on it. A paste
+//! that never shows is typed once more, an Enter that leaves it in the box is pressed once more,
+//! and otherwise the message fails. On Windows a multi-line paste once vanished without a trace,
+//! and the message counted as sent while Claude never saw it.
+//!
 //! Local triggers' `send_to_session` adds its steps here, so triggers, agents and the human
 //! share one ordered queue per terminal. Steps fired by `agent.prompt_blocked` remember the
 //! refused prompt, which Claude puts back in its input box: a box holding exactly that doesn't
@@ -31,6 +37,12 @@ const PASTE_GAP: Duration = Duration::from_millis(250);
 const ENTER_DELAY: Duration = Duration::from_millis(300);
 /// How long Claude gets to empty its input box after ctrl-c.
 const CLEAR_WAIT: Duration = Duration::from_secs(2);
+/// How long typed text gets to show in Claude's input box (it shows within half a second).
+const SHOW_WAIT: Duration = Duration::from_secs(3);
+/// How long Claude gets to start on a message after Enter: its `UserPromptSubmit` hook starts a
+/// turn and its title spins at once, before the model answers.
+const START_WAIT: Duration = Duration::from_secs(10);
+const POLL: Duration = Duration::from_millis(100);
 pub const MAX_ITEMS: usize = 50;
 
 /// What the worker remembers about a terminal between ticks.
@@ -280,22 +292,36 @@ fn still_running(d: &Daemon, other: &str) -> Option<String> {
     (busy || !s.queue.is_empty()).then(|| format!("{} to finish", s.name))
 }
 
-/// Type one message the way `session.input` would for whoever queued it.
+/// Type one message the way `session.input` would for whoever queued it. One that submits into
+/// Claude's input box goes through `deliver`, which checks that Claude has it.
 fn type_message(d: &Arc<Daemon>, sid: &str, m: &QueuedMessage) -> Result<(), String> {
     clear_restored(d, sid, m)?;
     let ctx = ctx_for(&m.by);
-    let input = |text: &str, enter: bool, images: Vec<String>| {
-        let p = SessionInputParams { id: sid.to_string(), text: text.to_string(), enter, images };
-        crate::rpc::session::input(d, &ctx, p).map(|_| ()).map_err(|e| e.message)
-    };
     let (text, trailing) = crate::rpc::session::split_trailing_enter(&m.text);
     let enter = m.enter || trailing;
-    if !text.contains('\n') {
-        return input(text, enter, m.images.clone());
+    let claude = d.core().state.session(sid).is_some_and(|s| s.agent == Some(AgentKind::Claude));
+    if enter
+        && claude
+        && let Some(rt) = d.rt(sid).filter(|rt| input_box(rt).is_some())
+    {
+        let mut c = Live { d, sid, ctx: &ctx, rt, text, images: m.images.clone(), start: Instant::now() };
+        return deliver(&mut c, text.trim_start().starts_with('/'));
     }
-    // Several lines go in as one paste, so a newline isn't a submit.
-    if !m.images.is_empty() {
-        input("", false, m.images.clone())?;
+    type_text(d, &ctx, sid, text, m.images.clone(), enter)
+}
+
+/// Type `text` after its images, then Enter when `enter`: one line the way `session.input`
+/// does, several lines as one paste, so a newline isn't a submit.
+fn type_text(d: &Arc<Daemon>, ctx: &Ctx, sid: &str, text: &str, images: Vec<String>, enter: bool) -> Result<(), String> {
+    let input = |text: &str, enter: bool, images: Vec<String>| {
+        let p = SessionInputParams { id: sid.to_string(), text: text.to_string(), enter, images };
+        crate::rpc::session::input(d, ctx, p).map(|_| ()).map_err(|e| e.message)
+    };
+    if !text.contains('\n') {
+        return input(text, enter, images);
+    }
+    if !images.is_empty() {
+        input("", false, images)?;
         std::thread::sleep(PASTE_GAP);
     }
     let rt = d.rt(sid).ok_or("the terminal's process ended")?;
@@ -310,6 +336,107 @@ fn type_message(d: &Arc<Daemon>, sid: &str, m: &QueuedMessage) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+/// A Claude terminal as `deliver` sees it, so tests can play Claude.
+trait Claude {
+    /// The input box's text (None: the screen shows no box).
+    fn input_box(&self) -> Option<String>;
+    /// Claude has started on a prompt: a turn began, it works (status or title) or it asks the
+    /// human. Err: the terminal is gone.
+    fn started(&self) -> Result<bool, String>;
+    /// Type the message without Enter. `again` = the earlier one never showed: images stay out.
+    fn type_text(&mut self, again: bool) -> Result<(), String>;
+    fn enter(&mut self) -> Result<(), String>;
+    fn now(&self) -> Duration;
+    fn sleep(&mut self, d: Duration);
+}
+
+fn shows(c: &impl Claude) -> bool {
+    c.input_box().is_some_and(|t| !t.trim().is_empty())
+}
+
+/// Poll `done` until it holds (true) or `limit` passes (false).
+fn until<C: Claude>(c: &mut C, limit: Duration, done: impl Fn(&C) -> Result<bool, String>) -> Result<bool, String> {
+    let end = c.now() + limit;
+    loop {
+        if done(c)? {
+            return Ok(true);
+        }
+        if c.now() >= end {
+            return Ok(false);
+        }
+        c.sleep(POLL);
+    }
+}
+
+/// Type a message into Claude's input box and submit it, checking each step. The text has to
+/// show in the box: one that never does is typed once more (Windows once lost a whole
+/// multi-line paste). After Enter, Claude has to start on it: still in the box, Enter is
+/// pressed once more. A `slash` command may just empty the box (`/clear`), which counts.
+fn deliver(c: &mut impl Claude, slash: bool) -> Result<(), String> {
+    let mut shown = false;
+    for again in [false, true] {
+        c.type_text(again)?;
+        if until(c, SHOW_WAIT, |c| Ok(shows(c)))? {
+            shown = true;
+            break;
+        }
+    }
+    if !shown {
+        return Err("it was typed twice but never showed in Claude's input box".into());
+    }
+    for _ in 0..2 {
+        c.sleep(ENTER_DELAY);
+        c.enter()?;
+        if until(c, START_WAIT, |c| Ok(c.started()? || (slash && !shows(c))))? {
+            return Ok(());
+        }
+        if !shows(c) {
+            return Err("Claude took it out of its input box but never started on it".into());
+        }
+    }
+    Err("it stayed in Claude's input box after Enter, pressed twice".into())
+}
+
+/// The real terminal behind `deliver`.
+struct Live<'a> {
+    d: &'a Arc<Daemon>,
+    sid: &'a str,
+    ctx: &'a Ctx,
+    rt: crate::term::RtHandle,
+    text: &'a str,
+    images: Vec<String>,
+    start: Instant,
+}
+
+impl Claude for Live<'_> {
+    fn input_box(&self) -> Option<String> {
+        input_box(&self.rt)
+    }
+
+    fn started(&self) -> Result<bool, String> {
+        // Ready before typing; any reason it isn't now (working, a turn, a question or a
+        // dialog on screen) is Claude reacting.
+        Ok(readiness(self.d, self.sid, false, None)?.is_some())
+    }
+
+    fn type_text(&mut self, again: bool) -> Result<(), String> {
+        let images = if again { vec![] } else { self.images.clone() };
+        type_text(self.d, self.ctx, self.sid, self.text, images, false)
+    }
+
+    fn enter(&mut self) -> Result<(), String> {
+        if self.rt.key(crate::term::Key::Enter) { Ok(()) } else { Err("the terminal stopped taking input".into()) }
+    }
+
+    fn now(&self) -> Duration {
+        self.start.elapsed()
+    }
+
+    fn sleep(&mut self, d: Duration) {
+        std::thread::sleep(d);
+    }
 }
 
 fn ctx_for(by: &Actor) -> Ctx {
@@ -557,4 +684,111 @@ pub fn add_steps(d: &Daemon, sid: &str, t: &Trigger, by: Actor, steps: Vec<(Stri
         }
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Claude as a script, on a clock that moves only while `deliver` waits.
+    #[derive(Default)]
+    struct Fake {
+        now: Duration,
+        /// Typings that never show in the box.
+        lost: usize,
+        /// Enters that leave the box as it is.
+        ignored: usize,
+        /// What an Enter that takes does: start a turn this long after (None: only empty the box).
+        starts_after: Option<Duration>,
+        boxed: bool,
+        started_at: Option<Duration>,
+        typed: Vec<bool>,
+        enters: usize,
+    }
+
+    impl Claude for Fake {
+        fn input_box(&self) -> Option<String> {
+            Some(if self.boxed { "[Pasted text #1 +4 lines]".into() } else { String::new() })
+        }
+        fn started(&self) -> Result<bool, String> {
+            Ok(self.started_at.is_some_and(|t| self.now >= t))
+        }
+        fn type_text(&mut self, again: bool) -> Result<(), String> {
+            self.typed.push(again);
+            if self.lost > 0 { self.lost -= 1 } else { self.boxed = true }
+            Ok(())
+        }
+        fn enter(&mut self) -> Result<(), String> {
+            self.enters += 1;
+            if self.ignored > 0 {
+                self.ignored -= 1;
+            } else if self.boxed {
+                self.boxed = false;
+                self.started_at = self.starts_after.map(|d| self.now + d);
+            }
+            Ok(())
+        }
+        fn now(&self) -> Duration {
+            self.now
+        }
+        fn sleep(&mut self, d: Duration) {
+            self.now += d;
+        }
+    }
+
+    fn starts() -> Fake {
+        Fake { starts_after: Some(Duration::from_millis(400)), ..Default::default() }
+    }
+
+    #[test]
+    fn a_message_claude_takes_is_typed_and_entered_once() {
+        let mut c = starts();
+        assert_eq!(deliver(&mut c, false), Ok(()));
+        assert_eq!((c.typed, c.enters), (vec![false], 1));
+    }
+
+    #[test]
+    fn a_paste_that_never_shows_is_typed_once_more_without_its_images() {
+        // T58 on Windows: the paste vanished, and Enter on the empty box did nothing.
+        let mut c = Fake { lost: 1, ..starts() };
+        assert_eq!(deliver(&mut c, false), Ok(()));
+        assert_eq!((c.typed, c.enters), (vec![false, true], 1));
+    }
+
+    #[test]
+    fn one_that_never_shows_fails_before_any_enter() {
+        let mut c = Fake { lost: 2, ..starts() };
+        let e = deliver(&mut c, false).unwrap_err();
+        assert!(e.contains("never showed"), "{e}");
+        assert_eq!((c.typed.len(), c.enters), (2, 0));
+    }
+
+    #[test]
+    fn an_enter_left_in_the_box_is_pressed_once_more() {
+        let mut c = Fake { ignored: 1, ..starts() };
+        assert_eq!(deliver(&mut c, false), Ok(()));
+        assert_eq!(c.enters, 2);
+        let mut c = Fake { ignored: 2, ..starts() };
+        let e = deliver(&mut c, false).unwrap_err();
+        assert!(e.contains("stayed in Claude's input box"), "{e}");
+        assert_eq!(c.enters, 2);
+    }
+
+    #[test]
+    fn claude_gets_a_while_to_start() {
+        let mut c = Fake { starts_after: Some(START_WAIT - Duration::from_secs(1)), ..Default::default() };
+        assert_eq!(deliver(&mut c, false), Ok(()));
+        assert_eq!(c.enters, 1);
+    }
+
+    #[test]
+    fn taken_from_the_box_but_never_started_fails_unless_a_command() {
+        let mut c = Fake::default();
+        let e = deliver(&mut c, false).unwrap_err();
+        assert!(e.contains("never started"), "{e}");
+        assert_eq!(c.enters, 1, "no second Enter on an empty box");
+        // `/clear` and the like only empty the box.
+        let mut c = Fake::default();
+        assert_eq!(deliver(&mut c, true), Ok(()));
+    }
 }
