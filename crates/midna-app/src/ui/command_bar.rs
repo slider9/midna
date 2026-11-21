@@ -210,7 +210,7 @@ fn rows(m: &MainWindow) -> Vec<Row> {
     if prompt_mode(m) {
         return prompt_rows(m);
     }
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = midna_proto::paths::home_var().unwrap_or_default();
     // "Add project folder…": a path search instead of commands
     let roots: Vec<String> = m.settings.get("projects.roots").and_then(Value::as_array).into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect();
     if let Some(cmds) = commands::folder_rows(&m.palette.query, &home, &roots) {

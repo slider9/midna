@@ -141,7 +141,7 @@ fn read_settings(arg: &str, cwd: &Path) -> Option<Value> {
         arg.to_string()
     } else {
         let p = match arg.strip_prefix("~/") {
-            Some(rest) => PathBuf::from(std::env::var("HOME").ok()?).join(rest),
+            Some(rest) => PathBuf::from(midna_proto::paths::home_var()?).join(rest),
             None => cwd.join(arg),
         };
         std::fs::read_to_string(p).ok()?

@@ -477,7 +477,7 @@ fn run(d: &Arc<Daemon>, s: &Session, plan: CleanupPlan, dry_run: bool, by: &str)
         let lock = started.repo.as_deref().map(|r| d.cleanup.repo_lock(r));
         let _held = lock.as_ref().map(|l| l.lock().unwrap_or_else(|e| e.into_inner()));
         let mut run = started;
-        let folder = run.repo.clone().filter(|r| Path::new(r).is_dir()).or_else(|| Path::new(&run.cwd).is_dir().then(|| run.cwd.clone())).unwrap_or_else(|| std::env::var("HOME").unwrap_or("/".into()));
+        let folder = run.repo.clone().filter(|r| Path::new(r).is_dir()).or_else(|| Path::new(&run.cwd).is_dir().then(|| run.cwd.clone())).unwrap_or_else(|| paths::home_var().unwrap_or("/".into()));
         let timeout = Duration::from_secs(d.setting("cleanup.timeout_secs").as_u64().unwrap_or(300).clamp(30, 3600));
         let extra = list_setting(&d, "cleanup.tools");
         let mut argv: Vec<String> = ["claude", "-p", "--model", &run.model, "--output-format", "json", "--no-session-persistence"].map(String::from).to_vec();

@@ -85,7 +85,7 @@ fn agent_dir(var: &str, default: &str) -> PathBuf {
     std::env::var_os(var)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(default))
+        .unwrap_or_else(|| paths::home_var().map(PathBuf::from).unwrap_or_default().join(default))
 }
 
 /// `MIDNA_APP_PATH` makes any executable the human GUI. That's a development convenience only:

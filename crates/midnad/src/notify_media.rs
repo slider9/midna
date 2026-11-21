@@ -302,7 +302,7 @@ pub fn list(d: &Daemon, kind: Option<&str>) -> NotifyMediaResult {
 /// name gets `-2`, `-3`, … before its extension.
 pub fn import(d: &Daemon, actor: Actor, path: &str) -> Result<NotifyMedia, RpcError> {
     let src = match path.strip_prefix("~/") {
-        Some(rest) => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(rest)).unwrap_or_else(|| PathBuf::from(path)),
+        Some(rest) => midna_proto::paths::home_var().map(|h| PathBuf::from(h).join(rest)).unwrap_or_else(|| PathBuf::from(path)),
         None => PathBuf::from(path),
     };
     if !src.is_absolute() {

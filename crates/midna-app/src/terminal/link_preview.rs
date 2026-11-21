@@ -1470,7 +1470,7 @@ fn user_path() -> &'static str {
 fn pattern_command(argv: &[String], path: &str) -> Option<std::process::Command> {
     let prog = argv.first().filter(|p| !p.is_empty())?;
     let bin = match prog.strip_prefix("~/") {
-        Some(rest) => PathBuf::from(std::env::var("HOME").ok()?).join(rest),
+        Some(rest) => PathBuf::from(midna_proto::paths::home_var()?).join(rest),
         None if prog.contains('/') => PathBuf::from(prog),
         None => std::env::split_paths(path).map(|d| d.join(prog)).find(|p| p.is_file())?,
     };

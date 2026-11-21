@@ -118,7 +118,7 @@ fn resolve(found: &[(PathBuf, String)], home: &Path, exists: &dyn Fn(&Path) -> b
 }
 
 fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    midna_proto::paths::home_var().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// The installed editors, plus the bundle `ide.app` names by path. Blocking (Spotlight, sips).

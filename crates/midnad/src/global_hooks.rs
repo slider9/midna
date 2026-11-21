@@ -405,7 +405,7 @@ fn write(path: &Path, before: Option<&str>, after: &str) -> std::io::Result<()> 
 /// Line diff (LCS) with `context` unchanged lines around each change; longer unchanged runs
 /// collapse to one `…` line.
 fn agent_home(dir: &str) -> std::path::PathBuf {
-    std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default().join(dir)
+    midna_proto::paths::home_var().map(std::path::PathBuf::from).unwrap_or_default().join(dir)
 }
 
 pub fn diff(before: &str, after: &str, context: usize) -> Vec<DiffLine> {

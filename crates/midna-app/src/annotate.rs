@@ -1168,7 +1168,7 @@ fn unshell_path(word: &str) -> Option<PathBuf> {
         s
     };
     let p = match s.strip_prefix("~/") {
-        Some(rest) => PathBuf::from(std::env::var_os("HOME")?).join(rest),
+        Some(rest) => PathBuf::from(midna_proto::paths::home_var()?).join(rest),
         None => PathBuf::from(s),
     };
     p.is_absolute().then_some(p)

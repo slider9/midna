@@ -60,7 +60,7 @@ pub fn gather(k: Known) -> Facts {
         macos: if build.is_empty() { version } else { format!("{version} ({build})") },
         hardware,
         arch: format!("{}{}", std::env::consts::ARCH, if rosetta { " (Rosetta)" } else { "" }),
-        install: install_kind(&std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(), &std::env::var("HOME").unwrap_or_default()),
+        install: install_kind(&std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(), &midna_proto::paths::home_var().unwrap_or_default()),
         accessibility: k.accessibility,
         kass: k.kass,
         shell: std::env::var("SHELL").ok().and_then(|s| s.rsplit('/').next().map(str::to_string)).unwrap_or_default(),

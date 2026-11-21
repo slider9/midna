@@ -981,7 +981,7 @@ pub fn detect_link(chars: &[char], i: usize, dirs: &[&str], app_for: &dyn Fn(&st
         return None;
     }
     let expanded = match path.strip_prefix("~/") {
-        Some(rest) => std::env::var("HOME").map(|h| format!("{h}/{rest}")).unwrap_or_else(|_| path.to_string()),
+        Some(rest) => midna_proto::paths::home_var().map(|h| format!("{h}/{rest}")).unwrap_or_else(|| path.to_string()),
         None => path.to_string(),
     };
     let candidates: Vec<std::path::PathBuf> = if expanded.starts_with('/') {

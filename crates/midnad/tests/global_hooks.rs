@@ -105,3 +105,53 @@ fn unparseable_settings_are_never_rewritten() {
     assert!(e.message.contains("won't rewrite"), "{e:?}");
     assert_eq!(std::fs::read_to_string(claude_dir.join("settings.json")).unwrap(), jsonc);
 }
+
+/// Windows sets no `HOME` (Git Bash does), and midnad started at login has none. Claude Code's
+/// and Codex's folders are then in the user's profile, not a relative `.claude` beside wherever
+/// midnad works, which read as "Claude Code not set up". The real binary, since the in-process
+/// daemons in these tests have their own agent folders.
+#[cfg(windows)]
+#[test]
+fn without_home_the_agent_folders_are_in_the_profile() {
+    let root = tmp().join(format!("midna-gh-p-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (home, profile) = (root.join("h"), root.join("p"));
+    std::fs::create_dir_all(profile.join(".claude")).unwrap();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_midnad"))
+        .args(["--foreground", "--home"])
+        .arg(&home)
+        .current_dir(&root)
+        .env_remove("HOME")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("MIDNA_SOCKET")
+        .env_remove("MIDNA_SESSION")
+        .env("USERPROFILE", &profile)
+        .env("MIDNA_NO_GH", "1")
+        .env("MIDNA_NOTIFY_SYSTEM", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // Stopped by its pid however the test ends.
+    struct Kill(std::process::Child, std::path::PathBuf);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+    let _daemon = Kill(child, root.clone());
+    let mut h = wait_for(10, "daemon socket", || {
+        let mut c = midna_proto::Client::connect(home.join("midnad.sock")).ok()?;
+        c.set_caller(None);
+        Some(c)
+    });
+    let st = call(&mut h, "hooks.status", json!({}));
+    assert_eq!(st["claude"]["path"], json!(profile.join(".claude").join("settings.json")), "{st}");
+    assert_eq!(st["claude"]["state"], "not_installed", "{st}");
+    assert_eq!(st["codex"]["path"], json!(profile.join(".codex").join("config.toml")), "{st}");
+    assert_eq!(st["codex"]["state"], "unavailable", "{st}");
+}
