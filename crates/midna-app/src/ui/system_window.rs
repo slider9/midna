@@ -66,8 +66,8 @@ pub fn show(kind: Kind, load: SystemLoad, backend: Arc<dyn Backend>, cx: &mut Ap
         Kind::Overloaded => OVERLOAD_SIZE,
     };
     let title = match kind {
-        Kind::UpgradePostponed => "Midna update waiting",
-        Kind::Overloaded => "Your Mac is overloaded",
+        Kind::UpgradePostponed => "Midna update waiting".to_string(),
+        Kind::Overloaded => format!("Your {COMPUTER} is overloaded"),
     };
     let opts = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(width), px(height)), cx))),
@@ -122,6 +122,13 @@ fn busy_for(l: &SystemLoad) -> String {
     if mins >= 1 { format!("busy {mins} min") } else { "busy".into() }
 }
 
+/// What these windows call the computer ("your PC" on Windows).
+pub const COMPUTER: &str = if cfg!(windows) { "PC" } else { "Mac" };
+/// The row for the system's own processes.
+const SYSTEM_NAME: &str = if cfg!(windows) { "Windows" } else { "macOS" };
+/// The system's own view of every process.
+const MONITOR: &str = if cfg!(windows) { "Task Manager" } else { "Activity Monitor" };
+
 /// The color of other apps' share of the CPU, beside `t.work` for midna's terminals.
 pub fn other_apps_color(t: &Theme) -> Hsla {
     t.dim.opacity(0.7)
@@ -136,13 +143,13 @@ pub fn mac_share(cpu_percent: u32, cpus: u32) -> String {
 pub fn verdict(l: &SystemLoad) -> (String, String) {
     let midna = share_label(l.midna_percent as f64);
     if !l.cpu_busy && !l.overloaded {
-        return ("Your Mac has calmed down".into(), format!("{}% of its CPU is in use now.", l.cpu_percent));
+        return (format!("Your {COMPUTER} has calmed down"), format!("{}% of its CPU is in use now.", l.cpu_percent));
     }
     if midna_is_the_cause(l.cpu_percent, l.midna_percent) {
         let slowed = if l.top.iter().any(|t| t.backgrounded) { ", and the busiest terminals are slowed down" } else { "" };
-        ("Midna's terminals are using your Mac".into(), format!("They use {midna} of it. Agents wait before starting more builds, tests or subagents{slowed}."))
+        (format!("Midna's terminals are using your {COMPUTER}"), format!("They use {midna} of it. Agents wait before starting more builds, tests or subagents{slowed}."))
     } else {
-        ("Other apps are using your Mac".into(), format!("Midna's terminals use {midna} of it, so your agents carry on as normal: nothing is held back or slowed down."))
+        (format!("Other apps are using your {COMPUTER}"), format!("Midna's terminals use {midna} of it, so your agents carry on as normal: nothing is held back or slowed down."))
     }
 }
 
@@ -161,8 +168,13 @@ pub fn cpu_bar(t: &Theme, l: &SystemLoad, h: f32) -> Div {
         .child(div().h_full().bg(other_apps_color(t)).w(relative(other as f32 / 100.)))
 }
 
-fn open_activity_monitor() {
-    let _ = std::process::Command::new("open").args(["-a", "Activity Monitor"]).spawn();
+/// Activity Monitor, or on Windows Task Manager. Task Manager asks to run elevated, which a
+/// plain process start refuses ("elevation required"); the shell's open starts it.
+fn open_monitor() {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").args(["-a", MONITOR]).spawn();
+    #[cfg(windows)]
+    crate::opener::open("taskmgr.exe");
 }
 
 /// One column of the overload window: a colored heading with its share, rows, a line under them.
@@ -258,7 +270,7 @@ impl SystemWindow {
             .flex()
             .flex_col()
             .gap(px(10.))
-            .child(text(format!("Your Mac is very busy right now: {}.", load_line(l))))
+            .child(text(format!("Your {COMPUTER} is very busy right now: {}.", load_line(l))))
             .child(text(
                 "Updating moves every terminal over to the new version of Midna's background service. Under this much \
                  load that handoff can time out and close your terminals, so Midna recommends waiting."
@@ -308,7 +320,7 @@ impl SystemWindow {
             .child(div().text_color(t.dim).text_size(px(12.)).child(format!("Load {:.1} on {} cores", l.load1, l.cpus)))
             .children(self.error.as_ref().map(|e| div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(t.err).text_size(px(12.)).child(e.clone())))
             .child(div().flex_1())
-            .child(btn(t, "overload-activity", "Open Activity Monitor").on_click(|_, _, _| open_activity_monitor()))
+            .child(btn(t, "overload-activity", format!("Open {MONITOR}")).on_click(|_, _, _| open_monitor()))
             .child(btn_primary(t, "overload-ok", "OK").on_click(|_, window, _| window.remove_window()));
         div()
             .flex()
@@ -369,13 +381,13 @@ impl SystemWindow {
         column(t, "overload-midna", t.work, "Midna's terminals", share_label(l.midna_percent as f64), rows, foot.into())
     }
 
-    /// Other apps and processes, and macOS's own; midna can't pause these.
+    /// Other apps and processes, and the system's own; midna can't pause these.
     fn other_column(&self, t: &Theme) -> Div {
         let l = &self.load;
         let label = |s: &str| div().font_weight(FontWeight::SEMIBOLD).overflow_hidden().text_ellipsis().whitespace_nowrap().child(s.to_string()).into_any_element();
         let mut rows: Vec<AnyElement> = l.others.iter().map(|o| row(t, label(&o.name), o.busiest.join(", "), mac_share(o.cpu_percent, l.cpus), None).into_any_element()).collect();
         if l.system_percent > 0 {
-            rows.push(row(t, label("macOS"), "system processes and other users".into(), share_label(l.system_percent as f64), None).into_any_element());
+            rows.push(row(t, label(SYSTEM_NAME), "system processes and other users".into(), share_label(l.system_percent as f64), None).into_any_element());
         }
         let other = l.cpu_percent.saturating_sub(l.midna_percent);
         column(t, "overload-other", other_apps_color(t), "Other apps", share_label(other as f64), rows, "Midna can't pause these. Quit them in their app.".into())
@@ -386,10 +398,10 @@ impl Render for SystemWindow {
     fn render(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.global::<Theme>().clone();
         let heading = match self.kind {
-            Kind::UpgradePostponed => "Midna's update is waiting for a calmer moment",
-            Kind::Overloaded => "Your Mac is overloaded",
+            Kind::UpgradePostponed => "Midna's update is waiting for a calmer moment".to_string(),
+            Kind::Overloaded => format!("Your {COMPUTER} is overloaded"),
         };
-        let aside = (self.kind == Kind::Overloaded).then(|| format!("Mac CPU {}% · {}", self.load.cpu_percent, busy_for(&self.load)));
+        let aside = (self.kind == Kind::Overloaded).then(|| format!("{COMPUTER} CPU {}% · {}", self.load.cpu_percent, busy_for(&self.load)));
         let body = match self.kind {
             Kind::UpgradePostponed => self.upgrade_body(&t, cx),
             Kind::Overloaded => self.overload_body(&t, cx),

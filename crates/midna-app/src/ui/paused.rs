@@ -278,7 +278,7 @@ pub fn status_item(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> O
             .when_some(over, |d, l| {
                 let theirs = !midna_proto::system::midna_is_the_cause(l.cpu_percent, l.midna_percent);
                 d.child(div().text_color(t.status_color("orange")).child("●"))
-                    .child(format!("Mac CPU {}%", l.cpu_percent))
+                    .child(format!("{} CPU {}%", crate::ui::system_window::COMPUTER, l.cpu_percent))
                     .when(theirs, |d| d.child(div().text_color(t.dim).child("· other apps")))
             })
             .when(over.is_some() && paused > 0, |d| d.child(div().text_color(t.dim).child("·")))
