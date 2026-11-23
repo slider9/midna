@@ -64,7 +64,8 @@ pub fn read_plist(_path: &Path) -> Option<Value> {
     None
 }
 
-/// Not macOS.
+/// Not macOS. (Windows reads its own version: `updater::windows_version`.)
+#[cfg_attr(windows, allow(dead_code))]
 pub fn macos_version() -> (u32, u32) {
     (0, 0)
 }

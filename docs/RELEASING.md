@@ -190,11 +190,48 @@ is replaced by `updates.channel`, `stable` or `beta`; `midna_proto::settings::DE
 
 - `signature` is ed25519 over exactly
   `"midna-update-v1\nversion=<version>\nsha256=<lowercase sha256>\nminimum_macos=<min>\narch=<arch>\n"`.
-  The public key (base64, raw 32 bytes) is compiled in from `MIDNA_UPDATE_PUBKEY` at build
+  The public keys (base64, raw 32 bytes each) are compiled in from `MIDNA_UPDATE_PUBKEY` at build
   time. A build without a key never updates (Settings says so). `url`, `notes` and `pub_date`
-  aren't signed: the signed sha256 pins the bytes, so a mirror can serve the file.
+  aren't signed: the signed sha256 pins the bytes, so a mirror can serve the file. A signed field
+  with a line break in it is refused.
 - `arch`: `aarch64`, `x86_64` or `universal` (default). `minimum_macos` defaults to `12.0`.
 - Archive: `.tar.gz` (or `.zip`) containing `Midna.app` at the top level.
+
+**Windows feed.** Windows reads its own file: `{channel}` becomes `windows-<channel>`, so the
+`channels` release holds `windows-stable.json` and `windows-beta.json` beside macOS's
+`stable.json` and `beta.json`. A Windows entry adds `os` and `minimum_windows` (`10.0.17763`,
+Windows 10 1809, the first with ConPTY, when absent) and drops `minimum_macos`:
+
+```json
+{
+  "version": "0.1.0-beta.58.w.1",
+  "url": "https://github.com/slider9/midna/releases/download/windows-v0.1.0-beta.58.w.1/Midna-0.1.0-beta.58.w.1-windows-x86_64.zip",
+  "sha256": "…", "size": 41943040, "pub_date": "…", "notes": "…",
+  "os": "windows",
+  "minimum_windows": "10.0.17763",
+  "arch": "x86_64",
+  "signature": "base64 ed25519 signature"
+}
+```
+
+- Its `signature` covers a different message, `midna-update-v2`:
+  `"midna-update-v2\nos=<os>\nversion=<version>\nsha256=<lowercase sha256>\narch=<arch>\nminimum_windows=<min>\n"`.
+  An entry without `os` (or with `os: "macos"`) is a macOS entry and is checked with v1, so a
+  signed macOS entry relabelled `windows` no longer verifies, and each app refuses an entry for
+  another OS outright. macOS still signs and checks v1, byte for byte as before.
+- `arch` names the CPU (`x86_64`); `universal` is a macOS bundle and a Windows app refuses it.
+  The Windows version is read with `RtlGetVersion` and compared as major.minor.build.
+- Archive: a `.zip` with the folder `packaging/build-windows.sh` makes (`Midna/`, holding
+  `midna-bundle.txt`) at the top level. `make-update.sh --windows dist/<v>-windows/Midna` writes
+  it and its entry.
+
+**Several keys.** `MIDNA_UPDATE_PUBKEY` is a list: base64 keys separated by commas or
+whitespace, and an entry signed by any one of them passes. That is how the release key moves
+(say, from the fork's to upstream's): one bridging release embeds both keys and is signed with
+the old one; releases after it are signed with the new key, and the old key is dropped from the
+list once nobody runs a build older than the bridge. `midna-release verify` takes the same list.
+The release workflow's check that `MIDNA_UPDATE_KEY` matches `MIDNA_UPDATE_PUBKEY` compares
+against a single key, so the bridging release changes it to "is one of".
 
 **Client flow** (`updater.rs`). It runs about 5s after launch, then every 6h (Settings has
 "Check now"):
