@@ -68,6 +68,8 @@ mod terminal;
 mod theme;
 mod ui;
 mod updater;
+#[cfg(windows)]
+mod update_windows;
 mod windows;
 #[cfg(windows)]
 mod winreg;
@@ -129,6 +131,8 @@ fn main() {
             cx.spawn(async move |cx| {
                 if qrx.recv().await.is_ok() {
                     lifecycle::log("quit: asked by --quit");
+                    // Whoever asked (`--uninstall`, a reinstall) is about to change the install.
+                    lifecycle::keep_update_on_quit();
                     cx.update(|cx| cx.dispatch_action(&Quit));
                 }
             })

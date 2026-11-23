@@ -21,10 +21,15 @@
 //! The swap is ours (not cargo-packager-updater's, which isn't atomic): the new bundle is
 //! staged next to the installed one and exchanged with `renamex_np(RENAME_SWAP)`, so
 //! `Midna.app` is always either the complete old or the complete new bundle.
+//!
+//! Windows has no such swap for a folder: once the app has quit, the staged build's own
+//! `midna-app.exe --apply-update` replaces the install file by file, with rollback
+//! (`update_windows.rs`).
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Command;
 
 /// The update keys this build trusts, as a list (see [`keys`]). Several keys let one release
@@ -278,8 +283,13 @@ pub fn download(e: &FeedEntry, dir: &Path) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+/// Windows: unpack the zip and check the build in it (`update_windows.rs`).
+#[cfg(windows)]
+pub use crate::update_windows::stage;
+
 /// Extract `archive` (`.tar.gz` / `.tgz` / `.zip`) into `dir` and validate the `Midna.app` in
 /// it: bundle id, version, a valid code signature, and the same signing team as this app.
+#[cfg(not(windows))]
 pub fn stage(archive: &Path, dir: &Path, expect_version: &str, installed: &Path) -> Result<PathBuf, String> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -320,6 +330,7 @@ pub fn stage(archive: &Path, dir: &Path, expect_version: &str, installed: &Path)
 }
 
 /// The Developer ID team of a signed bundle (`None` for ad-hoc / unsigned).
+#[cfg(not(windows))]
 pub fn team_id(app: &Path) -> Option<String> {
     let o = Command::new("/usr/bin/codesign").args(["-dv", "--verbose=2"]).arg(app).output().ok()?;
     let text = String::from_utf8_lossy(&o.stderr).to_string();
@@ -329,6 +340,7 @@ pub fn team_id(app: &Path) -> Option<String> {
 /// Swap `staged` into `installed` atomically. The staged copy is moved next to `installed`
 /// first (same volume; a copy if it was elsewhere), then exchanged with `renamex_np`
 /// `RENAME_SWAP`; the old bundle ends up at the staging path and is deleted.
+#[cfg(not(windows))]
 pub fn apply(staged: &Path, installed: &Path) -> Result<(), String> {
     let parent = installed.parent().ok_or("app has no parent directory")?;
     let side = parent.join(format!(".{}.update-{}", installed.file_name().unwrap_or_default().to_string_lossy(), std::process::id()));
@@ -349,8 +361,8 @@ pub fn apply(staged: &Path, installed: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Off macOS there's no installed bundle to update yet (the app always runs in dev mode).
-#[cfg(not(target_os = "macos"))]
+/// Off macOS there's no bundle to swap (Windows applies with `update_windows::start_apply`).
+#[cfg(not(any(target_os = "macos", windows)))]
 fn swap(_a: &Path, _b: &Path) -> Result<(), String> {
     Err("updates aren't available on this platform yet".into())
 }
