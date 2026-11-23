@@ -50,6 +50,63 @@ pub fn current_cli(home: &Path) -> PathBuf {
     current_binary(home).with_file_name(format!("midna{EXE}"))
 }
 
+/// Windows: the `midna` CLI the agents' global config runs, `bin\midna.exe`. The versioned
+/// folder's copy moves with every update; this path doesn't, and each install (and midnad, when
+/// it finds this one out of date) makes it a copy of `current_cli` again. Nothing in midna
+/// removes it, `--uninstall` included.
+#[cfg(windows)]
+pub fn stable_cli(home: &Path) -> PathBuf {
+    bin_root(home).join(format!("midna{EXE}"))
+}
+
+/// Make [`stable_cli`] a copy of [`current_cli`] unless it is one already (a copy keeps the
+/// source's time, so the same size and time means current). One that's running (a hook waiting
+/// on an approval) can't be replaced, only renamed: it's moved aside and removed on a later call.
+/// Returns whether it's current now.
+#[cfg(windows)]
+pub fn refresh_stable_cli(home: &Path) -> bool {
+    // midnad refreshes from several threads (polls, launches, hooks RPCs): one at a time. The
+    // temp and aside names also carry a per-call number, for `--install-self` running alongside.
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let (src, stable) = (current_cli(home), stable_cli(home));
+    let Some(want) = std::fs::metadata(&src).ok().filter(|m| m.is_file()) else { return false };
+    let root = bin_root(home);
+    for e in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with(".midna.") && name.ends_with(".old") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    if std::fs::metadata(&stable).is_ok_and(|m| m.len() == want.len() && m.modified().ok() == want.modified().ok()) {
+        return true;
+    }
+    let id = format!("{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let tmp = root.join(format!(".midna.{id}.tmp"));
+    if std::fs::copy(&src, &tmp).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    // Straight over the old one when it isn't running, so there's no moment without it.
+    if std::fs::rename(&tmp, &stable).is_ok() {
+        return true;
+    }
+    let aside = root.join(format!(".midna.{id}.old"));
+    if std::fs::rename(&stable, &aside).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    if std::fs::rename(&tmp, &stable).is_ok() {
+        let _ = std::fs::remove_file(&aside);
+        return true;
+    }
+    // Never leave it missing: the old copy goes back.
+    let _ = std::fs::rename(&aside, &stable);
+    let _ = std::fs::remove_file(&tmp);
+    false
+}
+
 /// Install the running executable. Returns the versioned directory.
 pub fn install_self(home: &Path) -> std::io::Result<PathBuf> {
     install(&std::env::current_exe()?, home)
@@ -85,6 +142,9 @@ fn install(exe: &Path, home: &Path) -> std::io::Result<PathBuf> {
     #[cfg(windows)]
     std::fs::write(&tmp, &name)?;
     std::fs::rename(&tmp, root.join("current"))?;
+    // midnad does it later if this can't (one still running that can't be moved either).
+    #[cfg(windows)]
+    refresh_stable_cli(home);
     Ok(dir)
 }
 
@@ -120,6 +180,55 @@ mod tests {
         assert_eq!(std::fs::canonicalize(&cur).unwrap(), std::fs::canonicalize(&bin).unwrap());
         // Re-installing the same binary is idempotent.
         assert_eq!(super::install_self(&home).unwrap(), dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The agents' global config names `bin\midna.exe`: an update leaves the path alone and makes
+    /// it the new CLI, even while a hook is running the old one.
+    #[cfg(windows)]
+    #[test]
+    fn the_stable_cli_follows_updates_even_while_running() {
+        let home = std::env::temp_dir().join(format!("midna-inst-stable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let bin = super::bin_root(&home);
+        let point = |v: &str, body: &[u8]| {
+            std::fs::create_dir_all(bin.join(v)).unwrap();
+            std::fs::write(bin.join(v).join("midna.exe"), body).unwrap();
+            std::fs::write(bin.join("current"), v).unwrap();
+        };
+        let stable = super::stable_cli(&home);
+        assert!(!super::refresh_stable_cli(&home), "nothing installed, nothing to copy");
+        assert!(!stable.exists());
+
+        point("v1", b"one");
+        assert!(super::refresh_stable_cli(&home));
+        assert_eq!(std::fs::read(&stable).unwrap(), b"one");
+        assert!(super::refresh_stable_cli(&home), "already current");
+
+        // A hook running it: a real program, since only a running image refuses to be replaced.
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        std::fs::copy(std::path::Path::new(&system).join(r"System32\PING.EXE"), &stable).unwrap();
+        let mut running = std::process::Command::new(&stable).args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        point("v2", b"two, a new version");
+        let refreshed = super::refresh_stable_cli(&home);
+        let _ = running.kill();
+        let _ = running.wait();
+        assert!(refreshed);
+        assert_eq!(std::fs::read(&stable).unwrap(), b"two, a new version");
+        // The running one was moved aside; the next call clears it away.
+        let left = || -> Vec<String> { std::fs::read_dir(&bin).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with(".midna.")).collect() };
+        assert_eq!(left().len(), 1, "{:?}", left());
+        assert!(super::refresh_stable_cli(&home));
+        assert!(left().is_empty(), "{:?}", left());
+
+        // midnad's threads refreshing at once leave one whole, current copy.
+        let big: Vec<u8> = (0..4_000_000u32).map(|i| i as u8).collect();
+        point("v3", &big);
+        let all: Vec<bool> = std::thread::scope(|s| (0..8).map(|_| s.spawn(|| super::refresh_stable_cli(&home))).collect::<Vec<_>>().into_iter().map(|t| t.join().unwrap()).collect());
+        assert!(all.iter().all(|&ok| ok), "{all:?}");
+        assert!(std::fs::read(&stable).unwrap() == big);
+        let tmps: Vec<_> = std::fs::read_dir(&bin).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).collect();
+        assert!(tmps.is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
 
