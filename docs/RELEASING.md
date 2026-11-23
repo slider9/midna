@@ -101,7 +101,7 @@ git tag windows-v0.1.0-beta.58.w.1 && git push origin windows-v0.1.0-beta.58.w.1
 A `windows-v` tag runs `.github/workflows/release-windows.yml`; a bare `v` tag runs
 `release.yml` (macOS) and never this one. Two jobs:
 
-- **build** (`windows-latest`)
+- **build** (`windows-2022`; `windows-latest`'s MSVC 14.52 needs a newer Clang than Zig 0.15.2 has)
   1. checks the tag's version (below) and that the files say its upstream base
      (`scripts/set-version.sh --check <base>`)
   2. sets up `.toolchain/`: Zig and Ghostty's source (`scripts/setup-toolchain.sh`, which on

@@ -51,7 +51,9 @@ jobs:
   build:
     # Only the fork's owner releases (docs/RELEASING.md, "Windows releases").
     if: github.actor == 'slider9'
-    runs-on: windows-latest
+    # Not windows-latest: its Visual Studio 2026 (MSVC 14.52) STL wants Clang 22, newer than the
+    # one in Zig 0.15.2, which builds Ghostty's C++ against the MSVC headers.
+    runs-on: windows-2022
     timeout-minutes: 90
     outputs:
       tag: ${{ steps.version.outputs.tag }}
