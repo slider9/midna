@@ -691,3 +691,93 @@ fn forced_restart_goes_at_once_and_a_bad_binary_is_refused_on_windows() {
         assert_ne!(s["status"]["state"], "exited", "{s}");
     }
 }
+
+/// Each Windows terminal runs in a keeper (midna-pty.exe) that outlives midnad on purpose, so a
+/// stop has to end them: `daemon.stop` hangs up every terminal and returns once the keepers,
+/// their console hosts and their shells are gone.
+#[cfg(windows)]
+#[test]
+fn a_stopped_midnad_leaves_no_keeper_console_host_or_shell_on_windows() {
+    let d = Bin::start();
+    let mut c = d.human();
+    let mut ids = vec![];
+    // cmd for the first: Git's sh starts Windows programs out of the terminal's job when the job
+    // allows it, which a terminal's does (pty_windows.rs), so only the console's hang-up timing
+    // out ends those.
+    for shell in ["cmd.exe".to_string(), common::sh(), common::sh()] {
+        let s = call(&mut c, "session.open", json!({ "kind": "shell", "cwd": common::tmp(), "command": [shell] }));
+        ids.push(s["id"].as_str().unwrap().to_string());
+    }
+    // A program in the terminal's job with a console of its own, which the hang-up never
+    // reaches: only ending the job stops it, even once the shell has exited.
+    let ping = "powershell -NoProfile -Command \"Start-Process -WindowStyle Hidden ping -ArgumentList '-n','377','127.0.0.1'\"";
+    call(&mut c, "session.input", json!({ "id": ids[0], "text": ping, "enter": true }));
+    let pinging = || {
+        midnad::procs::snapshot()
+            .into_iter()
+            .filter(|(p, (_, n))| n.eq_ignore_ascii_case("ping") && midnad::procs::command_line(*p).is_some_and(|l| l.contains("377")))
+            .map(|(p, _)| p)
+            .collect::<Vec<i32>>()
+    };
+    let hidden = wait_for(15, "the hidden ping", || Some(pinging()).filter(|p| !p.is_empty()));
+    // And one runs a program that outlasts the console's hang-up as long as Windows lets it.
+    let me = std::env::current_exe().unwrap();
+    let line = format!("\"{}\" --exact helper_outlast_a_hangup --ignored --nocapture", me.display());
+    call(&mut c, "session.input", json!({ "id": ids[0], "text": line, "enter": true }));
+    wait_for(10, "the helper to be ready", || common::read(&mut c, &ids[0]).contains("outlasting-hangups").then_some(()));
+    let records = wait_for(10, "a keeper record per terminal", || {
+        let r = midna_pty::names::records(&d.home);
+        (r.len() == ids.len()).then_some(r)
+    });
+    for (sid, _) in &records {
+        assert!(ids.contains(sid), "{sid} isn't one of {ids:?}");
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    // What runs now: the keepers, the console hosts they started, the shells and their children.
+    let table = midnad::procs::snapshot();
+    let keepers: Vec<i32> = records.iter().map(|(_, r)| r.pid as i32).collect();
+    let mut ours: Vec<i32> = keepers.clone();
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for (&pid, (ppid, _)) in &table {
+            // Windows keeps a parent's pid after it exits: a process started before its "parent"
+            // is a stranger whose parent had that pid once.
+            let after = |p: i32| midnad::procs::start_time(pid).zip(midnad::procs::start_time(p)).is_some_and(|(c, p)| c >= p);
+            if ours.contains(ppid) && !ours.contains(&pid) && after(*ppid) {
+                ours.push(pid);
+                grew = true;
+            }
+        }
+    }
+    let names: Vec<String> = ours.iter().filter_map(|p| table.get(p).map(|(_, n)| n.to_lowercase())).collect();
+    assert!(names.iter().any(|n| n == "midna-pty"), "no keeper among {names:?}");
+    let helper = me.file_stem().unwrap().to_string_lossy().to_lowercase();
+    assert!(names.contains(&helper), "no {helper} among {names:?}");
+    assert!(names.iter().any(|n| n == "openconsole" || n == "conhost"), "no console host among {names:?}");
+
+    ours.extend(&hidden);
+    let t0 = Instant::now();
+    let _ = c.call_value("daemon.stop", json!({}));
+    wait_for(15, "midnad to exit", || (!d.socket().exists()).then_some(()));
+    // A pid still running under the same name is one of them (a reused pid has another).
+    let now = midnad::procs::snapshot();
+    let left: Vec<String> = ours.iter().filter(|p| now.get(p).map(|(_, n)| n) == table.get(p).map(|(_, n)| n)).map(|p| format!("{p} {}", table.get(p).map_or("?", |(_, n)| n.as_str()))).collect();
+    assert!(left.is_empty(), "still running {:.1}s after daemon.stop: {left:?}", t0.elapsed().as_secs_f64());
+    assert!(midna_pty::names::records(&d.home).is_empty(), "keeper records left: {:?}", midna_pty::names::records(&d.home));
+}
+
+/// Run in a terminal by the test above: stalls the console's hang-up (CTRL_CLOSE_EVENT) for as
+/// long as Windows waits for it (about 5 s), so only ending the terminal's job stops it at once.
+#[cfg(windows)]
+#[test]
+#[ignore]
+fn helper_outlast_a_hangup() {
+    unsafe extern "system" fn stall(_: u32) -> windows_sys::core::BOOL {
+        std::thread::sleep(Duration::from_secs(60));
+        1
+    }
+    unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(stall), 1) };
+    println!("outlasting-hangups");
+    std::thread::sleep(Duration::from_secs(300));
+}

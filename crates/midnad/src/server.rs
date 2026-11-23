@@ -109,15 +109,15 @@ pub fn hangup_all(rts: &[crate::term::RtHandle]) {
 }
 
 /// Windows: hang up every terminal (its keeper closes the pseudoconsole: CTRL_CLOSE_EVENT to
-/// everything attached), then have each keeper end its session's job if the shell is still
-/// running after the grace period, and wait for the keepers to be gone, so nothing of a stopped
-/// midnad is left running.
+/// everything attached), then end each session's job: the keeper does once the shell has
+/// exited, and midnad asks it to if the shell is still running after the grace period. Then
+/// wait for the keepers to be gone, so nothing of a stopped midnad is left running.
 #[cfg(windows)]
 pub fn hangup_all(rts: &[crate::term::RtHandle]) {
     const GRACE: Duration = Duration::from_millis(1500);
     const KEEPERS: Duration = Duration::from_secs(5);
     for rt in rts {
-        rt.fd.hangup();
+        rt.fd.hangup_and_end();
     }
     let t0 = std::time::Instant::now();
     while t0.elapsed() < GRACE && rts.iter().any(|r| r.fd.child_alive()) {

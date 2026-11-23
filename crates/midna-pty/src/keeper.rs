@@ -6,7 +6,8 @@
 //! `spawn` (the shell's argv, folder, environment and size never go on the command line); later
 //! ones attach to the same shell. Once the shell runs, the keeper records itself in
 //! `MIDNA_HOME\pty\<session id>.json`; it exits once the shell has exited and a client has been
-//! told the code (`exited`), or once the shell has ended after `hangup` or `kill`, and removes
+//! told the code (`exited`), or once the shell has ended after `hangup` (ending the job first when
+//! it was asked to) or `kill`, and removes
 //! the record then. What it does goes to `MIDNA_HOME\pty\keeper.log`.
 use crate::names::{self, Record};
 use crate::proto::{self, PROTOCOL, Reply, Request};
@@ -79,6 +80,7 @@ pub fn run(args: &[String]) -> i32 {
         exit_code: Mutex::new(None),
         conn: Mutex::new(None),
         ending: AtomicBool::new(false),
+        end_job: AtomicBool::new(false),
         collected: AtomicBool::new(false),
         finishing: AtomicBool::new(false),
         closing: AtomicBool::new(false),
@@ -106,6 +108,8 @@ struct Keeper {
     conn: Mutex<Option<Conn>>,
     /// `hangup` or `kill` was asked for: exit once the shell has, told or not.
     ending: AtomicBool,
+    /// `hangup` with `end_job`: end the job before exiting.
+    end_job: AtomicBool,
     /// A client was sent `exited`.
     collected: AtomicBool,
     finishing: AtomicBool,
@@ -306,10 +310,13 @@ impl Keeper {
                 Ok(Reply::Resize {})
             }
             Request::Snapshot => Ok(Reply::Snapshot(console::snapshot(&*shell()?)?)),
-            Request::Hangup => {
+            Request::Hangup { end_job } => {
                 let s = shell()?;
+                if end_job {
+                    self.end_job.store(true, Ordering::SeqCst);
+                }
                 self.ending.store(true, Ordering::SeqCst);
-                self.log.line(&format!("hangup from pid {client}"));
+                self.log.line(&format!("hangup{} from pid {client}", if end_job { ", ending the job," } else { "" }));
                 self.close_console(!self.client_reads());
                 let k = self.clone();
                 std::thread::spawn(move || {
@@ -411,6 +418,12 @@ impl Keeper {
     fn finish(self: &Arc<Self>) {
         if self.finishing.swap(true, Ordering::SeqCst) {
             return;
+        }
+        // What the shell started and left running goes too, and with it the console host.
+        if self.end_job.load(Ordering::SeqCst)
+            && let Some(s) = self.shell.get()
+        {
+            s.kill(1);
         }
         if !self.wait_closed(CLOSE_STALL) {
             if !self.client_reads() {

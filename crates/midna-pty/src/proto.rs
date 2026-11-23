@@ -34,8 +34,13 @@ pub enum Request {
     /// The visible screen as the console host holds it.
     Snapshot,
     /// Close the pseudoconsole, which gives the shell a console hang-up; its job is ended if it
-    /// hasn't exited a few seconds later. The keeper exits once the shell has.
-    Hangup,
+    /// hasn't exited a few seconds later. The keeper exits once the shell has. With `end_job`
+    /// (a later field: a keeper without it ignores it), the job is ended then too, so nothing
+    /// the shell started outlasts it (midnad stopping). Left out when false.
+    Hangup {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        end_job: bool,
+    },
     /// End every process in the shell's job (the force close). The keeper exits once the shell has.
     Kill,
 }
@@ -48,7 +53,7 @@ impl Request {
             Request::Attach { .. } => "attach",
             Request::Resize { .. } => "resize",
             Request::Snapshot => "snapshot",
-            Request::Hangup => "hangup",
+            Request::Hangup { .. } => "hangup",
             Request::Kill => "kill",
         }
     }
@@ -229,7 +234,8 @@ mod tests {
             Request::Attach { pid: 42 },
             Request::Resize { cols: 100, rows: 30 },
             Request::Snapshot,
-            Request::Hangup,
+            Request::Hangup { end_job: false },
+            Request::Hangup { end_job: true },
             Request::Kill,
         ];
         for r in all {
@@ -244,6 +250,9 @@ mod tests {
         let spawn = Request::Spawn { argv: vec!["cmd".into()], cwd: "C:\\".into(), env: vec![("A".into(), "1".into())], cols: 80, rows: 24 };
         assert_eq!(serde_json::to_value(&spawn).unwrap(), json!({"type": "spawn", "argv": ["cmd"], "cwd": "C:\\", "env": [["A", "1"]], "cols": 80, "rows": 24}));
         assert_eq!(serde_json::to_value(Request::Snapshot).unwrap(), json!({"type": "snapshot"}));
+        assert_eq!(serde_json::to_value(Request::Hangup { end_job: false }).unwrap(), json!({"type": "hangup"}));
+        assert_eq!(serde_json::to_value(Request::Hangup { end_job: true }).unwrap(), json!({"type": "hangup", "end_job": true}));
+        assert_eq!(parse_request(json!({"type": "hangup"})).unwrap(), Request::Hangup { end_job: false });
         assert_eq!(serde_json::to_value(Reply::Exited { code: 7 }).unwrap(), json!({"type": "exited", "code": 7}));
         assert_eq!(serde_json::to_value(Reply::Kill {}).unwrap(), json!({"type": "kill"}));
         let mut buf = vec![];
@@ -286,7 +295,7 @@ mod tests {
     #[test]
     fn frames_that_are_cut_short_too_big_or_not_objects() {
         let mut buf = vec![];
-        write_frame(&mut buf, &Request::Hangup).unwrap();
+        write_frame(&mut buf, &Request::Hangup { end_job: false }).unwrap();
         let e = read_frame(&mut &buf[..buf.len() - 1]).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
         assert_eq!(read_frame(&mut &b""[..]).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);

@@ -300,7 +300,13 @@ impl Client {
     }
 
     pub fn hangup(&self) -> io::Result<()> {
-        self.call(Request::Hangup).map(drop)
+        self.call(Request::Hangup { end_job: false }).map(drop)
+    }
+
+    /// Hang up, and have the keeper end the shell's job once the shell has exited too, so
+    /// nothing it started is left (midnad stopping).
+    pub fn hangup_ending_job(&self) -> io::Result<()> {
+        self.call(Request::Hangup { end_job: true }).map(drop)
     }
 
     pub fn kill(&self) -> io::Result<()> {

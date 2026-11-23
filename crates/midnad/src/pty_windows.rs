@@ -153,6 +153,16 @@ impl Master {
         });
     }
 
+    /// [`hangup`](Self::hangup), for midnad stopping: once the shell has exited, the keeper
+    /// ends whatever is left in its job too, as midnad's own `kill_all` would after the grace.
+    pub fn hangup_and_end(self: &Arc<Self>) {
+        self.ended.store(true, Ordering::SeqCst);
+        let m = self.clone();
+        let _ = std::thread::Builder::new().name("pty-hangup".into()).spawn(move || {
+            let _ = m.client.hangup_ending_job();
+        });
+    }
+
     /// The shell exited. The keeper lets the console host paint its last output, then closes the
     /// pseudoconsole so the output pipe ends and the reader drains.
     pub fn child_exited(&self) {}
