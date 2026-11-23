@@ -8,6 +8,8 @@
 //! - `MIDNA_UPDATE_CHECK_SECS` overrides the 6h interval (first check is ~5s after launch).
 //! - `MIDNA_DEBUG_UPDATE=apply` installs an update (and relaunches) as soon as it's ready.
 //! - `MIDNA_DEBUG_DAEMON_WAITING=a,b` shows the daemon's restart waiting for agents a and b.
+//! - `MIDNA_DEBUG_UPDATE_STATE=ready:0.2.0` (or `downloading:`, `applying:`, `failed:<error>`)
+//!   shows that update state, for screenshots of a development build.
 //!
 //! A busy Mac (midnad answers daemon.upgrade with BUSY) postpones moving the daemon onto the
 //! installed build: the first time per launch (or when asked from Settings) a system window
@@ -134,7 +136,7 @@ pub fn start(backend: Arc<dyn Backend>, cx: &mut App) {
         login: if installed { LoginItem::Checking } else { LoginItem::Dev },
         cli: CliLink::Dev,
         install_error: None,
-        update: if installed { UpdateState::Idle } else { UpdateState::Off("development build".into()) },
+        update: debug_update_state().unwrap_or(if installed { UpdateState::Idle } else { UpdateState::Off("development build".into()) }),
         daemon_upgrade_error: None,
         daemon_postponed: None,
         // Screenshots: a restart waiting for these agents (comma-separated; empty for none named).
@@ -196,6 +198,20 @@ pub fn start(backend: Arc<dyn Backend>, cx: &mut App) {
             }
         })
         .expect("spawn lifecycle thread");
+}
+
+/// `MIDNA_DEBUG_UPDATE_STATE` (see the module docs).
+fn debug_update_state() -> Option<UpdateState> {
+    let v = crate::dev::var("MIDNA_DEBUG_UPDATE_STATE").ok()?;
+    let (state, arg) = v.split_once(':').unwrap_or((&v, "0.2.0"));
+    let version = arg.to_string();
+    Some(match state {
+        "ready" => UpdateState::Ready { version, notes: String::new(), app: PathBuf::new() },
+        "downloading" => UpdateState::Downloading { version },
+        "applying" => UpdateState::Applying { version },
+        "failed" => UpdateState::Failed { error: arg.to_string(), at: Instant::now() },
+        _ => return None,
+    })
 }
 
 /// The updater state in the daemon's `updates.status` shape (agents read it there).
@@ -266,13 +282,30 @@ pub fn on_daemon_command(action: &str, cx: &mut App) -> Option<String> {
     }
 }
 
-/// Quitting with an update ready installs it (no relaunch). Called from the Quit paths.
+/// Set when the app is asked to quit by someone about to change the install themselves
+/// (`midna-app.exe --quit`): quitting then leaves a ready update for next time.
+static KEEP_UPDATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn keep_update_on_quit() {
+    KEEP_UPDATE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Quitting with an update ready installs it (no relaunch). Called from the Quit paths. Windows
+/// starts the staged build's helper, which installs it once the app has exited.
 pub fn apply_on_quit(_cx: &mut App) {
     let Some(l) = snapshot() else { return };
+    if KEEP_UPDATE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     if let (Mode::Installed { bundle }, UpdateState::Ready { app, version, .. }) = (&l.mode, &l.update) {
-        match updater::apply(app, bundle) {
-            Ok(()) => eprintln!("midna-app: installed {version} on quit"),
-            Err(e) => eprintln!("midna-app: update on quit failed: {e}"),
+        #[cfg(windows)]
+        let r = crate::update_windows::start_apply(app, bundle, false);
+        #[cfg(not(windows))]
+        let r = updater::apply(app, bundle);
+        match r {
+            Ok(()) => log(&format!("installing {version} on quit")),
+            Err(e) => log(&format!("update on quit failed: {e}")),
         }
     }
 }
@@ -327,6 +360,10 @@ impl Worker {
         let home = midna_proto::paths::midna_home();
         let _ = std::fs::create_dir_all(&home);
         log(&format!("launch from {} (home {})", bundle.display(), home.display()));
+        // Windows: clear what an update left in the install; an update that couldn't be applied
+        // says why (its helper put the old build back and started it).
+        #[cfg(windows)]
+        let apply_failed = crate::update_windows::after_update(bundle, &home);
         // 1. the stable daemon binary
         match install::install_daemon(bundle, &home) {
             Ok(_) => self.send(Msg::Install(None)),
@@ -360,6 +397,14 @@ impl Worker {
         let mut update = UpdateState::Idle;
         if updater::PUBKEY.is_none() {
             update = UpdateState::Off("this build has no update key".into());
+            self.send(Msg::Update(update.clone()));
+        }
+        #[cfg(windows)]
+        if let Some(error) = apply_failed
+            && !matches!(update, UpdateState::Off(_))
+        {
+            log(&format!("the last update wasn't installed: {error}"));
+            update = UpdateState::Failed { error: format!("The update wasn't installed: {error}"), at: Instant::now() };
             self.send(Msg::Update(update.clone()));
         }
         let started = Instant::now();
@@ -543,14 +588,26 @@ impl Worker {
     fn apply(&self, bundle: &Path, app: &Path, version: &str) -> UpdateState {
         // Returns only on failure (success ends the process).
         self.send(Msg::Update(UpdateState::Applying { version: version.into() }));
-        log(&format!("applying {version}: swapping {}", bundle.display()));
-        if let Err(e) = updater::apply(app, bundle) {
+        // Windows: the staged build's helper swaps its files in once this app has exited, then
+        // starts the new one.
+        #[cfg(windows)]
+        let r = {
+            log(&format!("applying {version}: {} installs it into {} once the app quits", app.display(), bundle.display()));
+            crate::update_windows::start_apply(app, bundle, true)
+        };
+        #[cfg(not(windows))]
+        let r = {
+            log(&format!("applying {version}: swapping {}", bundle.display()));
+            updater::apply(app, bundle)
+        };
+        if let Err(e) = r {
             log(&format!("apply failed: {e}"));
             let s = UpdateState::Failed { error: e, at: Instant::now() };
             self.send(Msg::Update(s.clone()));
             return s;
         }
         // The new app upgrades the daemon in place when it starts (ensure_daemon_current).
+        #[cfg(not(windows))]
         match install::relaunch_after_exit(bundle) {
             Ok(()) => log("relaunching"),
             Err(e) => log(&format!("relaunch helper failed: {e}; restart midna by hand")),
@@ -569,19 +626,29 @@ impl Worker {
 /// - `--uninstall`: stop midnad (`daemon.stop`, which hangs up every terminal), unregister the
 ///   login item and remove our `midna` CLI link. MIDNA_HOME's data is left in place. (Windows,
 ///   where Settings ▸ Apps' Uninstall runs it: first quit the app, which would start midnad
-///   again; also remove the CLI copy, the Start menu entry and the Settings ▸ Apps entry. The
-///   app's folder stays.)
+///   again; also remove the CLI copy, the Start menu entry and the Settings ▸ Apps entry, and,
+///   once this has exited, the app's folder.)
 /// - `--start-daemon` (Windows, what the login entry runs): start the installed midnad, with no
 ///   window, unless it's already answering.
 /// - `--quit` (Windows, any build): ask the app using this MIDNA_HOME to quit; exit 1 when none
 ///   is running.
+/// - `--apply-update <install folder> --wait <pid> [--no-launch]` (Windows, run from a staged
+///   update) and `--remove-install <install folder> --wait <pid>` (Windows, run by
+///   `--uninstall` from a copy in `%TEMP%`): the after-exit steps in `update_windows.rs`.
 ///
 /// Returns the exit code when one of them ran.
 pub fn headless(args: &[String]) -> Option<i32> {
     let cmd = args.get(1)?.as_str();
-    let windows_only = matches!(cmd, "--start-daemon" | "--quit");
-    if !matches!(cmd, "--login-item-status" | "--uninstall" | "--start-daemon" | "--quit") || (windows_only && !cfg!(windows)) {
+    let windows_only = matches!(cmd, "--start-daemon" | "--quit" | "--apply-update" | "--remove-install");
+    if !matches!(cmd, "--login-item-status" | "--uninstall" | "--start-daemon" | "--quit" | "--apply-update" | "--remove-install") || (windows_only && !cfg!(windows)) {
         return None;
+    }
+    // Helpers with no console to print to.
+    #[cfg(windows)]
+    match cmd {
+        "--apply-update" => return Some(crate::update_windows::apply_main(args)),
+        "--remove-install" => return Some(crate::update_windows::remove_main(args)),
+        _ => {}
     }
     // A release build has no console of its own: print to the one it was run from, if any.
     #[cfg(windows)]
@@ -657,6 +724,10 @@ pub fn headless(args: &[String]) -> Option<i32> {
             Ok(true) => println!("removed the Settings ▸ Apps entry"),
             Ok(false) => {}
             Err(e) => eprintln!("Settings ▸ Apps entry: {e}"),
+        }
+        match crate::update_windows::remove_after_exit(&bundle) {
+            Ok(_) => println!("removing {} once this exits", bundle.display()),
+            Err(e) => eprintln!("{}: {e}; delete the folder yourself", bundle.display()),
         }
     }
     Some(code)

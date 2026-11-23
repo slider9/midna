@@ -11,7 +11,6 @@
 //! `MIDNA_NO_SPAWN=1`), and the installed-only calls report that they aren't available.
 //!
 //! All functions here block; `lifecycle` runs them off the UI thread.
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -60,7 +59,8 @@ pub enum LoginItem {
     Failed(String),
 }
 
-pub fn read_plist(_path: &Path) -> Option<Value> {
+#[cfg(not(windows))]
+pub fn read_plist(_path: &Path) -> Option<serde_json::Value> {
     None
 }
 
@@ -422,14 +422,14 @@ pub fn spawn_dev_daemon() -> Result<(), String> {
 /// A console with no window (midnad's console programs share it instead of each flashing a
 /// window of its own), and not in this process's group (so it survives the app and ⌃C).
 #[cfg(windows)]
-fn detach(cmd: &mut Command) {
+pub fn detach(cmd: &mut Command) {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
     cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 }
 
 #[cfg(not(windows))]
-fn detach(cmd: &mut Command) {
+pub fn detach(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
     unsafe {
         cmd.pre_exec(|| {
@@ -572,26 +572,7 @@ fn is_our_cli(link: &Path) -> bool {
 
 // ------------------------------------------------------------------ relaunch
 
-/// Start `app` (the executable, or the packaged build's folder) again once this process has
-/// exited. The caller quits right after.
-#[cfg(windows)]
-pub fn relaunch_after_exit(app: &Path) -> Result<(), String> {
-    let exe = if app.is_dir() { app.join(exe_name("midna-app")) } else { app.to_path_buf() };
-    let app = exe.as_path();
-    let script = format!(
-        "Wait-Process -Id {} -Timeout 30 -ErrorAction SilentlyContinue; Start-Process -FilePath '{}'",
-        std::process::id(),
-        app.display().to_string().replace('\'', "''")
-    );
-    let mut cmd = Command::new("powershell.exe");
-    cmd.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    detach(&mut cmd);
-    cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
-}
-
+/// Windows relaunches through the update's own helper (`update_windows::apply_main`).
 #[cfg(not(windows))]
 pub fn relaunch_after_exit(_app: &Path) -> Result<(), String> {
     Err(NOT_YET.into())

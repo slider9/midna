@@ -75,10 +75,30 @@ the folder to `%LOCALAPPDATA%\Programs\Midna` and run `midna-app.exe`. On each l
 - registers the login entry and starts midnad if it isn't answering;
 - copies the `midna` CLI into `~\.local\bin` when that folder is on PATH.
 
-There's no installer or updater yet. `midna-app.exe --uninstall` (also what Settings ▸ Apps'
-Uninstall runs) quits the running app (it would start midnad again), stops midnad (closing its
-terminals) and removes the login entry, the CLI copy, the Start menu entry and the Settings ▸
-Apps entry, but leaves the folder and the home.
+There's no installer yet. `midna-app.exe --uninstall` (also what Settings ▸ Apps' Uninstall
+runs) quits the running app (it would start midnad again), stops midnad (closing its terminals)
+and removes the login entry, the CLI copy, the Start menu entry and the Settings ▸ Apps entry.
+Once it has exited, a copy of it in `%TEMP%` (`--remove-install <folder> --wait <pid>`) removes
+the build's own files from the folder (`update_windows::remove_install`: the executables,
+ConPTY, `Fonts`, the marker last) and the folder once it's empty; anything else in it stays. The
+home stays.
+
+**Updates** (`updater.rs`, then `update_windows.rs`). A build with an update key reads
+`windows-<channel>.json`, checks its `midna-update-v2` signature against the key list and its
+version, OS, arch and `minimum_windows`, and downloads the zip to `MIDNA_HOME\updates\<version>\`,
+as macOS does. It unpacks it with the zip crate (no paths outside the folder, no links, 2 GiB at
+most) and checks the build: `midna-bundle.txt` is there and its `midnad.exe --selftest` reports
+the feed's version. Then Settings and the status bar say "Update ready", as on macOS. Restart to
+apply (or quitting) starts the staged `midna-app.exe --apply-update <install folder> --wait
+<pid>` and the app quits. That helper waits for it to exit, copies each new file in beside its
+old one as `<name>.new`, then one by one renames the old file to `<name>.old` (Windows renames a
+running exe) and the new one into place, `midna-bundle.txt` last; if any rename fails it renames
+everything back. It starts the app (new or old) and exits. The new app deletes the `.old` files
+and the staged builds no newer than itself, and starts as usual, which brings midnad onto its
+build. An update that wasn't installed leaves its error in `updates\apply-failed.txt`, and the
+app it started shows it as a failed check. `midna-app.exe --quit` (a script about to change the
+install) leaves a ready update for next time. Builds aren't Authenticode-signed yet, so there's
+no signer check; the signed feed pins the zip's sha256.
 
 One app runs per `MIDNA_HOME`. At launch the app creates a named event,
 `Local\midna-app-show-<hash of MIDNA_HOME>` (`instance.rs`). When it's already there, another
@@ -278,8 +298,8 @@ In rough order of how much they matter:
 3. **Shell integration, what's left.** A PowerShell alias for `claude` that names a full path skips the shims, and a profile that rebinds Enter to its own handler gets no output mark. Git Bash and cmd have no prompt marks: each prints its prompt in one write, which ConPTY would reorder. Marks depend on ConPTY painting within 15 ms, so on a very busy machine one may land early.
 4. **Installing and upgrading.** midnad starts at login and the app installs itself on launch
    (see Installing), but:
-   - There's no installer and no updater (the updater reports itself off: no update key).
-     Uninstalling from Settings ▸ Apps leaves the app's folder (and the home) behind.
+   - There's no installer. The updater works (see Installing), but `packaging/build-windows.sh`
+     embeds no update key yet, so a build from it reports updates off.
    - **Upgrades.** A new build can't take over a running daemon's terminals: a pseudoconsole dies
      with the process that made it. Until each terminal gets a keeper process that outlives
      midnad, `daemon.upgrade` and `daemon.restart` wait until every agent is idle (the queued
