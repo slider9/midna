@@ -17,7 +17,7 @@ use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
@@ -129,6 +129,14 @@ impl Shell {
             unsafe { TerminateJobObject(raw(job), code) };
         }
     }
+
+    /// Let what's still in the job outlive the job's handle, for a keeper that exits on purpose
+    /// (the shell exited, or a plain hang-up): only a keeper that dies takes them with it.
+    pub fn release_job(&self) {
+        if let Some(job) = &self.job {
+            limits(job, JOB_OBJECT_LIMIT_BREAKAWAY_OK);
+        }
+    }
 }
 
 impl Drop for Shell {
@@ -210,11 +218,19 @@ fn job() -> Option<OwnedHandle> {
     unsafe {
         let job = owned(CreateJobObjectW(std::ptr::null(), std::ptr::null())).ok()?;
         // A process may still leave the session on purpose (CREATE_BREAKAWAY_FROM_JOB), like a
-        // Unix process that calls setsid.
-        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
-        SetInformationJobObject(raw(&job), JobObjectExtendedLimitInformation, &info as *const _ as *const _, std::mem::size_of_val(&info) as u32);
+        // Unix process that calls setsid. The keeper holds the only handle, so if it dies, all
+        // that's still in the job (the shell and what it started) goes with it; one that exits
+        // on purpose lets them be first (`release_job`).
+        limits(&job, JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
         Some(job)
+    }
+}
+
+fn limits(job: &OwnedHandle, flags: u32) {
+    unsafe {
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = flags;
+        SetInformationJobObject(raw(job), JobObjectExtendedLimitInformation, &info as *const _ as *const _, std::mem::size_of_val(&info) as u32);
     }
 }
 

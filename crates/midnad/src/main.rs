@@ -138,9 +138,10 @@ fn main() {
             let c = &h.daemon.cfg;
             eprintln!("midnad {} listening on {} (home {}, pid {})", midna_proto::VERSION, c.socket.display(), c.home.display(), std::process::id());
             #[cfg(windows)]
-            match &midnad::pty::conpty().dll {
-                Some(dll) => eprintln!("midnad: terminals run in {}", dll.display()),
-                None => eprintln!("midnad: terminals run in Windows' own ConPTY"),
+            match (midnad::pty::keeper_exe(), midnad::pty::conpty_dll()) {
+                (Err(e), _) => eprintln!("midnad: no terminal will start: {e}"),
+                (Ok(k), Some(dll)) => eprintln!("midnad: terminals run in {}, each kept by {}", dll.display(), k.display()),
+                (Ok(k), None) => eprintln!("midnad: terminals run in Windows' own ConPTY, each kept by {}", k.display()),
             }
             // Children nothing waits for, such as ones still running when an upgrade exec'd.
             // (Windows keeps no zombies.)

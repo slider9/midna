@@ -1287,6 +1287,9 @@ pub fn on_exit(d: &Arc<Daemon>, sid: &str, generation: u64, code: Option<i32>, s
         // `session.close` sends. Neither is a failure worth a needs-you item.
         (Some(130), _) | (None, Some(crate::sys::SIGINT)) => (StatusState::Exited, "exited (interrupted)".to_string()),
         (None, Some(crate::sys::SIGHUP)) => (StatusState::Exited, "exited (hung up)".to_string()),
+        // The keeper holding a Windows terminal's console died (pty_windows.rs).
+        #[cfg(windows)]
+        (None, Some(crate::pty::HOST_EXITED)) => (StatusState::Failed, "terminal host exited".to_string()),
         (Some(c), _) => (StatusState::Failed, format!("exited with code {c}")),
         (None, Some(sig)) => (StatusState::Failed, format!("killed by signal {sig}")),
         _ => (StatusState::Exited, "exited".to_string()),

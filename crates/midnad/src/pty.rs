@@ -1,6 +1,7 @@
 //! PTY spawn / resize / write. Spawning uses `std::process::Command` (PATH lookup, env, cwd)
 //! with a `pre_exec` that makes the slave the controlling terminal of a new session. Windows
-//! uses a pseudoconsole instead (`pty_windows.rs`), behind the same [`Master`] / [`Spawned`] API.
+//! runs each terminal's pseudoconsole in a keeper process instead (`pty_windows.rs`), behind the
+//! same [`Master`] / [`Spawned`] API.
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
@@ -15,7 +16,7 @@ use std::time::{Duration, Instant};
 #[path = "pty_windows.rs"]
 mod windows;
 #[cfg(windows)]
-pub use windows::{FILES as CONPTY_FILES, Master, Spawned, Writer, command_line, conpty, spawn, wait_exit, which};
+pub use windows::{FILES as CONPTY_FILES, HOST_EXITED, Master, Owner, Spawned, Writer, command_line, conpty_dll, end_leftover_keepers, keeper_exe, spawn, which};
 
 /// The most unread input a terminal holds. macOS stops taking a write here, wherever in the
 /// write that falls.

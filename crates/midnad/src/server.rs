@@ -108,13 +108,16 @@ pub fn hangup_all(rts: &[crate::term::RtHandle]) {
     }
 }
 
-/// Windows: close every terminal's pseudoconsole (CTRL_CLOSE_EVENT to everything attached),
-/// then end each session's job if its app is still running after the grace period.
+/// Windows: hang up every terminal (its keeper closes the pseudoconsole: CTRL_CLOSE_EVENT to
+/// everything attached), then end each session's job: the keeper does once the shell has
+/// exited, and midnad asks it to if the shell is still running after the grace period. Then
+/// wait for the keepers to be gone, so nothing of a stopped midnad is left running.
 #[cfg(windows)]
 pub fn hangup_all(rts: &[crate::term::RtHandle]) {
     const GRACE: Duration = Duration::from_millis(1500);
+    const KEEPERS: Duration = Duration::from_secs(5);
     for rt in rts {
-        rt.fd.hangup();
+        rt.fd.hangup_and_end();
     }
     let t0 = std::time::Instant::now();
     while t0.elapsed() < GRACE && rts.iter().any(|r| r.fd.child_alive()) {
@@ -122,6 +125,10 @@ pub fn hangup_all(rts: &[crate::term::RtHandle]) {
     }
     for rt in rts {
         rt.fd.kill_all();
+    }
+    let t0 = std::time::Instant::now();
+    for rt in rts {
+        rt.fd.wait_keeper(KEEPERS.saturating_sub(t0.elapsed()));
     }
 }
 
@@ -191,6 +198,12 @@ pub fn start_with(mut cfg: Config, resume: Option<crate::upgrade::Resume>) -> st
         Some(l) => l,
         None => bind(&d.cfg.socket, &d.cfg.home)?,
     };
+    // Windows: what a crashed midnad's keepers still run is ended before any terminal reopens
+    // (only once the socket is ours, so a running midnad's terminals are never touched).
+    #[cfg(windows)]
+    if resume.is_none() {
+        crate::pty::end_leftover_keepers(&d.cfg.home);
+    }
     #[cfg(unix)]
     d.listener_fd.store(std::os::fd::AsRawFd::as_raw_fd(&listener), Ordering::SeqCst);
     crate::hooks::write_claude_settings(&d);

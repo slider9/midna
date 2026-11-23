@@ -6,7 +6,8 @@
 //! `spawn` (the shell's argv, folder, environment and size never go on the command line); later
 //! ones attach to the same shell. Once the shell runs, the keeper records itself in
 //! `MIDNA_HOME\pty\<session id>.json`; it exits once the shell has exited and a client has been
-//! told the code (`exited`), or once the shell has ended after `hangup` or `kill`, and removes
+//! told the code (`exited`), or once the shell has ended after `hangup` (ending the job first when
+//! it was asked to) or `kill`, and removes
 //! the record then. What it does goes to `MIDNA_HOME\pty\keeper.log`.
 use crate::names::{self, Record};
 use crate::proto::{self, PROTOCOL, Reply, Request};
@@ -73,11 +74,13 @@ pub fn run(args: &[String]) -> i32 {
         pipe,
         own_dir: exe.parent().map(Path::to_path_buf).unwrap_or_default(),
         exe,
+        creator: win::Creator::find(),
         log,
         shell: OnceLock::new(),
         exit_code: Mutex::new(None),
         conn: Mutex::new(None),
         ending: AtomicBool::new(false),
+        end_job: AtomicBool::new(false),
         collected: AtomicBool::new(false),
         finishing: AtomicBool::new(false),
         closing: AtomicBool::new(false),
@@ -96,6 +99,8 @@ struct Keeper {
     pipe: Pipe,
     exe: PathBuf,
     own_dir: PathBuf,
+    /// The process that started this keeper. It may drive it whatever program it runs.
+    creator: Option<win::Creator>,
     log: Log,
     shell: OnceLock<Arc<Shell>>,
     exit_code: Mutex<Option<u32>>,
@@ -103,6 +108,8 @@ struct Keeper {
     conn: Mutex<Option<Conn>>,
     /// `hangup` or `kill` was asked for: exit once the shell has, told or not.
     ending: AtomicBool,
+    /// `hangup` with `end_job`: end the job before exiting.
+    end_job: AtomicBool,
     /// A client was sent `exited`.
     collected: AtomicBool,
     finishing: AtomicBool,
@@ -191,8 +198,13 @@ impl Keeper {
         }
     }
 
-    /// A client must be midnad from this home's `bin` (any version) or from beside the keeper.
+    /// A client must be midnad from this home's `bin` (any version) or from beside the keeper,
+    /// or the process that started the keeper. That one is held open, so its pid is still its
+    /// own.
     fn allowed(&self, pid: u32) -> Result<(), String> {
+        if self.creator.as_ref().is_some_and(|c| c.pid == pid) {
+            return Ok(());
+        }
         let image = win::process_image(pid).ok_or("can't see its program")?;
         let real = midna_proto::paths::canonical(&image).unwrap_or(image);
         let name = real.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -298,10 +310,13 @@ impl Keeper {
                 Ok(Reply::Resize {})
             }
             Request::Snapshot => Ok(Reply::Snapshot(console::snapshot(&*shell()?)?)),
-            Request::Hangup => {
+            Request::Hangup { end_job } => {
                 let s = shell()?;
+                if end_job {
+                    self.end_job.store(true, Ordering::SeqCst);
+                }
                 self.ending.store(true, Ordering::SeqCst);
-                self.log.line(&format!("hangup from pid {client}"));
+                self.log.line(&format!("hangup{} from pid {client}", if end_job { ", ending the job," } else { "" }));
                 self.close_console(!self.client_reads());
                 let k = self.clone();
                 std::thread::spawn(move || {
@@ -403,6 +418,16 @@ impl Keeper {
     fn finish(self: &Arc<Self>) {
         if self.finishing.swap(true, Ordering::SeqCst) {
             return;
+        }
+        // What the shell started and left running goes too when asked, and with it the console
+        // host; otherwise it stays, as it would without a keeper: the job only ends what's in it
+        // when the keeper dies.
+        if let Some(s) = self.shell.get() {
+            if self.end_job.load(Ordering::SeqCst) {
+                s.kill(1);
+            } else {
+                s.release_job();
+            }
         }
         if !self.wait_closed(CLOSE_STALL) {
             if !self.client_reads() {

@@ -128,11 +128,11 @@ fn codex_notify_replay_skips_title_turn() {
     assert!(ev[0]["data"]["prompt"].as_str().unwrap().contains("echo midna-codex-two"));
 }
 
-/// Terminals run in Windows' own ConPTY, not the `conpty.dll` midnad uses when it has one
+/// Terminals run in Windows' own ConPTY, not the `conpty.dll` their keeper runs when it has one
 /// (`pty_windows.rs`): Windows 10's keeps an app's kitty keyboard push to itself.
 fn old_conpty() -> bool {
     #[cfg(windows)]
-    return midnad::pty::conpty().dll.is_none();
+    return midnad::pty::conpty_dll().is_none();
     #[cfg(not(windows))]
     return false;
 }

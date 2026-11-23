@@ -58,6 +58,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_WindowsProgramming",
     "Win32_UI_Shell",
 ] }
+# The terminal keeper's client: every Windows terminal runs in a midna-pty.exe (src/pty_windows.rs).
+midna-pty = { path = "../midna-pty" }
 # midnad's own toasts (src/notify_windows.rs), through WinRT: the version the app uses.
 windows = { version = "0.62", features = ["UI_Notifications", "Data_Xml_Dom", "Foundation_Collections"] }
 

@@ -179,3 +179,55 @@ fn user_sid() -> io::Result<String> {
         Ok(out)
     }
 }
+
+/// The process that started this one, held open so its pid can't go to another process while
+/// we look at it: None if it has exited already, or a process with its pid started after us
+/// (the pid was reused).
+pub struct Creator {
+    pub pid: u32,
+    _process: OwnedHandle,
+}
+
+impl Creator {
+    pub fn find() -> Option<Creator> {
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
+        use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+        let me = std::process::id();
+        // SAFETY: a snapshot we own, walked with a sized entry; plain calls on handles we own.
+        unsafe {
+            let snap = owned(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)).ok()?;
+            let mut e: PROCESSENTRY32W = std::mem::zeroed();
+            e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let mut ok = Process32FirstW(raw(&snap), &mut e) != 0;
+            let mut parent = None;
+            while ok {
+                if e.th32ProcessID == me {
+                    parent = Some(e.th32ParentProcessID);
+                    break;
+                }
+                ok = Process32NextW(raw(&snap), &mut e) != 0;
+            }
+            let pid = parent.filter(|&p| p != 0)?;
+            let process = owned(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid)).ok()?;
+            // A parent pid isn't kept up to date: a process that started after us under that
+            // pid isn't the one that started us.
+            if started(raw(&process))? > started(GetCurrentProcess())? {
+                return None;
+            }
+            Some(Creator { pid, _process: process })
+        }
+    }
+
+}
+
+/// When the process `h` started (FILETIME ticks).
+fn started(h: HANDLE) -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+    let z = || FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut c, mut x, mut k, mut u) = (z(), z(), z(), z());
+    if unsafe { GetProcessTimes(h, &mut c, &mut x, &mut k, &mut u) } == 0 {
+        return None;
+    }
+    Some((c.dwHighDateTime as u64) << 32 | c.dwLowDateTime as u64)
+}
