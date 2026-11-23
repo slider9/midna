@@ -202,9 +202,16 @@ Ctrl+Shift+J, Ctrl+Alt+T …), Ctrl+, opened Settings, Ctrl+] stepped to Shortcu
 Windows keys), and Ctrl+Shift+W closed Settings and then the terminal. Not checked by hand yet:
 copying with Ctrl+C, pasting, Ctrl+Tab.
 
-Still in macOS wording: setting descriptions in the catalog, the Settings blurbs, the setup screen
-and most of the remaining hints (about 450 strings with ⌘ or ⌥, a third of them in tests). The
-shortcut list and the menus and hints you see most are done.
+Text that names keys or the platform is picked when it's compiled: `midna_proto::wording::os(mac,
+other)` gives the macOS literal on macOS and the Windows one elsewhere, so macOS text stays exactly
+as written and `static` tables keep `&'static str`. `wording` also has the names for text put
+together at run time (`MAC` "PC", `FINDER` "File Explorer", `SYSTEM_SETTINGS`, `LOGIN_ITEMS`
+"Settings ▸ Apps ▸ Startup"). The setting descriptions (`settings.rs`), the Settings window's
+labels, rows and blurbs use it: ⌘K reads Ctrl+Shift+K, ⌘↩ Ctrl+Enter, ⌘V Ctrl+V, ⌘-click
+Ctrl+click, Mac PC, Finder File Explorer, macOS banners Windows notifications, and keep-awake,
+memory and background mode say what midnad does on Windows. Settings ▸ Nearby is hidden there,
+so its text still says Mac. Still in macOS wording: the setup screen and most of the remaining
+hints and menus.
 
 ## What works (verified on Windows 10 19045)
 
@@ -240,8 +247,10 @@ shortcut list and the menus and hints you see most are done.
 
 In rough order of how much they matter:
 
-1. **macOS wording.** The shortcuts work (see Shortcuts), but setting descriptions, blurbs, the setup
-   screen and many hints still say ⌘ and ⌥.
+1. **macOS wording.** The shortcuts work and Settings says Windows' keys and names (see Shortcuts),
+   but the setup screen, menus and many hints still say ⌘ and ⌥. Settings rows for what Windows
+   doesn't have yet say so (File Explorer's “Open in Midna”, waking for scheduled work, noticing a
+   crash); the Accessibility row still shows, always granted.
 2. **Integration tests: the product gaps they show.** The tests run on Windows through the helpers in `crates/midnad/tests/common/mod.rs` (and midna-cli's): `tmp()`, `sh()` and `posix_bin()` (Git for Windows' `usr\bin` tools, as 8.3 paths), `script()` (a `.sh` with a `.cmd` that runs it), and a copy of the test binary standing in for `nc -U`. Each test binary sets `MIDNA_SHELL` to Git's `sh`, so one-line commands get a POSIX shell as on macOS. What's Unix only is `cfg(unix)` with its reason: `shell_integration.rs`, in-place upgrade and restart (`upgrade.rs` checks the refusal instead), file modes, `/` as the root, and `adopt.rs`, whose fake agents are sh scripts (`adopt_windows.rs` covers Windows). The tests that still fail do so on the product:
    - **`.cmd` agents** used to get broken arguments: a `.cmd` ran as `cmd /d /s /c "…"`, and cmd drops every argument after a newline (Claude's system hint) and acts on `|`, `<`, `>` and `&` inside them (Codex's hint). Now a `.cmd` or `.bat` that is only a shim (npm's cmd-shim output, as in `claude.cmd` and `codex.cmd`, or one line ending in `%*` such as the tests' fake agents) is read and its program started directly, with the arguments quoted for it (`midna_proto::cmd_shim`). That covers terminals, typed `claude`/`codex` (`midna shim`) and the Codex notify command chained after midna's. npm's shim runs the `node.exe` beside it when there is one, else `node` from PATH. Any other batch file still runs through cmd, with the old limits. agent_args, global_hooks and agent_screen_prompts pass.
    - **Windows 10's own ConPTY**, used when the newer one isn't beside midnad (a cargo build without `.toolchain/conpty`), drops faint text (SGR 2), so Claude's dim placeholder reads as typed text and a queued restart waits forever (restart_queue). It also clears a new terminal's screen, so an exited agent's last screen isn't kept above its shell (shell_on_exit). That screen was also how midna told a "No" typed into Claude's folder-trust dialog from a "Yes"; it now also checks that the agent is still running (`trust::confirm`). It keeps an app's kitty keyboard push, and probably its mouse mode, to itself (prompt jumps in a full-screen view fail; the Enter tests expect legacy keys on it). Its first title is the program's path. The newer ConPTY fixes the rest (the title wasn't checked on it): restart_queue, shell_on_exit, the jumps and the kitty Enter tests pass on it. With real Claude in Midna Dev, a queued prompt and its follow-up were both typed and answered.
@@ -255,8 +264,8 @@ In rough order of how much they matter:
    - A new build can't take over a running daemon: `daemon.upgrade` is refused, the app says
      so, and the old daemon runs until it's stopped, which closes its terminals. Keeping them
      would need a separate pty-host process that owns the ConPTYs.
-   - The login-entry wording in the app (onboarding, Settings ▸ General) still says System
-     Settings ▸ Login Items.
+   - The setup screen's login-entry wording still says System Settings ▸ Login Items (Settings ▸
+     System says Settings ▸ Apps ▸ Startup).
 5. **App stubs.** Badge, twilight, Kass composer, haptics and app link previews are missing. Commands that only exist on macOS (`sips`, `plutil`, `mdfind`, `xed`, `open -a`, `defaults`) do nothing, and menus and text still use macOS wording. Notifications show as toasts, but:
    - midnad's own notifications (`via: system`, no app connected) use osascript and afplay, so on Windows nothing shows.
    - Starting the app from a click after it quit is registered only by an installed Midna's release build (`LocalServer32`), and hasn't been tried: Midna Dev and debug builds don't register it, so their toasts do nothing then. A dismissal while the app isn't running isn't reported.

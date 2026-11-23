@@ -30,6 +30,7 @@ pub mod system;
 pub mod themes;
 pub mod time;
 pub mod types;
+pub mod wording;
 
 pub use catalog::{MethodSpec, catalog, method};
 pub use cleanup::{
