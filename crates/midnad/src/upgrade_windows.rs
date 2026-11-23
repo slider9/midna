@@ -538,8 +538,10 @@ fn reopen(d: &Arc<Daemon>, plan: &Plan, p: &PlanSession) -> Option<Value> {
     let reason = format!("midna {}", plan.reason);
     let (resume, on, line) = match &p.reopen {
         Reopen::No => return Some(json!({ "session": p.id, "name": p.name, "reopened": false, "said": format!("{}: not reopened (a monitor's command may not be safe to run again)", p.name) })),
-        Reopen::Agent { resume } => (*resume, crate::rpc::session::RestartOn::default(), None),
-        Reopen::Shell => (false, crate::rpc::session::RestartOn { snap: p.term.clone(), cwd: p.cwd.clone() }, None),
+        // Without its conversation an agent starts again without its first prompt, so an idle
+        // agent doesn't redo its task.
+        Reopen::Agent { resume } => (*resume, crate::rpc::session::RestartOn { no_prompt: true, ..Default::default() }, None),
+        Reopen::Shell => (false, crate::rpc::session::RestartOn { snap: p.term.clone(), cwd: p.cwd.clone(), no_prompt: false }, None),
         Reopen::Adopted { line, resume } => {
             // The shell comes back as a shell; the agent is typed into it once it's up.
             {
@@ -553,14 +555,17 @@ fn reopen(d: &Arc<Daemon>, plan: &Plan, p: &PlanSession) -> Option<Value> {
                 core.agents.remove(&p.id);
             }
             d.mark_dirty();
-            (*resume, crate::rpc::session::RestartOn { snap: p.term.clone(), cwd: p.cwd.clone() }, line.clone())
+            (*resume, crate::rpc::session::RestartOn { snap: p.term.clone(), cwd: p.cwd.clone(), no_prompt: false }, line.clone())
         }
     };
     let r = crate::rpc::session::restart_on(d, &p.id, resume, &reason, Actor::system(), on);
     let said = match (&r, &p.reopen) {
         (Err(e), _) => format!("{}: not reopened: {}", p.name, e.message),
-        (Ok(_), Reopen::Agent { resume: true }) => format!("{}: the agent reopened in its conversation", p.name),
-        (Ok(_), Reopen::Agent { resume: false }) => format!("{}: the agent started again (it had no conversation to reopen)", p.name),
+        // restart_on starts fresh when the conversation was never saved.
+        (Ok(_), Reopen::Agent { resume }) if *resume && s.agent_info.as_ref().is_none_or(crate::agent_work::has_transcript) => {
+            format!("{}: the agent reopened in its conversation", p.name)
+        }
+        (Ok(_), Reopen::Agent { .. }) => format!("{}: the agent started again without its first prompt (it had no conversation to reopen)", p.name),
         (Ok(_), Reopen::Adopted { line: Some(_), resume }) => {
             format!("{}: the shell reopened{}, and {} was typed into it{}", p.name, folder(p), s.agent.map_or("the agent", |a| a.as_str()), if *resume { " to reopen its conversation" } else { "" })
         }

@@ -1108,6 +1108,9 @@ pub struct RestartOn {
     pub snap: Option<crate::engine::TermSnap>,
     /// A folder other than the session's own.
     pub cwd: Option<String>,
+    /// An agent that doesn't resume starts without its first prompt (its own arguments stay),
+    /// so it doesn't do that task again.
+    pub no_prompt: bool,
 }
 
 /// `restart_now`, on top of `on.snap` and in `on.cwd` when given (Windows: a terminal reopened
@@ -1131,6 +1134,10 @@ pub fn restart_on(d: &Arc<Daemon>, sid: &str, resume: bool, reason: &str, actor:
             let args = midna_proto::agent_cli::resume_args(agent, &midna_proto::agent_cli::Spec::builtin(agent), &s.agent_args);
             let base = launch_command(d, agent, &args, None, None, &env, was_supervised(&s.command), &s.cwd);
             crate::agent_work::resume_command(agent, &base, &info).ok_or_else(|| RpcError::conflict(format!("session {sid} has no conversation to resume")))?
+        }
+        Some(agent) if on.no_prompt => {
+            let args = midna_proto::agent_cli::resume_args(agent, &midna_proto::agent_cli::Spec::builtin(agent), &s.agent_args);
+            launch_command(d, agent, &args, None, None, &env, was_supervised(&s.command), &s.cwd)
         }
         _ => s.command.clone(),
     };

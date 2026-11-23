@@ -643,7 +643,8 @@ fn upgrade_waits_for_idle_agents_then_reopens_terminals_on_windows() {
     assert!(note["detail"].as_str().unwrap().contains("reopened in its conversation"), "{note}");
 }
 
-/// `force` doesn't wait for the agents; a binary that fails its selftest changes nothing.
+/// `force` doesn't wait for the agents; a binary that fails its selftest changes nothing. An
+/// agent with no conversation to reopen starts again without its first prompt.
 #[cfg(windows)]
 #[test]
 fn forced_restart_goes_at_once_and_a_bad_binary_is_refused_on_windows() {
@@ -651,6 +652,8 @@ fn forced_restart_goes_at_once_and_a_bad_binary_is_refused_on_windows() {
     let (d, shell, agent, _) = busy_daemon(&fake);
     let mut c = d.human();
     let pid0 = d.info()["pid"].as_i64().unwrap();
+    let fresh = call(&mut c, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": common::tmp(), "prompt": "second task" }))["id"].as_str().unwrap().to_string();
+    wait_for(10, "the second agent started", || (fake.launches().len() >= 2).then_some(()));
 
     let bad = d.home.join("bad.cmd");
     std::fs::write(&bad, "@exit /b 3\r\n").unwrap();
@@ -667,8 +670,13 @@ fn forced_restart_goes_at_once_and_a_bad_binary_is_refused_on_windows() {
     let up = d.wait_upgraded(1);
     assert_eq!(up["reason"], "restart", "{up}");
     assert_ne!(d.info()["pid"].as_i64(), Some(pid0));
+    let said = up["sessions"].as_array().unwrap().iter().find(|s| s["session"] == json!(fresh)).map(|s| s["said"].to_string());
+    assert!(said.as_deref().is_some_and(|s| s.contains("without its first prompt")), "{up}");
     let mut c = d.human();
-    for id in [&shell, &agent] {
+    wait_for(15, "both agents launched again", || (fake.launches().len() >= 4).then_some(()));
+    let launches = fake.launches();
+    assert_eq!(launches.iter().filter(|l| l.contains("second task")).count(), 1, "the first prompt isn't sent again: {launches:?}");
+    for id in [&shell, &agent, &fresh] {
         let s = wait_for(10, "reopened", || {
             let s = call(&mut c, "session.get", json!({ "id": id }));
             s["pid"].as_i64().map(|_| s)
