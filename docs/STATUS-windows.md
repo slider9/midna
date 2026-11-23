@@ -97,8 +97,10 @@ To try a change in a real app, `scripts/dev-app-windows.sh` (the Windows `dev-ap
 - an inverted icon (`packaging/assets/MidnaDev.ico`) and the Gruvbox theme.
 
 It quits the running copy with `midna-app.exe --quit` and starts the new one through Explorer.
-midnad can't upgrade in place on Windows, so a running daemon stays on its old build (the app
-says so); `--restart-daemon` stops it first, which closes its terminals.
+midnad can't upgrade in place on Windows. The new app asks the running daemon to move onto its
+build, and that daemon restarts once every agent is idle, reopening each terminal (see "Upgrades"
+under "Not done yet"). A daemon from before that refuses, and stays on its old build until it's
+stopped (the app says so); `--restart-daemon` stops it first, which closes its terminals.
 
 Windows won't rename or delete a folder that a running process works in. midnad used to keep the
 working folder it was started in, which was the app's folder when the app started it, so the
@@ -149,7 +151,7 @@ would build them in with `\r\n`.
 | Installed binaries | `bin/current` symlink | `bin/current` is a text file naming the version dir; midnad finds `midna.exe` there (`install::current_cli`) or next to itself. The global hooks run `bin\midna.exe`, a copy each install refreshes (`install::stable_cli`) |
 | Typed `claude` / `codex` (adopt) | sh shims in `MIDNA_HOME/shims` | the sh shims for Git Bash, plus `claude.exe` and `codex.exe` there: copies of midna.exe that run as `midna shim <agent>` under those names (`adopt::exe_shims`, refreshed when midna.exe changes; a running one is renamed aside). Every shell runs them, cmd included, with no argument mangling. `midna-shims.txt` marks the dir so the shim never takes one for the real agent |
 | Shell integration | zsh (`ZDOTDIR`), bash (`--init-file`) and fish (`XDG_DATA_DIRS`) run midna's startup file: shims kept first on PATH, `claude`/`codex` aliases routed through them; zsh marks its prompt (OSC 133) | **PowerShell** (5.1 and 7) starts with `-NoExit -EncodedCommand`, a command that runs `shell/powershell/midna.ps1` after the profiles (no execution policy applies to it). Its wrapper around the user's prompt keeps the shims first, makes PowerShell's location the process's working folder (`Set-Location` never changes it, and midna reads a terminal's folder from there), and marks the prompt and input (OSC 133 A, B). With PSReadLine, Enter marks the output (C) unless the command is unfinished. ConPTY on Windows 10 passes a mark on at once but text on its next paint, so a mark written with text arrives ahead of it: each mark is written on its own, after a 15 ms pause. **Git Bash** gets `init.bash` as bash does on macOS (matched by program name, `bash.exe`), with `MIDNA_SHIMS` turned into a `/c/…` path by `cygpath`. Like bash on macOS it has no marks. Its `cd` moves the process's folder. **cmd**: the shims are first on PATH at start, and `cd` moves the folder |
-| In-place upgrade / restart | exec with the same pid, terminals kept | refused (`upgrade_windows.rs`): no exec on Windows. Stop the daemon and start the new one |
+| In-place upgrade / restart | exec with the same pid, terminals kept | no exec on Windows: once every agent is idle a new midnad starts and reopens each terminal (`upgrade_windows.rs`); what ran in a shell is lost |
 | Agents' config folders | `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, else `~/.claude` / `~/.codex` under `$HOME` | the same, with `~` as `%USERPROFILE%` (`paths::home_var`, as everywhere midna expands `~/`). A midnad started at login has no `HOME` (Git Bash sets one, Windows doesn't), and it looked for a relative `.claude`, so Settings ▸ Agents said Claude Code wasn't set up |
 | Codex `notify` | `sh -c` wrapper chains the previous notify | `midna.exe hook codex notify [--global] -- PREV…`; the CLI runs PREV with the payload |
 | Title bar | hidden; AppKit draws the traffic lights and drags by the top | hidden; `ui/caption.rs` draws a 32px row above each window: the caption (`WindowControlArea::Drag`: move, Snap, double-click) and minimise / maximise / close |
@@ -278,9 +280,18 @@ In rough order of how much they matter:
    (see Installing), but:
    - There's no installer and no updater (the updater reports itself off: no update key).
      Uninstalling from Settings ▸ Apps leaves the app's folder (and the home) behind.
-   - A new build can't take over a running daemon: `daemon.upgrade` is refused, the app says
-     so, and the old daemon runs until it's stopped, which closes its terminals. Keeping them
-     would need a separate pty-host process that owns the ConPTYs.
+   - **Upgrades.** A new build can't take over a running daemon's terminals: a pseudoconsole dies
+     with the process that made it. Until each terminal gets a keeper process that outlives
+     midnad, `daemon.upgrade` and `daemon.restart` wait until every agent is idle (the queued
+     restart's checks in `restart.rs`; Settings says what it waits for and offers Restart now,
+     which is `force`). Then the old midnad writes `handoff\relaunch.json`, starts the new one,
+     which waits for it to exit, and stops, which closes every terminal. The new one reopens
+     each under its id (`upgrade_windows.rs`): a shell in the folder it was in, below its old
+     screen; an agent in its conversation; a `claude` typed into a shell by typing it again
+     there. Whatever ran in a shell is lost, and a monitor isn't reopened (its command may not
+     be safe to run again). `daemon.upgraded` and a needs-you note say what was reopened. A new
+     midnad that dies first leaves the plan for the next one to start. With Windows 10's own
+     ConPTY an agent never looks idle (see above), so only `force` restarts.
 5. **App stubs.** Twilight, Kass composer, haptics and app link previews are missing. Commands that only exist on macOS (`sips`, `plutil`, `mdfind`, `xed`, `open -a`, `defaults`) do nothing. Notifications show as toasts, but:
    - Starting the app from a click after it quit (on the app's toast or midnad's) is registered by release builds, Midna and Midna Dev (`LocalServer32`), and hasn't been tried. Debug builds don't register it, so a click then does nothing, or starts Midna Dev, whose class they share. A dismissal while the app isn't running isn't reported.
    - A toast holds at most 5 buttons, so `notify send` with 6 loses the last one.

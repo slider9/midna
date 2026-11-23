@@ -3,8 +3,9 @@
 //!
 //! Every test runs its own daemon on a temp MIDNA_HOME; this test binary is the "GUI" (human).
 //!
-//! Windows can't upgrade or restart in place (no exec; see `src/upgrade_windows.rs`), so only
-//! the tests that don't swap the binary run there, plus one that checks the refusal.
+//! Windows can't upgrade or restart in place (no exec; see `src/upgrade_windows.rs`): there the
+//! tests that don't swap the binary run, plus the ones for its stopgap, a restart once every
+//! agent is idle that reopens each terminal.
 mod common;
 use midna_proto::{Client, ClientError};
 use serde_json::{Value, json};
@@ -58,6 +59,11 @@ impl Bin {
 
     /// The daemon reports this load average.
     fn start_with_load(load1: f64) -> Bin {
+        Bin::start_with(load1, &[])
+    }
+
+    /// The daemon reports this load average, and gets `env` too.
+    fn start_with(load1: f64, env: &[(&str, String)]) -> Bin {
         let home = common::tmp().join(format!("midna-u-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
@@ -77,6 +83,7 @@ impl Bin {
             .env("MIDNA_NOTIFY_SYSTEM", "0")
             .env("MIDNA_UPGRADE_WATCHDOG_SECS", "5")
             .env("MIDNA_DEBUG_LOAD", load1.to_string())
+            .envs(env.iter().map(|(k, v)| (*k, v)))
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
             .stderr(log)
@@ -109,14 +116,11 @@ impl Bin {
         call(&mut self.human(), "daemon.info", json!({}))
     }
 
-    // Only the in-place upgrade tests (Unix only) read the log or wait for an upgrade.
-    #[cfg(unix)]
     fn log(&self) -> String {
         std::fs::read_to_string(self.home.join("daemon.log")).unwrap_or_default()
     }
 
     /// Wait for the n-th `daemon.upgraded` event and return its data.
-    #[cfg(unix)]
     fn wait_upgraded(&self, n: usize) -> Value {
         wait_for(20, "daemon.upgraded", || {
             let mut c = Client::connect(self.socket()).ok()?;
@@ -510,24 +514,173 @@ fn a_busy_mac_postpones_the_upgrade_unless_forced() {
     assert_eq!(d.info()["pid"].as_i64().unwrap(), pid0);
 }
 
-/// Windows has no exec, and a pseudoconsole dies with the process that made it, so midnad
-/// can't swap itself in place: the human's `daemon.upgrade` and `daemon.restart` are refused,
-/// saying what to do instead, and the daemon goes on as it was.
+/// Windows: a stand-in for `claude` that records its argv and draws Claude's input box with a
+/// faint placeholder, so midnad reads the box as empty (on the newer ConPTY; Windows 10's own
+/// drops faint text, and the agent never looks idle).
+#[cfg(windows)]
+struct FakeClaude {
+    dir: PathBuf,
+}
+
+#[cfg(windows)]
+impl FakeClaude {
+    fn new(tag: &str) -> FakeClaude {
+        let dir = common::tmp().join(format!("midna-uf-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rule = "─".repeat(40);
+        let body = format!(
+            "case \"$1\" in --version) echo '2.1.289 (Claude Code)'; exit 0;; esac\n\
+             echo \"$@\" >> '{d}/argv'\n\
+             printf '\\033[38;2;136;136;136m%s\\033[39m\\n\\342\\235\\257\\302\\240\\033[2mTry \"fix lint errors\"\\033[22m\\n\\033[38;2;136;136;136m%s\\033[39m\\n' '{rule}' '{rule}'\n\
+             trap 'exit 0' HUP TERM\n\
+             sleep 300 & wait $!\n",
+            d = dir.display()
+        );
+        common::script(dir.join("claude"), &body);
+        FakeClaude { dir }
+    }
+
+    fn bin(&self) -> String {
+        self.dir.join("claude.cmd").to_string_lossy().into_owned()
+    }
+
+    fn launches(&self) -> Vec<String> {
+        std::fs::read_to_string(self.dir.join("argv")).unwrap_or_default().lines().map(str::to_string).collect()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FakeClaude {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[cfg(windows)]
+fn hook(d: &Bin, sid: &str, event: &str, payload: Value) {
+    call(&mut d.human(), "agent.hook", json!({ "agent": "claude", "event": event, "payload": payload, "session": sid }));
+}
+
+#[cfg(windows)]
+fn screen(c: &mut Client, id: &str) -> String {
+    call(c, "session.read", json!({ "id": id, "lines": 200 }))["text"].as_str().unwrap_or_default().to_string()
+}
+
+/// A daemon with the fake agent and no quiet time before a restart, an sh terminal in `sub`
+/// that printed a marker, and an agent terminal in a turn of conversation conv-1.
+#[cfg(windows)]
+fn busy_daemon(fake: &FakeClaude) -> (Bin, String, String, PathBuf) {
+    let sh = common::sh(); // and MIDNA_SHELL, PATH for the daemon
+    let d = Bin::start_with(0., &[("MIDNA_AGENT_BIN", fake.bin())]);
+    let mut c = d.human();
+    call(&mut c, "settings.set", json!({ "key": "agents.restart_idle_secs", "value": 0 }));
+    let sub = d.home.join("work");
+    std::fs::create_dir_all(&sub).unwrap();
+    let shell = call(&mut c, "session.open", json!({ "kind": "shell", "cwd": common::tmp(), "command": [sh] }))["id"].as_str().unwrap().to_string();
+    call(&mut c, "session.input", json!({ "id": shell, "text": format!("cd {}; echo before-the-restart", common::sh_word(&sub)), "enter": true }));
+    wait_for(10, "the shell's marker", || screen(&mut c, &shell).lines().any(|l| l.trim() == "before-the-restart").then_some(()));
+    let agent = call(&mut c, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": common::tmp(), "prompt": "do the thing" }))["id"].as_str().unwrap().to_string();
+    wait_for(10, "fake claude started", || (!fake.launches().is_empty()).then_some(()));
+    hook(&d, &agent, "SessionStart", json!({ "session_id": "conv-1", "source": "startup" }));
+    hook(&d, &agent, "UserPromptSubmit", json!({ "session_id": "conv-1", "prompt": "do the thing" }));
+    (d, shell, agent, sub)
+}
+
+/// Windows has no exec, and a pseudoconsole dies with the process that made it, so a new
+/// midnad can't take the old one's terminals. `daemon.upgrade` waits until every agent is idle,
+/// then the new midnad reopens each terminal under its id: the shell in the folder it had moved
+/// to, below its old screen, and the agent in its conversation. It says what it reopened.
 #[cfg(windows)]
 #[test]
-fn upgrade_and_restart_are_refused_on_windows() {
-    let d = Bin::start();
+fn upgrade_waits_for_idle_agents_then_reopens_terminals_on_windows() {
+    let fake = FakeClaude::new("u");
+    let (d, shell, agent, sub) = busy_daemon(&fake);
     let mut c = d.human();
     let pid0 = d.info()["pid"].as_i64().unwrap();
-    for (m, p) in [("daemon.upgrade", json!({ "binary_path": d.path(V2) })), ("daemon.restart", json!({}))] {
-        let e = match c.call_value(m, p) {
-            Err(ClientError::Rpc(e)) => e,
-            other => panic!("{m}: expected a refusal, got {other:?}"),
-        };
-        assert_eq!(e.code, midna_proto::error::REFUSED, "{m}: {e:?}");
-        assert!(e.message.contains("can't upgrade or restart in place on Windows"), "{m}: {e:?}");
-    }
+    // A connection held across the restart, as the app's is.
+    let mut held = d.human();
+
+    let r = call(&mut c, "daemon.upgrade", json!({ "binary_path": d.path(V2) }));
+    assert_eq!((r["ok"].as_bool(), r["when"].as_str()), (Some(true), Some("idle")), "{r}");
+    let w = &r["waiting_for"][0];
+    assert_eq!(w["session"], json!(agent), "{r}");
+    assert!(w["waiting_for"].as_array().unwrap().iter().any(|x| x == "the agent is working"), "{r}");
+    let ev = call(&mut c, "events.list", json!({ "since_seq": 0, "limit": 100, "filter": { "kinds": ["daemon.upgrade_postponed"] } }));
+    assert_eq!(ev[0]["data"]["waiting_for"][0]["session"], json!(agent), "{ev}");
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(d.info()["pid"].as_i64(), Some(pid0), "must wait while the agent works");
+
+    // The turn ends: the restart goes.
+    hook(&d, &agent, "Stop", json!({ "session_id": "conv-1", "hook_event_name": "Stop", "stop_hook_active": false, "background_tasks": [], "session_crons": [] }));
+    let up = d.wait_upgraded(1);
+    assert_ne!(d.info()["pid"].as_i64(), Some(pid0), "a new midnad: {}", d.log());
+    // Gone with the old midnad (the new one inherits none of its handles), so the app reconnects.
+    assert!(held.call_value("daemon.info", json!({})).is_err(), "the old connection still answers");
+    assert_eq!(up["relaunched"], json!(true), "{up}");
+    let said: Vec<&str> = up["sessions"].as_array().unwrap().iter().map(|s| s["said"].as_str().unwrap()).collect();
+    assert_eq!(said.len(), 2, "{up}");
+    assert!(up["sessions"].as_array().unwrap().iter().all(|s| s["reopened"] == json!(true)), "{up}");
+
+    let mut c = d.human();
+    wait_for(15, "the agent's second launch", || (fake.launches().len() >= 2).then_some(()));
+    let argv = fake.launches()[1].clone();
+    assert!(argv.ends_with("--resume conv-1"), "into its conversation: {argv}");
+    assert!(!argv.contains("do the thing"), "the first prompt isn't sent again: {argv}");
+
+    // The shell: the same id, running again, below its old screen, in the folder it was in.
+    let s = call(&mut c, "session.get", json!({ "id": shell }));
+    assert!(s["pid"].as_i64().is_some(), "{s}");
+    let text = screen(&mut c, &shell);
+    assert!(text.contains("before-the-restart") && text.contains("midna restarted this terminal to update itself"), "{text}");
+    call(&mut c, "session.input", json!({ "id": shell, "text": "pwd -W", "enter": true }));
+    let want = sub.to_string_lossy().replace('\\', "/").to_lowercase();
+    wait_for(10, "pwd in the reopened shell", || screen(&mut c, &shell).to_lowercase().contains(&want).then_some(()));
+
+    let notes = call(&mut c, "needs_you.list", json!({}));
+    let note = notes.as_array().unwrap().iter().find(|n| n["kind"] == "note").unwrap_or_else(|| panic!("{notes}"));
+    assert!(note["title"].as_str().unwrap().contains("reopened 2 of 2 terminals"), "{note}");
+    assert!(note["detail"].as_str().unwrap().contains("reopened in its conversation"), "{note}");
+}
+
+/// `force` doesn't wait for the agents; a binary that fails its selftest changes nothing. An
+/// agent with no conversation to reopen starts again without its first prompt.
+#[cfg(windows)]
+#[test]
+fn forced_restart_goes_at_once_and_a_bad_binary_is_refused_on_windows() {
+    let fake = FakeClaude::new("f");
+    let (d, shell, agent, _) = busy_daemon(&fake);
+    let mut c = d.human();
+    let pid0 = d.info()["pid"].as_i64().unwrap();
+    let fresh = call(&mut c, "session.open", json!({ "kind": "agent", "agent": "claude", "cwd": common::tmp(), "prompt": "second task" }))["id"].as_str().unwrap().to_string();
+    wait_for(10, "the second agent started", || (fake.launches().len() >= 2).then_some(()));
+
+    let bad = d.home.join("bad.cmd");
+    std::fs::write(&bad, "@exit /b 3\r\n").unwrap();
+    let e = match c.call_value("daemon.upgrade", json!({ "binary_path": bad })) {
+        Err(ClientError::Rpc(e)) => e,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    assert_eq!(e.code, midna_proto::error::REFUSED, "{e:?}");
+    assert!(e.message.contains("nothing changed"), "{e:?}");
     assert_eq!(d.info()["pid"].as_i64(), Some(pid0));
-    let ev = call(&mut c, "events.list", json!({ "since_seq": 0, "limit": 100, "filter": { "kinds": ["daemon.upgraded"] } }));
-    assert!(ev.as_array().unwrap().is_empty(), "{ev}");
+
+    let r = call(&mut c, "daemon.restart", json!({ "force": true }));
+    assert_eq!(r["when"], "now", "{r}");
+    let up = d.wait_upgraded(1);
+    assert_eq!(up["reason"], "restart", "{up}");
+    assert_ne!(d.info()["pid"].as_i64(), Some(pid0));
+    let said = up["sessions"].as_array().unwrap().iter().find(|s| s["session"] == json!(fresh)).map(|s| s["said"].to_string());
+    assert!(said.as_deref().is_some_and(|s| s.contains("without its first prompt")), "{up}");
+    let mut c = d.human();
+    wait_for(15, "both agents launched again", || (fake.launches().len() >= 4).then_some(()));
+    let launches = fake.launches();
+    assert_eq!(launches.iter().filter(|l| l.contains("second task")).count(), 1, "the first prompt isn't sent again: {launches:?}");
+    for id in [&shell, &agent, &fresh] {
+        let s = wait_for(10, "reopened", || {
+            let s = call(&mut c, "session.get", json!({ "id": id }));
+            s["pid"].as_i64().map(|_| s)
+        });
+        assert_ne!(s["status"]["state"], "exited", "{s}");
+    }
 }

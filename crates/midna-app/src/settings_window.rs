@@ -1787,24 +1787,44 @@ impl SettingsWindow {
                 let daemon = self.info.get("version").and_then(Value::as_str);
                 let life = crate::lifecycle::snapshot();
                 let failed = life.as_ref().and_then(|l| l.daemon_upgrade_error.clone());
-                let postponed = life.and_then(|l| l.daemon_postponed);
+                let postponed = life.as_ref().and_then(|l| l.daemon_postponed.clone());
+                // Windows: the restart onto the app's build waits for these agents.
+                let waiting = life.and_then(|l| l.daemon_waiting);
                 let (dot, note) = match daemon {
                     None => (t.dim, None),
                     Some(v) if v == midna_proto::VERSION => (t.ok, None),
-                    Some(_) => match (&failed, &postponed) {
-                        (Some(e), _) => (t.err, Some(format!("Doesn't match the app, and updating it failed: {e}"))),
-                        (None, Some(l)) => (
+                    Some(_) => match (&failed, &postponed, &waiting) {
+                        (Some(e), _, _) => (t.err, Some(format!("Doesn't match the app, and updating it failed: {e}"))),
+                        (None, Some(l), _) => (
                             t.need,
                             Some(format!("Updates by itself once the {} is less busy (load {:.1} on {} cores).", midna_proto::wording::MAC, l.load1, l.cpus)),
                         ),
-                        (None, None) => (t.err, Some("Doesn't match the app. Update it in place: your terminals keep running.".into())),
+                        (None, None, Some(names)) => (
+                            t.need,
+                            // A row shows its note's first sentence (`brief`): what happens goes first.
+                            Some(format!(
+                                "Restarts once every agent is idle{} and reopens your terminals. Each terminal reopens in its folder and each agent in its conversation; whatever runs in a shell is stopped.",
+                                if names.is_empty() { String::new() } else { format!(" (waiting for {})", names.join(", ")) }
+                            )),
+                        ),
+                        (None, None, None) => (
+                            t.err,
+                            Some(os(
+                                "Doesn't match the app. Update it in place: your terminals keep running.",
+                                "Doesn't match the app; updating it reopens your terminals once agents are idle. Whatever runs in a shell is stopped.",
+                            ).into()),
+                        ),
                     },
                 };
                 let mut daemon_row = status("Daemon version", dot, daemon.unwrap_or("not connected").into(), if daemon.is_some() { t.fg } else { t.dim }, note, "midna info");
                 if self.daemon_behind()
                     && let Control::Text { action, .. } = &mut daemon_row.control
                 {
-                    *action = Some(("Update daemon".into(), Act::Life(crate::lifecycle::Cmd::UpgradeDaemon), true));
+                    // Waiting for the agents: Restart now doesn't wait.
+                    *action = Some(match waiting {
+                        Some(_) => ("Restart now".into(), Act::Life(crate::lifecycle::Cmd::UpgradeDaemonNow), true),
+                        None => ("Update daemon".into(), Act::Life(crate::lifecycle::Cmd::UpgradeDaemon), true),
+                    });
                     daemon_row.warn = true;
                 }
                 vec![status("App version", t.ok, midna_proto::VERSION.into(), t.fg, None, "midna info"), daemon_row]

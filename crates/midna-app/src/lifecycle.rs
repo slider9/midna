@@ -7,6 +7,7 @@
 //! - `MIDNA_UPDATE_FEED_URL` overrides the `updates.feed_url` setting.
 //! - `MIDNA_UPDATE_CHECK_SECS` overrides the 6h interval (first check is ~5s after launch).
 //! - `MIDNA_DEBUG_UPDATE=apply` installs an update (and relaunches) as soon as it's ready.
+//! - `MIDNA_DEBUG_DAEMON_WAITING=a,b` shows the daemon's restart waiting for agents a and b.
 //!
 //! A busy Mac (midnad answers daemon.upgrade with BUSY) postpones moving the daemon onto the
 //! installed build: the first time per launch (or when asked from Settings) a system window
@@ -62,6 +63,8 @@ enum Msg {
     /// The daemon upgrade waits for a calmer Mac (None: it isn't waiting any more). `ask`
     /// opens the system window; otherwise an open one just gets the new numbers.
     DaemonPostponed { load: Option<midna_proto::SystemLoad>, ask: bool },
+    /// Windows: the daemon restarts onto the installed build once these agents are idle.
+    DaemonWaiting(Option<Vec<String>>),
     Quit,
 }
 
@@ -86,6 +89,9 @@ pub struct Snapshot {
     pub daemon_upgrade_error: Option<String>,
     /// The daemon upgrade is waiting for the Mac to calm down (its last load reading).
     pub daemon_postponed: Option<midna_proto::SystemLoad>,
+    /// Windows: the daemon restarts onto the installed build once every agent is idle; the
+    /// agents it waited for when asked.
+    pub daemon_waiting: Option<Vec<String>>,
 }
 
 static SNAP: std::sync::Mutex<Option<Snapshot>> = std::sync::Mutex::new(None);
@@ -131,6 +137,8 @@ pub fn start(backend: Arc<dyn Backend>, cx: &mut App) {
         update: if installed { UpdateState::Idle } else { UpdateState::Off("development build".into()) },
         daemon_upgrade_error: None,
         daemon_postponed: None,
+        // Screenshots: a restart waiting for these agents (comma-separated; empty for none named).
+        daemon_waiting: crate::dev::var("MIDNA_DEBUG_DAEMON_WAITING").ok().map(|v| v.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).collect()),
     });
     cx.set_global(Lifecycle { tx: Some(cmd_tx) });
     let reporter = backend.clone();
@@ -159,6 +167,7 @@ pub fn start(backend: Arc<dyn Backend>, cx: &mut App) {
                     Msg::Update(s) => l.update = s,
                     Msg::DaemonUpgrade(e) => l.daemon_upgrade_error = e,
                     Msg::DaemonPostponed { load, .. } => l.daemon_postponed = load,
+                    Msg::DaemonWaiting(w) => l.daemon_waiting = w,
                     Msg::Quit => {}
                 });
                 if is_update && !fake {
@@ -272,6 +281,15 @@ struct Worker {
     backend: Arc<dyn Backend>,
     tx: async_channel::Sender<Msg>,
     rx: mpsc::Receiver<Cmd>,
+}
+
+/// Windows: the agents a `daemon.upgrade` answered it waits for (`when: idle`), by name.
+fn waiting_for(v: &Value) -> Option<Vec<String>> {
+    if v.get("when").and_then(Value::as_str) != Some("idle") {
+        return None;
+    }
+    let names = v.get("waiting_for").and_then(Value::as_array).map(|a| a.iter().filter_map(|w| w.get("name").and_then(Value::as_str).map(str::to_string)).collect());
+    Some(names.unwrap_or_default())
 }
 
 pub fn log(msg: &str) {
@@ -438,7 +456,8 @@ impl Worker {
 
     /// The running daemon must be `bin/current/midnad`; if not (the app was just updated),
     /// upgrade it in place. Terminals survive (same-PID execv with the PTYs handed over). A busy
-    /// Mac postpones it unless `force`.
+    /// Mac postpones it unless `force`. Windows has no in-place upgrade: midnad restarts once
+    /// every agent is idle (at once with `force`) and reopens the terminals.
     fn ensure_daemon_current(&self, home: &Path, force: bool) -> Upgrade {
         let want = install::current_daemon(home);
         let fail = |e: String| {
@@ -459,6 +478,7 @@ impl Worker {
         // unresolved bin/current path, so the version check catches those.)
         if running.as_ref() == Some(&want_canon) && version == midna_proto::VERSION {
             self.send(Msg::DaemonUpgrade(None));
+            self.send(Msg::DaemonWaiting(None));
             log(&format!("daemon {version} is current ({})", want_canon.display()));
             return Upgrade::Done;
         }
@@ -467,6 +487,7 @@ impl Worker {
             Ok(v) => {
                 log(&format!("daemon.upgrade: {v}"));
                 self.send(Msg::DaemonUpgrade(None));
+                self.send(Msg::DaemonWaiting(waiting_for(&v)));
                 Upgrade::Done
             }
             Err(e) => match e.downcast_ref::<midna_proto::RpcError>().filter(|r| r.code == midna_proto::error::BUSY) {

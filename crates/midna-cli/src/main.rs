@@ -149,7 +149,22 @@ pub(crate) fn call(method: &str, params: Value) -> Result<Value, Fail> {
 
 fn daemon(a: &Args, out: OutFn) -> Res {
     let sub = a.need(1, "daemon subcommand (upgrade|restart|stop|info)")?;
-    let scheduled = |v: &Value| println!("{} terminal(s) carried over to {}; watch `midna events --kind daemon.`", v["sessions"], v["binary"].as_str().unwrap_or(""));
+    // Windows answers with `when`: midnad restarts (now, or once every agent is idle) and reopens the terminals.
+    let scheduled = |v: &Value| {
+        let bin = v["binary"].as_str().unwrap_or("");
+        match v["when"].as_str() {
+            Some("idle") => {
+                let names: Vec<&str> = v["waiting_for"].as_array().into_iter().flatten().filter_map(|w| w["name"].as_str()).collect();
+                println!(
+                    "midnad restarts onto {bin} once every agent is idle (waiting for {}), then reopens its {} terminal(s); --force restarts now. Watch `midna events --kind daemon.`",
+                    names.join(", "),
+                    v["sessions"]
+                );
+            }
+            Some(_) => println!("midnad restarts onto {bin} now and reopens its {} terminal(s); watch `midna events --kind daemon.`", v["sessions"]),
+            None => println!("{} terminal(s) carried over to {bin}; watch `midna events --kind daemon.`", v["sessions"]),
+        }
+    };
     match sub {
         "info" => out(&call("daemon.info", json!({}))?, &print::kv),
         "upgrade" => {

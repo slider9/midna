@@ -260,7 +260,8 @@ pub fn check_updates(d: &Daemon) {
     }
 }
 
-/// Background: queued restarts every 2s, update checks every minute.
+/// Background: queued restarts (and on Windows a waiting midnad update) every 2s, update
+/// checks every minute.
 pub fn start(d: &Arc<Daemon>) {
     let w = Arc::downgrade(d);
     let _ = std::thread::Builder::new().name("restart-queue".into()).spawn(move || {
@@ -272,6 +273,9 @@ pub fn start(d: &Arc<Daemon>) {
                 return;
             }
             tick(&d);
+            // Windows: a midnad update waits here until every agent is idle (upgrade_windows.rs).
+            #[cfg(windows)]
+            crate::upgrade::tick(&d);
             crate::adopt::reap(&d);
             n += 1;
             // First check ~10s after start, then every minute. Off the tick so a slow login
