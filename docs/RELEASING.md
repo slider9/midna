@@ -149,7 +149,9 @@ gh release delete windows-v0.1.0-beta.58.w.1 --yes
 
 GitHub only dispatches a workflow it knows, so the file has to be on the default branch (or
 have run once from the branch). Run by hand on a `windows-v` tag with `draft` off, it publishes
-that tag like a push would; on a branch it only ever makes drafts.
+that tag like a push would; on a branch it only ever makes drafts. A draft run refuses a
+version that is already published, and a real run replaces a leftover draft of its version
+with a fresh release before any channel points at it.
 
 The same rules hold as for macOS: never skip a version, and a failed run is re-run or cut again
 at the same number. The fork's `MIDNA_UPDATE_KEY` secret and `MIDNA_UPDATE_PUBKEY` variable

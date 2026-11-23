@@ -204,11 +204,23 @@ jobs:
           path: release
 
       # The feed is published with the zip, so a draft carries everything a release would. A
-      # re-run finds the release already made and replaces its files.
+      # re-run finds the release already made and replaces its files. A draft run never touches
+      # a published release, and a real run replaces a leftover draft of its version with a
+      # fresh release (deleting a draft leaves the tag alone).
       - name: Publish release
         run: |
           files=("release/Midna-$VERSION-windows-x86_64.zip" release/windows-feed.json)
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          existing=$(gh release view "$TAG" --json isDraft -q .isDraft 2>/dev/null || true)
+          if [ "$existing" = false ] && [ "$DRAFT" = true ]; then
+            echo "::error::$TAG is already published; a draft run never replaces its files. Pick an unused version."
+            exit 1
+          fi
+          if [ "$existing" = true ] && [ "$DRAFT" != true ]; then
+            echo "Replacing the leftover draft of $TAG with the release."
+            gh release delete "$TAG" --yes
+            existing=
+          fi
+          if [ -n "$existing" ]; then
             gh release upload "$TAG" "${files[@]}" --clobber
             gh release edit "$TAG" --notes-file release/notes.md
           else
@@ -232,6 +244,9 @@ jobs:
       - name: Channel feeds
         if: needs.build.outputs.draft != 'true'
         run: |
+          # A feed must never point at a draft's zip, which only its owner can download.
+          [ "$(gh release view "$TAG" --json isDraft -q .isDraft)" = false ] ||
+            { echo "::error::$TAG is still a draft; the channels stay as they are"; exit 1; }
           if ! gh release view channels >/dev/null 2>&1; then
             gh release create channels --prerelease --latest=false --title "Update channels" \
               --notes "Where midna's updater looks for new versions. Not a release to download."
