@@ -25,6 +25,18 @@ for a in "$@"; do
 done
 
 nice -n 10 cargo test ${scope[@]+"${scope[@]}"} ${cargo_args[@]+"${cargo_args[@]}"} --no-run
+# Windows terminals run in the keeper, midna-pty.exe, which a test's midnad finds beside the
+# test binaries; cargo builds another package's binary only when asked.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    profile=()
+    for a in "$@"; do
+      [ "$a" = "--" ] && break
+      [ "$a" = "--release" ] && profile=(--release)
+    done
+    nice -n 10 cargo build -p midna-pty --bin midna-pty ${profile[@]+"${profile[@]}"}
+    ;;
+esac
 if command -v lockf >/dev/null 2>&1; then
   if ! lockf -s -t 0 "$LOCK" true; then
     echo "test.sh: another checkout's tests are running; waiting for $LOCK" >&2

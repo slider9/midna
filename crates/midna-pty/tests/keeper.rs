@@ -46,7 +46,7 @@ mod win {
             let _ = std::fs::remove_dir_all(&home);
             return;
         }
-        let cases: [(&str, fn(&Test)); 7] = [
+        let cases: [(&str, fn(&Test)); 8] = [
             ("a keeper outlives the client that started it and serves the next", handover_cmd),
             ("ctrl-c reaches the shell's programs, after a snapshot too", ctrl_c),
             ("powershell as the shell", handover_powershell),
@@ -54,6 +54,7 @@ mod win {
             ("hangup ends the shell and the keeper", hangup),
             ("kill ends the shell and the keeper", kill),
             ("a client that isn't this home's midnad is refused", refused),
+            ("the process that started a keeper is served whatever it runs", creator),
         ];
         let filter = args.iter().find(|a| !a.starts_with('-')).cloned();
         let mut failed = vec![];
@@ -236,6 +237,28 @@ mod win {
         assert!(alive(keeper));
         t.role("end", "s6", &["--how", "kill"]);
         t.gone("s6", keeper, shell);
+    }
+
+    fn creator(t: &Test) {
+        // This test isn't midnad.exe, but it started the keeper (an in-process midnad in a test).
+        let exe = t.midnad.with_file_name(names::EXE);
+        let s = Spawn { argv: shell_argv("cmd"), cwd: t.home.display().to_string(), env: std::env::vars().collect(), cols: 80, rows: 24 };
+        let st = client::start(&exe, &t.home, "s7", s).expect("the creator is served");
+        drop(st.client.attach().expect("attach"));
+        drop(st.client);
+        // Again, on a new connection.
+        let c = Client::connect(&names::pipe_name(&t.home, "s7"), Duration::from_secs(5)).unwrap();
+        assert_eq!(c.hello().expect("the creator is served again").shell_pid, Some(st.shell_pid));
+        drop(c);
+        // Another process of the same program isn't.
+        let other = t.home.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(), other.join("other.exe")).unwrap();
+        let out = Command::new(other.join("other.exe")).args(["--role", "hello", "--home"]).arg(&t.home).args(["--session", "s7"]).output().unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(v["error"].is_string(), "{v}");
+        t.role("end", "s7", &["--how", "kill"]);
+        t.gone("s7", st.keeper.pid, st.shell_pid);
     }
 
     /// N keepers at once: what the system pays for them, idle and with every output pipe full.

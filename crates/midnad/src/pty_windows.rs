@@ -1,124 +1,81 @@
-//! Windows terminals: a pseudoconsole (ConPTY, Windows 10 1809+) per session.
+//! Windows terminals: each runs in its own keeper, `midna-pty.exe` (crates/midna-pty), which owns
+//! the terminal's pseudoconsole (ConPTY), its shell and the shell's job, so the terminal can
+//! outlive midnad. midnad starts a keeper per new terminal, attaches to it and then reads, writes
+//! and waits on the copies of the shell's pipes and process the keeper gave it, as it did with
+//! its own pseudoconsole. Resizes, hang-ups and force closes are messages to the keeper.
 //!
-//! The app runs attached to a pseudoconsole whose conhost turns its console calls into VT on
-//! the output pipe and the VT we write on the input pipe into console input. Unlike a Unix pty,
-//! the output pipe doesn't end when the app exits: conhost lives until the pseudoconsole is
-//! closed, so the reaper closes it once the process is gone ([`Master::child_exited`]).
+//! The keeper closes the pseudoconsole once the shell exits, so the output pipe ends and the
+//! reader drains, and it puts every process the shell starts in the shell's job, so a force
+//! close ends them too, like a hang-up of the process group does on Unix. A keeper that dies
+//! takes its pseudoconsole with it: that terminal ends with "terminal host exited".
 //!
-//! Every session's processes go in a job object, so a close (or a force close) ends what the
-//! shell started too, like a hang-up of the process group does on Unix.
-//!
-//! Which ConPTY: `conpty.dll` next to midnad.exe when it's there ([`conpty`]), else Windows' own.
+//! The keeper comes from beside midnad.exe ([`keeper_exe`]); it runs `conpty.dll` from beside
+//! itself when it's there, else Windows' own.
 use super::ENV_SCRUB;
-use std::ffi::OsString;
-use std::os::windows::ffi::OsStrExt;
+use midna_pty::client::{self, Client, Spawn};
+use std::collections::HashMap;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_BROKEN_PIPE, ERROR_NO_DATA, GetLastError, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_NO_DATA, GetLastError, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-use windows_sys::Win32::System::Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
+    CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
 };
-use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
-    InitializeProcThreadAttributeList, OpenProcess, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+    GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_TERMINATE, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 /// The newer ConPTY's files, which go wherever midnad.exe goes (`install::install_self`; the
-/// app's bundle has them beside its midnad.exe). `conpty.dll` starts the `OpenConsole.exe`
-/// beside it for every terminal.
-pub const FILES: [&str; 2] = ["conpty.dll", "OpenConsole.exe"];
+/// app's bundle has them beside its midnad.exe), so the keeper beside it runs them.
+pub use midna_pty::shell::CONPTY_FILES as FILES;
+pub use midna_pty::shell::command_line;
+pub use midna_proto::cmd_shim::which;
 
-/// The pseudoconsole calls. Windows' own (kernel32) is as old as the Windows it ships with: on
-/// Windows 10 it drops dim text (Claude's placeholder then reads as typed), clears a new
-/// terminal's screen and keeps an app's keyboard and mouse modes to itself. Microsoft ships the
-/// current one, the one Windows Terminal runs, as `conpty.dll` with an `OpenConsole.exe` beside
-/// it (NuGet `Microsoft.Windows.Console.ConPTY`; VS Code and WezTerm bundle it too). Its three
-/// calls take what kernel32's do. `MIDNA_CONPTY=system` uses Windows' own regardless, and
-/// `MIDNA_CONPTY=<path to a conpty.dll>` that one (tests and trials).
-pub struct Conpty {
-    create: unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> i32,
-    resize: unsafe extern "system" fn(HPCON, COORD) -> i32,
-    close: unsafe extern "system" fn(HPCON),
-    /// The `conpty.dll` in use (None: Windows' own).
-    pub dll: Option<PathBuf>,
+/// What [`Master::wait_exit`] reports, in place of a signal, for a terminal whose keeper
+/// died while its shell ran.
+pub const HOST_EXITED: i32 = -1;
+
+/// How long a new terminal waits for the last keeper of the same session to be gone (an agent
+/// that exited and is replaced by a shell): the keeper's pipe is named after the session.
+const PREVIOUS_KEEPER: Duration = Duration::from_secs(5);
+
+/// How long a terminal that's dropped while its shell runs waits for the keeper to take the
+/// hang-up.
+const DROP_HANGUP: Duration = Duration::from_secs(2);
+
+/// Whose terminal this is: its keeper is named after `sid` in `home`. A `tied` terminal ends
+/// with this process: its keeper is put in a job that ends it, its shell and everything they
+/// started when this process exits (a midnad inside another program, such as a test, whose
+/// terminals mustn't outlive it). Otherwise the keeper outlives midnad, for the next one.
+pub struct Owner<'a> {
+    pub home: &'a Path,
+    pub sid: &'a str,
+    pub tied: bool,
 }
 
-pub fn conpty() -> &'static Conpty {
-    static API: OnceLock<Conpty> = OnceLock::new();
-    API.get_or_init(|| {
-        let system = Conpty { create: CreatePseudoConsole, resize: ResizePseudoConsole, close: ClosePseudoConsole, dll: None };
-        let dll = match std::env::var_os("MIDNA_CONPTY") {
-            Some(v) if v == "system" => return system,
-            Some(v) if !v.is_empty() => PathBuf::from(v),
-            _ => match std::env::current_exe() {
-                Ok(exe) => exe.with_file_name(FILES[0]),
-                Err(_) => return system,
-            },
-        };
-        if !(dll.is_file() && dll.with_file_name(FILES[1]).is_file()) {
-            return system;
-        }
-        match load_conpty(&dll) {
-            Some(api) => api,
-            None => {
-                eprintln!("midnad: {} has no pseudoconsole calls; using Windows' own", dll.display());
-                system
-            }
-        }
-    })
-}
-
-fn load_conpty(dll: &Path) -> Option<Conpty> {
-    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW};
-    let path = wide(dll.as_os_str());
-    // SAFETY: a NUL-terminated path; the library stays loaded for the process's life, and each
-    // export has the signature of the kernel32 call it stands in for.
-    unsafe {
-        let lib = LoadLibraryExW(path.as_ptr(), std::ptr::null_mut(), LOAD_WITH_ALTERED_SEARCH_PATH);
-        if lib.is_null() {
-            return None;
-        }
-        let create = GetProcAddress(lib, c"ConptyCreatePseudoConsole".as_ptr().cast())?;
-        let resize = GetProcAddress(lib, c"ConptyResizePseudoConsole".as_ptr().cast())?;
-        let close = GetProcAddress(lib, c"ConptyClosePseudoConsole".as_ptr().cast())?;
-        Some(Conpty {
-            create: std::mem::transmute::<unsafe extern "system" fn() -> isize, unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> i32>(create),
-            resize: std::mem::transmute::<unsafe extern "system" fn() -> isize, unsafe extern "system" fn(HPCON, COORD) -> i32>(resize),
-            close: std::mem::transmute::<unsafe extern "system" fn() -> isize, unsafe extern "system" fn(HPCON)>(close),
-            dll: Some(dll.to_path_buf()),
-        })
-    }
-}
-
-/// A session's pseudoconsole: its input and output pipes, the app's process and its job.
+/// A terminal, through its keeper: the copies of its pipes and the shell's process.
 pub struct Master {
-    /// None once closed (hang-up, or the app exited).
-    console: Mutex<Option<HPCON>>,
-    input: HANDLE,
-    output: HANDLE,
-    process: HANDLE,
-    job: HANDLE,
+    client: Client,
+    keeper: Arc<OwnedHandle>,
+    input: OwnedHandle,
+    output: OwnedHandle,
+    process: OwnedHandle,
+    shell_pid: u32,
+    /// A hang-up or kill was sent.
+    ended: AtomicBool,
 }
-
-// The handles are plain kernel handles, usable from any thread; `console` is behind a lock.
-unsafe impl Send for Master {}
-unsafe impl Sync for Master {}
 
 impl Drop for Master {
+    /// A terminal dropped with its shell still running is hung up, as closing its pseudoconsole
+    /// did; midnad handing its terminals over never drops them.
     fn drop(&mut self) {
-        self.close_console();
-        unsafe {
-            for h in [self.input, self.output, self.process, self.job] {
-                if !h.is_null() {
-                    CloseHandle(h);
-                }
-            }
+        if !self.ended.load(Ordering::SeqCst) && self.child_alive() {
+            let _ = self.client.hangup();
+            self.wait_keeper(DROP_HANGUP);
         }
     }
 }
@@ -145,20 +102,24 @@ fn write_handle(h: HANDLE, mut b: &[u8]) -> bool {
     true
 }
 
+fn raw(h: &OwnedHandle) -> HANDLE {
+    h.as_raw_handle()
+}
+
 impl Master {
-    /// Write everything, in order (a full pipe blocks until conhost reads).
+    /// Write everything, in order (a full pipe blocks until the console host reads).
     pub fn write_all(&self, b: &[u8]) -> bool {
-        write_handle(self.input, b)
+        write_handle(raw(&self.input), b)
     }
 
     pub fn writer(&self) -> Writer {
-        Writer(self.input as isize)
+        Writer(raw(&self.input) as isize)
     }
 
+    /// Once the shell has exited the keeper has closed the pseudoconsole and says so; nothing
+    /// to resize then.
     pub fn resize(&self, cols: u16, rows: u16) {
-        if let Some(hpc) = *self.console.lock().unwrap_or_else(|e| e.into_inner()) {
-            unsafe { (conpty().resize)(hpc, COORD { X: cols as i16, Y: rows as i16 }) };
-        }
+        let _ = self.client.resize(cols, rows);
     }
 
     /// Reads block (no readiness poll); the reader pause only matters to Unix upgrades.
@@ -166,10 +127,11 @@ impl Master {
         true
     }
 
-    /// Ok(0) once conhost has closed its end (the pseudoconsole was closed).
+    /// Ok(0) once the console host has closed its end (the keeper closed the pseudoconsole, or
+    /// died).
     pub fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut n = 0u32;
-        let ok = unsafe { ReadFile(self.output, buf.as_mut_ptr(), buf.len().min(u32::MAX as usize) as u32, &mut n, std::ptr::null_mut()) };
+        let ok = unsafe { ReadFile(raw(&self.output), buf.as_mut_ptr(), buf.len().min(u32::MAX as usize) as u32, &mut n, std::ptr::null_mut()) };
         if ok == 0 {
             let e = unsafe { GetLastError() };
             if e == ERROR_BROKEN_PIPE || e == ERROR_NO_DATA {
@@ -180,39 +142,69 @@ impl Master {
         Ok(n as usize)
     }
 
-    /// Hang up: close the pseudoconsole, which sends every attached process CTRL_CLOSE_EVENT
-    /// (the console's hang-up; Windows ends them if they don't exit within a few seconds).
-    /// ClosePseudoConsole can block until conhost has flushed, so it runs off this thread.
-    pub fn hangup(self: &std::sync::Arc<Self>) {
+    /// Hang up: the keeper closes the pseudoconsole, which sends every attached process
+    /// CTRL_CLOSE_EVENT (the console's hang-up), and ends the shell's job if the shell hasn't
+    /// exited a few seconds later. Off this thread, as closing a pseudoconsole was.
+    pub fn hangup(self: &Arc<Self>) {
+        self.ended.store(true, Ordering::SeqCst);
         let m = self.clone();
-        let _ = std::thread::Builder::new().name("pty-hangup".into()).spawn(move || m.close_console());
+        let _ = std::thread::Builder::new().name("pty-hangup".into()).spawn(move || {
+            let _ = m.client.hangup();
+        });
     }
 
-    /// The app exited: let conhost paint its last output, then close the pseudoconsole so the
-    /// output pipe ends and the reader drains.
-    pub fn child_exited(&self) {
-        std::thread::sleep(Duration::from_millis(150));
-        self.close_console();
-    }
+    /// The shell exited. The keeper lets the console host paint its last output, then closes the
+    /// pseudoconsole so the output pipe ends and the reader drains.
+    pub fn child_exited(&self) {}
 
-    fn close_console(&self) {
-        let hpc = self.console.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(hpc) = hpc {
-            unsafe { (conpty().close)(hpc) };
-        }
-    }
-
-    /// End every process in the session's job (a force close).
+    /// End every process in the session's job (a force close). With the keeper gone, the shell
+    /// at least.
     pub fn kill_all(&self) {
-        if !self.job.is_null() {
-            unsafe { TerminateJobObject(self.job, 1) };
+        self.ended.store(true, Ordering::SeqCst);
+        if self.client.kill().is_err() && self.child_alive() {
+            self.terminate_shell();
         }
     }
 
-    /// Is the app itself still running?
+    /// Is the shell itself still running?
     pub fn child_alive(&self) -> bool {
         let mut code = 0u32;
-        unsafe { GetExitCodeProcess(self.process, &mut code) != 0 && code == STILL_ACTIVE as u32 }
+        unsafe { GetExitCodeProcess(raw(&self.process), &mut code) != 0 && code == STILL_ACTIVE as u32 }
+    }
+
+    /// Wait up to `timeout` for the keeper to exit: true once it has.
+    pub fn wait_keeper(&self, timeout: Duration) -> bool {
+        unsafe { WaitForSingleObject(raw(&self.keeper), timeout.as_millis().min(INFINITE as u128 - 1) as u32) == WAIT_OBJECT_0 }
+    }
+
+    /// Block until the shell exits: `(exit code, None)`. Windows has no signals; a process ended
+    /// by TerminateProcess reports the code it was given. If the keeper dies first, the shell
+    /// has lost its console: it's ended, and the result is `(None, Some(HOST_EXITED))`.
+    pub fn wait_exit(&self) -> (Option<i32>, Option<i32>) {
+        let both = [raw(&self.process), raw(&self.keeper)];
+        let r = unsafe { WaitForMultipleObjects(2, both.as_ptr(), 0, INFINITE) };
+        // The keeper exits only after its shell has, unless it was killed or crashed.
+        if r != WAIT_OBJECT_0 && unsafe { WaitForSingleObject(raw(&self.process), 0) } == WAIT_TIMEOUT {
+            eprintln!("midnad: the keeper of shell {} exited while the shell ran", self.shell_pid);
+            self.terminate_shell();
+            return (None, Some(HOST_EXITED));
+        }
+        let mut code = 0u32;
+        if unsafe { GetExitCodeProcess(raw(&self.process), &mut code) } == 0 {
+            return (None, None);
+        }
+        (Some(code as i32), None)
+    }
+
+    /// End the shell itself, without its keeper. Its pid is still its own: we hold its process.
+    fn terminate_shell(&self) {
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, self.shell_pid);
+            if !h.is_null() {
+                TerminateProcess(h, 1);
+                drop(OwnedHandle::from_raw_handle(h));
+            }
+        }
     }
 }
 
@@ -221,205 +213,104 @@ pub struct Spawned {
     pub pid: i32,
 }
 
-fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
-    s.encode_wide().chain(std::iter::once(0)).collect()
+/// The keeper to start: `midna-pty.exe` beside this program, or, for a test inside cargo's
+/// `deps` folder, beside the binaries one folder up.
+pub fn keeper_exe() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let beside = exe.with_file_name(midna_pty::names::EXE);
+    if beside.is_file() {
+        return Ok(beside);
+    }
+    let dir = exe.parent().unwrap_or(Path::new(""));
+    if dir.file_name().is_some_and(|n| n == "deps")
+        && let Some(up) = dir.parent().map(|d| d.join(midna_pty::names::EXE)).filter(|p| p.is_file())
+    {
+        return Ok(up);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("{} (the terminal keeper) isn't beside {}; build it with cargo build -p midna-pty", midna_pty::names::EXE, exe.display()),
+    ))
 }
 
-/// One argument quoted the way the MSVC runtime (and Rust's std) splits a command line.
-fn quote_arg(arg: &str, out: &mut String) {
-    if !arg.is_empty() && !arg.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '\u{b}' | '"')) {
-        out.push_str(arg);
-        return;
-    }
-    out.push('"');
-    let mut backslashes = 0;
-    for c in arg.chars() {
-        match c {
-            '\\' => backslashes += 1,
-            '"' => {
-                out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
-                out.push('"');
-                backslashes = 0;
-            }
-            c => {
-                out.extend(std::iter::repeat_n('\\', backslashes));
-                out.push(c);
-                backslashes = 0;
-            }
-        }
-    }
-    out.extend(std::iter::repeat_n('\\', backslashes * 2));
-    out.push('"');
+/// The `conpty.dll` a new terminal's keeper runs, as it picks one (None: Windows' own).
+pub fn conpty_dll() -> Option<PathBuf> {
+    let dll = match std::env::var_os("MIDNA_CONPTY") {
+        Some(v) if v == "system" => return None,
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => keeper_exe().ok()?.with_file_name(FILES[0]),
+    };
+    (dll.is_file() && dll.with_file_name(FILES[1]).is_file()).then_some(dll)
 }
 
-pub fn command_line(argv: &[String]) -> String {
-    let mut s = String::new();
-    for (i, a) in argv.iter().enumerate() {
-        if i > 0 {
-            s.push(' ');
-        }
-        quote_arg(a, &mut s);
-    }
-    s
-}
-
-pub use midna_proto::cmd_shim::which;
-
-/// The environment block: ours minus [`ENV_SCRUB`], with `env` applied, sorted by name ignoring
-/// case (names are case-insensitive on Windows), as `K=V\0…\0\0` UTF-16.
-fn env_block(env: &[(String, String)]) -> Vec<u16> {
-    let mut vars: Vec<(OsString, OsString)> = std::env::vars_os()
-        .filter(|(k, _)| !ENV_SCRUB.iter().any(|s| k.to_string_lossy().eq_ignore_ascii_case(s)))
-        .filter(|(k, _)| !env.iter().any(|(n, _)| k.to_string_lossy().eq_ignore_ascii_case(n)))
+/// The environment the shell gets, whole: ours minus [`ENV_SCRUB`], with `env` applied.
+fn environment(env: &[(String, String)]) -> Vec<(String, String)> {
+    let mut vars: Vec<(String, String)> = std::env::vars_os()
+        .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+        .filter(|(k, _)| !ENV_SCRUB.iter().any(|s| k.eq_ignore_ascii_case(s)))
+        .filter(|(k, _)| !env.iter().any(|(n, _)| k.eq_ignore_ascii_case(n)))
         .collect();
-    vars.extend(env.iter().map(|(k, v)| (OsString::from(k), OsString::from(v))));
-    vars.sort_by_key(|(k, _)| k.to_string_lossy().to_uppercase());
-    let mut block = vec![];
-    for (k, v) in vars {
-        block.extend(k.encode_wide());
-        block.push('=' as u16);
-        block.extend(v.encode_wide());
-        block.push(0);
-    }
-    block.push(0);
-    block
+    vars.extend(env.iter().cloned());
+    vars
 }
 
-fn pipe() -> std::io::Result<(HANDLE, HANDLE)> {
-    let (mut r, mut w): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
-    if unsafe { CreatePipe(&mut r, &mut w, std::ptr::null(), 0) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((r, w))
-}
-
-fn job() -> HANDLE {
-    unsafe {
+/// The job tied terminals' keepers go in: it ends them when this process exits. Processes in it
+/// may still leave on purpose, as from a terminal's own job.
+fn tie_job() -> Option<&'static OwnedHandle> {
+    static JOB: OnceLock<Option<OwnedHandle>> = OnceLock::new();
+    JOB.get_or_init(|| unsafe {
         let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
         if job.is_null() {
-            return job;
+            return None;
         }
-        // A process may still leave the session on purpose (CREATE_BREAKAWAY_FROM_JOB), like a
-        // Unix process that calls setsid.
+        let job = OwnedHandle::from_raw_handle(job);
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
-        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info as *const _ as *const _, std::mem::size_of_val(&info) as u32);
-        job
-    }
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        SetInformationJobObject(raw(&job), JobObjectExtendedLimitInformation, &info as *const _ as *const _, std::mem::size_of_val(&info) as u32);
+        Some(job)
+    })
+    .as_ref()
 }
 
-pub fn spawn(argv: &[String], cwd: &str, env: &[(String, String)], cols: u16, rows: u16) -> std::io::Result<Spawned> {
+/// Each session's last keeper in this process, by its pipe name.
+fn keepers() -> &'static Mutex<HashMap<String, Arc<OwnedHandle>>> {
+    static K: OnceLock<Mutex<HashMap<String, Arc<OwnedHandle>>>> = OnceLock::new();
+    K.get_or_init(Default::default)
+}
+
+pub fn spawn(owner: &Owner, argv: &[String], cwd: &str, env: &[(String, String)], cols: u16, rows: u16) -> std::io::Result<Spawned> {
     let Some(prog) = argv.first() else {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"));
     };
+    // Found on the PATH midnad looks on (the terminal's, else the user's as it is now); the
+    // keeper takes the program found as it is.
     let path = env.iter().find(|(k, _)| k.eq_ignore_ascii_case("PATH")).map(|(_, v)| v.clone()).unwrap_or_else(crate::sys::user_path);
-    let all = midna_proto::cmd_shim::resolve(argv, &path).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("{prog}: not found on PATH")))?;
-    let exe = all[0].clone();
-    // A batch file runs through cmd.exe (CreateProcess can't start one with a pseudoconsole
-    // and quoted arguments on its own). cmd ends its arguments at a newline and acts on
-    // `|<>&` in them, so a shim (npm's claude.cmd) has been swapped for what it runs above,
-    // and only another batch file gets here.
-    let line = if midna_proto::cmd_shim::is_batch(&exe) {
-        let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into());
-        format!("{} /d /s /c \"{}\"", command_line(&[comspec]), command_line(&all))
-    } else {
-        command_line(&all)
-    };
-    let cwd = if Path::new(cwd).is_dir() { PathBuf::from(cwd) } else { midna_proto::paths::user_home() };
+    let argv = midna_proto::cmd_shim::resolve(argv, &path).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("{prog}: not found on PATH")))?;
+    let exe = keeper_exe()?;
+    let job = if owner.tied { Some(tie_job().ok_or_else(|| std::io::Error::other("can't make the job that ties terminals to midnad"))?) } else { None };
+    let pipe = midna_pty::names::pipe_name(owner.home, owner.sid);
     let _g = super::spawn_lock();
-    unsafe {
-        let (in_read, in_write) = pipe()?;
-        let (out_read, out_write) = match pipe() {
-            Ok(p) => p,
-            Err(e) => {
-                CloseHandle(in_read);
-                CloseHandle(in_write);
-                return Err(e);
-            }
-        };
-        let mut hpc: HPCON = 0;
-        let hr = (conpty().create)(COORD { X: cols as i16, Y: rows as i16 }, in_read, out_write, 0, &mut hpc);
-        // conhost holds its own copies now.
-        CloseHandle(in_read);
-        CloseHandle(out_write);
-        if hr < 0 {
-            CloseHandle(in_write);
-            CloseHandle(out_read);
-            return Err(std::io::Error::from_raw_os_error(hr));
-        }
-        let mut master = Master { console: Mutex::new(Some(hpc)), input: in_write, output: out_read, process: std::ptr::null_mut(), job: job() };
-        let mut size = 0usize;
-        InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size);
-        let mut attrs = vec![0u8; size];
-        let list = attrs.as_mut_ptr() as *mut core::ffi::c_void;
-        if InitializeProcThreadAttributeList(list, 1, 0, &mut size) == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let ok = UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize, hpc as *const _, std::mem::size_of::<HPCON>(), std::ptr::null_mut(), std::ptr::null());
-        if ok == 0 {
-            let e = std::io::Error::last_os_error();
-            DeleteProcThreadAttributeList(list);
-            return Err(e);
-        }
-        let mut si: STARTUPINFOEXW = std::mem::zeroed();
-        si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-        // Invalid std handles, so the app uses the pseudoconsole and never inherits midnad's
-        // own (redirected) stdio.
-        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
-        si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
-        si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
-        si.lpAttributeList = list;
-        let mut cmdline = wide(std::ffi::OsStr::new(&line));
-        let envb = env_block(env);
-        let cwdw = wide(cwd.as_os_str());
-        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
-        let created = CreateProcessW(
-            std::ptr::null(),
-            cmdline.as_mut_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
-            envb.as_ptr() as *const _,
-            cwdw.as_ptr(),
-            &si.StartupInfo,
-            &mut pi,
-        );
-        let err = std::io::Error::last_os_error();
-        DeleteProcThreadAttributeList(list);
-        if created == 0 {
-            return Err(std::io::Error::new(err.kind(), format!("{exe}: {err}")));
-        }
-        // In the job before it runs, so nothing it starts escapes.
-        if !master.job.is_null() {
-            AssignProcessToJobObject(master.job, pi.hProcess);
-        }
-        ResumeThread(pi.hThread);
-        CloseHandle(pi.hThread);
-        master.process = pi.hProcess;
-        Ok(Spawned { master, pid: pi.dwProcessId as i32 })
+    let previous = keepers().lock().unwrap_or_else(|e| e.into_inner()).get(&pipe).cloned();
+    if let Some(p) = previous {
+        unsafe { WaitForSingleObject(raw(&p), PREVIOUS_KEEPER.as_millis() as u32) };
     }
-}
-
-/// Block until `pid` exits: `(exit code, None)`. Windows has no signals; a process ended by
-/// TerminateProcess reports the code it was given.
-pub fn wait_exit(pid: i32) -> (Option<i32>, Option<i32>) {
-    unsafe {
-        let h = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
-        if h.is_null() {
-            return (None, None);
-        }
-        let mut code = None;
-        if WaitForSingleObject(h, INFINITE) == WAIT_OBJECT_0 {
-            let mut c = 0u32;
-            if GetExitCodeProcess(h, &mut c) != 0 {
-                code = Some(c as i32);
-            }
-        }
-        CloseHandle(h);
-        (code, None)
+    let shell = Spawn { argv, cwd: cwd.to_string(), env: environment(env), cols, rows };
+    let started = client::start_in(&exe, owner.home, owner.sid, shell, job).map_err(|e| std::io::Error::new(e.kind(), format!("terminal keeper: {e}")))?;
+    let keeper = Arc::new(started.keeper.process);
+    {
+        let mut k = keepers().lock().unwrap_or_else(|e| e.into_inner());
+        k.retain(|_, h| unsafe { WaitForSingleObject(raw(h), 0) } == WAIT_TIMEOUT);
+        k.insert(pipe, keeper.clone());
     }
+    let a = match started.client.attach() {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = started.client.kill();
+            return Err(std::io::Error::new(e.kind(), format!("terminal keeper: {e}")));
+        }
+    };
+    let master = Master { client: started.client, keeper, input: a.input, output: a.output, process: a.process, shell_pid: a.shell_pid, ended: AtomicBool::new(false) };
+    Ok(Spawned { master, pid: a.shell_pid as i32 })
 }
 
 #[cfg(test)]
@@ -444,27 +335,86 @@ mod tests {
     }
 
     #[test]
-    fn a_console_app_runs_in_the_pseudoconsole() {
-        let argv: Vec<String> = ["cmd", "/d", "/c", "echo midna-conpty-ok"].iter().map(|s| s.to_string()).collect();
-        let sp = spawn(&argv, ".", &[], 80, 24).expect("spawn");
-        let m = std::sync::Arc::new(sp.master);
-        let reader = {
-            let m = m.clone();
-            std::thread::spawn(move || {
-                let (mut all, mut buf) = (Vec::new(), [0u8; 4096]);
-                while let Ok(n) = m.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    all.extend_from_slice(&buf[..n]);
+    fn the_shell_gets_our_environment_scrubbed_with_the_terminals_on_top() {
+        // SAFETY: this test's own variables; no other test reads them.
+        unsafe {
+            std::env::set_var("MIDNA_PTY_ENV_TEST", "ours");
+            std::env::set_var("CLAUDECODE", "1");
+        }
+        let env = environment(&[("midna_pty_env_test".into(), "theirs".into()), ("TERM".into(), "xterm-256color".into())]);
+        let get = |k: &str| env.iter().filter(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.as_str()).collect::<Vec<_>>();
+        assert_eq!(get("MIDNA_PTY_ENV_TEST"), ["theirs"]);
+        assert!(get("CLAUDECODE").is_empty());
+        assert_eq!(get("TERM"), ["xterm-256color"]);
+        assert!(!get("SystemRoot").is_empty());
+    }
+
+    fn home(name: &str) -> PathBuf {
+        let h = std::env::temp_dir().join(format!("midnad-pty-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&h);
+        std::fs::create_dir_all(&h).unwrap();
+        h
+    }
+
+    fn read_all(m: &Arc<Master>) -> std::thread::JoinHandle<String> {
+        let m = m.clone();
+        std::thread::spawn(move || {
+            let (mut all, mut buf) = (Vec::new(), [0u8; 4096]);
+            while let Ok(n) = m.read(&mut buf) {
+                if n == 0 {
+                    break;
                 }
-                String::from_utf8_lossy(&all).into_owned()
-            })
-        };
-        let (code, _) = wait_exit(sp.pid);
-        assert_eq!(code, Some(0));
-        m.child_exited();
+                all.extend_from_slice(&buf[..n]);
+            }
+            String::from_utf8_lossy(&all).into_owned()
+        })
+    }
+
+    #[test]
+    fn a_console_app_runs_in_a_keeper() {
+        let h = home("app");
+        let argv: Vec<String> = ["cmd", "/d", "/c", "echo midna-conpty-ok& exit 3"].iter().map(|s| s.to_string()).collect();
+        let sp = spawn(&Owner { home: &h, sid: "app", tied: true }, &argv, ".", &[], 80, 24).expect("spawn");
+        let m = Arc::new(sp.master);
+        let reader = read_all(&m);
+        assert_eq!(m.wait_exit(), (Some(3), None));
         let out = reader.join().unwrap();
         assert!(out.contains("midna-conpty-ok"), "{out:?}");
+        // The keeper goes once it has told us.
+        assert!(m.wait_keeper(Duration::from_secs(10)), "the keeper stayed");
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn a_killed_keeper_ends_its_terminal() {
+        let h = home("host");
+        let argv: Vec<String> = ["cmd", "/d"].iter().map(|s| s.to_string()).collect();
+        let sp = spawn(&Owner { home: &h, sid: "host", tied: true }, &argv, ".", &[], 80, 24).expect("spawn");
+        let m = Arc::new(sp.master);
+        let reader = read_all(&m);
+        assert!(m.child_alive());
+        unsafe { TerminateProcess(raw(&m.keeper), 9) };
+        assert_eq!(m.wait_exit(), (None, Some(HOST_EXITED)));
+        assert!(!m.child_alive(), "the shell outlived its keeper");
+        reader.join().unwrap();
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn a_hangup_ends_the_shell_and_its_keeper() {
+        let h = home("hup");
+        let argv: Vec<String> = ["cmd", "/d"].iter().map(|s| s.to_string()).collect();
+        let sp = spawn(&Owner { home: &h, sid: "hup", tied: true }, &argv, ".", &[], 80, 24).expect("spawn");
+        let m = Arc::new(sp.master);
+        let reader = read_all(&m);
+        m.hangup();
+        let (code, signal) = m.wait_exit();
+        assert!(code.is_some() && signal.is_none(), "{code:?} {signal:?}");
+        assert!(m.wait_keeper(Duration::from_secs(10)), "the keeper stayed");
+        reader.join().unwrap();
+        // The next terminal of the session gets the name.
+        let again = spawn(&Owner { home: &h, sid: "hup", tied: true }, &["cmd".to_string(), "/d".into(), "/c".into(), "exit 0".into()], ".", &[], 80, 24).expect("again");
+        assert_eq!(again.master.wait_exit(), (Some(0), None));
+        let _ = std::fs::remove_dir_all(&h);
     }
 }

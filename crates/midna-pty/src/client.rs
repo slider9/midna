@@ -101,12 +101,24 @@ pub struct Started {
 /// Start a keeper and its shell: [`launch`], connect, `hello`, `spawn`. The client stays
 /// connected; drop it (or the process) and the keeper keeps the shell for the next one.
 pub fn start(exe: &Path, home: &Path, session: &str, shell: Spawn) -> io::Result<Started> {
+    start_in(exe, home, session, shell, None)
+}
+
+/// [`start`], with the keeper put in `job` before it starts the shell, so the shell, its console
+/// host and everything they start are in it too (a job that ends them all when it closes ties
+/// the terminal to the process holding it).
+pub fn start_in(exe: &Path, home: &Path, session: &str, shell: Spawn, job: Option<&OwnedHandle>) -> io::Result<Started> {
     let keeper = launch(exe, home, session)?;
     let fail = |keeper: &Launched, e: io::Error| {
         // Don't leave a keeper that never got a shell (it would exit on its own, later).
         unsafe { windows_sys::Win32::System::Threading::TerminateProcess(raw(&keeper.process), 1) };
         e
     };
+    if let Some(job) = job
+        && unsafe { windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(raw(job), raw(&keeper.process)) } == 0
+    {
+        return Err(fail(&keeper, io::Error::other(format!("can't put the keeper in its job: {}", win::last_error()))));
+    }
     let client = Client::connect_launched(&names::pipe_name(home, session), &keeper, Duration::from_secs(10)).map_err(|e| fail(&keeper, e))?;
     let hello = client.hello().map_err(|e| fail(&keeper, e))?;
     if hello.protocol < PROTOCOL {

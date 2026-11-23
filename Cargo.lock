@@ -4179,6 +4179,7 @@ dependencies = [
  "libghostty-vt",
  "lz4_flex",
  "midna-proto",
+ "midna-pty",
  "security-framework",
  "serde",
  "serde_json",

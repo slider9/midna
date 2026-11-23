@@ -15,8 +15,6 @@ use std::sync::{Arc, Weak};
 /// The PTY master (a pseudoconsole on Windows); closed when the last holder (reader, engine,
 /// writers) drops it.
 pub type PtyFd = pty::Master;
-#[cfg(windows)]
-pub use crate::pty::wait_exit;
 
 pub enum EngineMsg {
     Bytes(Vec<u8>, u64),
@@ -223,6 +221,18 @@ fn apply_resize(eng: &mut Engine, fd: &PtyFd, (c, r, cw, ch): (u16, u16, u32, u3
     fd.resize(c, r);
 }
 
+/// Windows names a terminal's keeper after its session, and ties it to this process when midnad
+/// runs inside another program (a test) rather than as its own.
+fn spawn(d: &Daemon, l: &Launch) -> std::io::Result<pty::Spawned> {
+    #[cfg(windows)]
+    return pty::spawn(&pty::Owner { home: &d.cfg.home, sid: &l.sid, tied: !d.cfg.owns_process }, &l.argv, &l.cwd, &l.env, l.cols, l.rows);
+    #[cfg(unix)]
+    {
+        let _ = d;
+        pty::spawn(&l.argv, &l.cwd, &l.env, l.cols, l.rows)
+    }
+}
+
 pub fn start(d: &Arc<Daemon>, l: Launch) -> std::io::Result<RtHandle> {
     start_on(d, l, None)
 }
@@ -231,7 +241,7 @@ pub fn start(d: &Arc<Daemon>, l: Launch) -> std::io::Result<RtHandle> {
 /// scrollback left off (an agent that exited, replaced by a shell).
 pub fn start_on(d: &Arc<Daemon>, mut l: Launch, snap: Option<crate::engine::TermSnap>) -> std::io::Result<RtHandle> {
     (l.cols, l.rows) = clamp_size(l.cols, l.rows);
-    let sp = pty::spawn(&l.argv, &l.cwd, &l.env, l.cols, l.rows)?;
+    let sp = spawn(d, &l)?;
     let pid = sp.pid;
     let (cols, rows) = (l.cols, l.rows);
     let make: MakeEngine = match snap {
@@ -248,7 +258,7 @@ pub fn start_on(d: &Arc<Daemon>, mut l: Launch, snap: Option<crate::engine::Term
 /// answer typed into the new process.
 pub fn start_with_preface(d: &Arc<Daemon>, mut l: Launch, preface: Vec<u8>) -> std::io::Result<RtHandle> {
     (l.cols, l.rows) = clamp_size(l.cols, l.rows);
-    let sp = pty::spawn(&l.argv, &l.cwd, &l.env, l.cols, l.rows)?;
+    let sp = spawn(d, &l)?;
     let pid = sp.pid;
     let (cols, rows) = (l.cols, l.rows);
     let make: MakeEngine = Box::new(move |replies| {
@@ -360,6 +370,13 @@ fn reader_thread(fd: Arc<PtyFd>, tx: SyncSender<EngineMsg>, activity: Arc<Atomic
 
 fn reaper_thread(sid: String, generation: u64, pid: i32, fd: Arc<PtyFd>, d: Weak<Daemon>, drained: Receiver<()>, gate: Receiver<()>) {
     let _ = std::thread::Builder::new().name("reaper".into()).spawn(move || {
+        // Windows: the shell, or its keeper if that dies first.
+        #[cfg(windows)]
+        let (code, signal) = {
+            let _ = pid;
+            fd.wait_exit()
+        };
+        #[cfg(unix)]
         let (code, signal) = wait_exit(pid);
         // A pseudoconsole outlives its app: closing it ends the output, so the reader drains.
         fd.child_exited();

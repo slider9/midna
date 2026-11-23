@@ -73,6 +73,7 @@ pub fn run(args: &[String]) -> i32 {
         pipe,
         own_dir: exe.parent().map(Path::to_path_buf).unwrap_or_default(),
         exe,
+        creator: win::Creator::find(),
         log,
         shell: OnceLock::new(),
         exit_code: Mutex::new(None),
@@ -96,6 +97,8 @@ struct Keeper {
     pipe: Pipe,
     exe: PathBuf,
     own_dir: PathBuf,
+    /// The process that started this keeper. It may drive it whatever program it runs.
+    creator: Option<win::Creator>,
     log: Log,
     shell: OnceLock<Arc<Shell>>,
     exit_code: Mutex<Option<u32>>,
@@ -191,8 +194,13 @@ impl Keeper {
         }
     }
 
-    /// A client must be midnad from this home's `bin` (any version) or from beside the keeper.
+    /// A client must be midnad from this home's `bin` (any version) or from beside the keeper,
+    /// or the process that started the keeper. That one is held open, so its pid is still its
+    /// own.
     fn allowed(&self, pid: u32) -> Result<(), String> {
+        if self.creator.as_ref().is_some_and(|c| c.pid == pid) {
+            return Ok(());
+        }
         let image = win::process_image(pid).ok_or("can't see its program")?;
         let real = midna_proto::paths::canonical(&image).unwrap_or(image);
         let name = real.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
