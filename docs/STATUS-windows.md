@@ -93,8 +93,10 @@ apply (or quitting) starts the staged `midna-app.exe --apply-update <install fol
 <pid>` and the app quits. That helper waits for it to exit, copies each new file in beside its
 old one as `<name>.new`, then one by one renames the old file to `<name>.old` (Windows renames a
 running exe) and the new one into place, `midna-bundle.txt` last; if any rename fails it renames
-everything back. It starts the app (new or old) and exits. The new app deletes the `.old` files
-and the staged builds no newer than itself, and starts as usual, which brings midnad onto its
+everything back. A swap that went all the way lists the `.old` files it made in
+`midna-update-leftovers.txt`; nothing else is ever deleted, so after a failed or interrupted swap
+the old files stay. It starts the app (new or old) and exits. The new app deletes the listed
+`.old` files and the staged builds no newer than itself, and starts as usual, which brings midnad onto its
 build. An update that wasn't installed leaves its error in `updates\apply-failed.txt`, and the
 app it started shows it as a failed check. `midna-app.exe --quit` (a script about to change the
 install) leaves a ready update for next time. Builds aren't Authenticode-signed yet, so there's

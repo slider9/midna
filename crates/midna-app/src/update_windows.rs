@@ -10,8 +10,10 @@
 //!    running or open, as long as it was opened to allow that), the new one moved in, the marker
 //!    last; a failure renames everything back. Then it starts the app and exits. Swapping the
 //!    whole folder would fail whenever any process had a file open or its working folder in it.
-//! 4. The new app ([`after_update`]) deletes the `.old` files and starts as usual, which brings
-//!    the daemon onto its build (`lifecycle::ensure_daemon_current`).
+//!    A swap that went all the way lists the `.old` files it made in the install's
+//!    `midna-update-leftovers.txt`.
+//! 4. The new app ([`after_update`]) deletes the listed `.old` files (nothing else) and starts
+//!    as usual, which brings the daemon onto its build (`lifecycle::ensure_daemon_current`).
 //!
 //! `--uninstall` (what Settings ▸ Apps runs) uses the same after-exit step to take the install
 //! folder away: [`remove_after_exit`] runs a copy of the app from `%TEMP%` as
@@ -30,6 +32,11 @@ const WAIT_FOR_APP: Duration = Duration::from_secs(60);
 const SELFTEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Where a failed `--apply-update` leaves its error for the app it starts (`MIDNA_HOME\updates`).
 const FAILED_FILE: &str = "apply-failed.txt";
+/// In the install: the `.old` files a finished swap set aside, one path (relative to the
+/// install) per line, for the next launch to delete. Only a swap that went all the way writes
+/// it, so the only copy of a file a failed or interrupted swap couldn't put back is never
+/// deleted, and neither is anything else that happens to end in `.old`.
+const LEFTOVERS_FILE: &str = "midna-update-leftovers.txt";
 
 // ------------------------------------------------------------------ stage
 
@@ -203,7 +210,8 @@ pub fn apply_main(args: &[String]) -> i32 {
 /// full disk) fails before anything in the install has changed. Then, one file at a time, the
 /// old file is renamed to `<name>.old` and the new one renamed in; the marker goes last, so a
 /// folder with the marker always holds a whole build. If any rename fails, the files already
-/// swapped are renamed back. Files the new build doesn't have are left alone.
+/// swapped are renamed back. Files the new build doesn't have are left alone. Once every file is
+/// in, the `.old` files are listed in [`LEFTOVERS_FILE`] for [`after_update`] to delete.
 pub fn swap_in(new: &Path, install: &Path) -> Result<(), String> {
     let files = files_of(new)?;
     let mut copies = vec![];
@@ -246,7 +254,37 @@ pub fn swap_in(new: &Path, install: &Path) -> Result<(), String> {
             }
         }
     }
+    let olds: Vec<PathBuf> = swapped.into_iter().filter_map(|(_, old)| old).collect();
+    if let Err(e) = note_leftovers(install, &olds) {
+        // The update is in; the .old files just stay until something lists them.
+        log(&format!("--apply-update: couldn't list the old files in {}: {e}", install.join(LEFTOVERS_FILE).display()));
+    }
     Ok(())
+}
+
+/// Add `olds` to the install's [`LEFTOVERS_FILE`] (written aside, then renamed in).
+fn note_leftovers(install: &Path, olds: &[PathBuf]) -> std::io::Result<()> {
+    let list = install.join(LEFTOVERS_FILE);
+    let mut lines: Vec<String> = std::fs::read_to_string(&list).unwrap_or_default().lines().map(str::to_string).filter(|l| !l.is_empty()).collect();
+    for old in olds {
+        if let Ok(rel) = old.strip_prefix(install) {
+            lines.push(rel.to_string_lossy().to_string());
+        }
+    }
+    write_list(&list, &lines)
+}
+
+/// Write `lines` to `list`, or remove it when there are none.
+fn write_list(list: &Path, lines: &[String]) -> std::io::Result<()> {
+    if lines.is_empty() {
+        return match std::fs::remove_file(list) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    let tmp = suffixed(list, ".tmp");
+    std::fs::write(&tmp, lines.join("\n") + "\n")?;
+    retry(|| std::fs::rename(&tmp, list))
 }
 
 /// `to.new` in place of `to`, with the old `to` (if any) moved aside. Returns where it went.
@@ -284,14 +322,16 @@ fn roll_back(swapped: &[(PathBuf, Option<PathBuf>)]) -> Vec<PathBuf> {
     stuck
 }
 
-/// `<name>.old` for `to`, clearing one a previous update left; when that one can't go (it is
-/// still running), `<name>.<n>.old`.
+/// The first of `<name>.old`, `<name>.1.old`, `<name>.2.old`… that isn't there. One left by an
+/// earlier update is never deleted here: it may still be running, or be the only copy of a file
+/// a failed swap couldn't put back. [`after_update`] deletes the ones a finished swap listed.
 fn free_old_name(to: &Path) -> PathBuf {
+    let free = |p: &PathBuf| p.symlink_metadata().is_err();
     let plain = suffixed(to, ".old");
-    if plain.symlink_metadata().is_err() || std::fs::remove_file(&plain).is_ok() {
+    if free(&plain) {
         return plain;
     }
-    (1..).map(|n| suffixed(to, &format!(".{n}.old"))).find(|p| p.symlink_metadata().is_err() || std::fs::remove_file(p).is_ok()).unwrap_or(plain)
+    (1..).map(|n| suffixed(to, &format!(".{n}.old"))).find(free).unwrap_or(plain)
 }
 
 /// The files under `dir`, relative to it, the marker last and the app just before it.
@@ -323,9 +363,9 @@ fn files_of(dir: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 /// What a finished update leaves for the new app (run at launch, from the install): delete the
-/// `.old` and `.new` files in `install`, and the staged builds in `MIDNA_HOME\updates` that are
-/// no newer than this one. Returns the error of an `--apply-update` that failed, for the app to
-/// show.
+/// `.old` files its swap listed in [`LEFTOVERS_FILE`], and the staged builds in
+/// `MIDNA_HOME\updates` that are no newer than this one. Returns the error of an
+/// `--apply-update` that failed, for the app to show.
 pub fn after_update(install: &Path, home: &Path) -> Option<String> {
     if install.join(BUNDLE_MARKER).is_file() {
         let removed = remove_leftovers(install);
@@ -346,22 +386,51 @@ pub fn after_update(install: &Path, home: &Path) -> Option<String> {
     Some(error.trim().to_string()).filter(|e| !e.is_empty())
 }
 
-/// Delete every `*.old` and `*.new` file under `dir`; the ones still in use stay for next time.
-fn remove_leftovers(dir: &Path) -> usize {
+/// Delete the `.old` files listed in `install`'s [`LEFTOVERS_FILE`]; the ones still in use stay
+/// listed for next time. A line that isn't a `.old` path inside the install is dropped unread.
+fn remove_leftovers(install: &Path) -> usize {
+    let list = install.join(LEFTOVERS_FILE);
+    let Ok(text) = std::fs::read_to_string(&list) else { return 0 };
     let mut n = 0;
-    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let p = e.path();
-        if e.file_type().is_ok_and(|t| t.is_dir()) {
-            n += remove_leftovers(&p);
-        } else if is_leftover(&p) && std::fs::remove_file(&p).is_ok() {
-            n += 1;
+    let mut keep = vec![];
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let rel = Path::new(line);
+        let inside = rel.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !inside || !line.ends_with(".old") {
+            continue;
+        }
+        match std::fs::remove_file(install.join(rel)) {
+            Ok(()) => n += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => keep.push(line.to_string()),
         }
     }
+    let _ = write_list(&list, &keep);
     n
 }
 
-fn is_leftover(p: &Path) -> bool {
-    p.extension().is_some_and(|x| x == "old" || x == "new")
+/// The file `name` is a copy an update makes of: `<base>.new`, `<base>.old` or `<base>.<n>.old`.
+fn leftover_of(name: &str) -> Option<&str> {
+    if let Some(base) = name.strip_suffix(".new") {
+        return Some(base);
+    }
+    let rest = name.strip_suffix(".old")?;
+    match rest.rsplit_once('.') {
+        Some((base, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => Some(base),
+        _ => Some(rest),
+    }
+}
+
+/// One of the build's own top-level files ([`BUILD_FILES`], the marker), or an update's copy of one.
+fn is_build_file(name: &str) -> bool {
+    let own = |n: &str| BUILD_FILES.contains(&n) || n == BUNDLE_MARKER;
+    own(name) || leftover_of(name).is_some_and(own)
+}
+
+/// A font or license file in `Fonts`, or an update's copy of one.
+fn is_font_file(name: &str) -> bool {
+    let own = |n: &str| Path::new(n).extension().is_some_and(|x| ["ttf", "otf", "txt"].iter().any(|e| x.eq_ignore_ascii_case(e)));
+    own(name) || leftover_of(name).is_some_and(own)
 }
 
 fn record_failure(error: &str) {
@@ -424,8 +493,8 @@ pub fn remove_main(args: &[String]) -> i32 {
     code
 }
 
-/// Remove the build in `dir` ([`BUILD_FILES`], `Fonts`, the update leftovers, the marker last)
-/// and `dir` itself once it's empty. Refuses a folder without the marker. Returns the names of
+/// Remove the build in `dir` ([`BUILD_FILES`], `Fonts`, an update's copies of those and its
+/// [`LEFTOVERS_FILE`], the marker last) and `dir` itself once it's empty. Refuses a folder without the marker. Returns the names of
 /// what was left because it isn't Midna's.
 pub fn remove_install(dir: &Path) -> Result<Vec<String>, String> {
     if !dir.join(BUNDLE_MARKER).is_file() {
@@ -442,13 +511,12 @@ pub fn remove_install(dir: &Path) -> Result<Vec<String>, String> {
     for e in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?.flatten() {
         let (p, name) = (e.path(), e.file_name().to_string_lossy().to_string());
         let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
-        if !is_dir && (BUILD_FILES.contains(&name.as_str()) || is_leftover(&p)) {
+        if !is_dir && name != BUNDLE_MARKER && (is_build_file(&name) || name == LEFTOVERS_FILE) {
             remove(&p);
         } else if is_dir && name == "Fonts" {
             for f in std::fs::read_dir(&p).into_iter().flatten().flatten() {
                 let fp = f.path();
-                let ext = fp.extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
-                if f.file_type().is_ok_and(|t| t.is_file()) && matches!(ext.as_str(), "ttf" | "otf" | "txt" | "old" | "new") {
+                if f.file_type().is_ok_and(|t| t.is_file()) && is_font_file(&f.file_name().to_string_lossy()) {
                     remove(&fp);
                 } else {
                     left.push(format!("Fonts\\{}", f.file_name().to_string_lossy()));
@@ -598,7 +666,10 @@ mod tests {
         let (new, install, home) = (d.join("staged"), d.join("Midna"), d.join("home"));
         build(&new, &NEW, "v2");
         build(&install, &OLD, "v1");
-        std::fs::write(install.join("notes.txt"), "mine").unwrap();
+        // The user's own files, some named like an update's copies.
+        for mine in ["notes.txt", "notes.old", "draft.new", "Fonts/mine.ttf.old"] {
+            std::fs::write(install.join(mine), "mine").unwrap();
+        }
         swap_in(&new, &install).unwrap();
         for (rel, text) in NEW {
             assert_eq!(read(&install.join(rel)), text, "{rel}");
@@ -609,10 +680,12 @@ mod tests {
         assert!(!install.join("midna-pty.exe.old").exists(), "a file new in this build has nothing to set aside");
         // The staged build stays whole (its midna-app.exe is the helper doing this).
         assert_eq!(read(&new.join("midna-app.exe")), "app 2");
-        // Next launch: the .old files go; files that aren't the build's stay.
+        assert_eq!(read(&install.join(LEFTOVERS_FILE)), "Fonts\\a.ttf.old\nmidnad.exe.old\nmidna-app.exe.old\nmidna-bundle.txt.old\n");
+        // Next launch: the .old files the swap listed go, and the list with them; every other
+        // file stays, whatever it's called.
         assert_eq!(after_update(&install, &home), None);
-        assert_eq!(names(&install), ["Fonts", "midna-app.exe", "midna-bundle.txt", "midna-pty.exe", "midnad.exe", "notes.txt"]);
-        assert_eq!(names(&install.join("Fonts")), ["a.ttf"]);
+        assert_eq!(names(&install), ["Fonts", "draft.new", "midna-app.exe", "midna-bundle.txt", "midna-pty.exe", "midnad.exe", "notes.old", "notes.txt"]);
+        assert_eq!(names(&install.join("Fonts")), ["a.ttf", "mine.ttf.old"]);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -666,6 +739,30 @@ mod tests {
         // Once it's let go, the same update goes through.
         swap_in(&new, &install).unwrap();
         assert_eq!(read(&install.join("midna-app.exe")), "app 2");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_swap_that_didnt_finish_leaves_its_old_files_alone() {
+        // A helper killed half way: midnad.exe is new, its .old is the only copy of the old one,
+        // and nothing listed it. The next launch, and the next update, keep it.
+        let d = scratch("interrupted");
+        let (new, install, home) = (d.join("staged"), d.join("Midna"), d.join("home"));
+        build(&install, &[("midna-app.exe", "app 1"), ("midnad.exe", "daemon 2"), ("midnad.exe.old", "daemon 1")], "v1");
+        assert_eq!(after_update(&install, &home), None);
+        assert_eq!(read(&install.join("midnad.exe.old")), "daemon 1");
+        build(&new, &NEW, "v2");
+        swap_in(&new, &install).unwrap();
+        assert_eq!(read(&install.join("midnad.exe.old")), "daemon 1");
+        assert_eq!(read(&install.join("midnad.exe.1.old")), "daemon 2");
+        after_update(&install, &home);
+        assert_eq!(read(&install.join("midnad.exe.old")), "daemon 1", "only what the finished swap listed goes");
+        assert!(!install.join("midnad.exe.1.old").exists() && !install.join(LEFTOVERS_FILE).exists());
+        // A list naming something outside the install, or not a .old file, deletes nothing.
+        std::fs::write(d.join("outside.old"), "x").unwrap();
+        std::fs::write(install.join(LEFTOVERS_FILE), "..\\outside.old\nmidnad.exe\nC:\\x.old\n").unwrap();
+        assert_eq!(remove_leftovers(&install), 0);
+        assert!(d.join("outside.old").exists() && install.join("midnad.exe").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -776,18 +873,19 @@ mod tests {
     fn uninstall_removes_the_build_and_only_the_build() {
         let d = scratch("remove");
         let install = d.join("Midna");
-        build(&install, &[("midna-app.exe", ""), ("midnad.exe", ""), ("conpty.dll", ""), ("Fonts/a.ttf", ""), ("Fonts/OFL.txt", ""), ("midna.exe.old", "")], "");
+        build(&install, &[("midna-app.exe", ""), ("midnad.exe", ""), ("conpty.dll", ""), ("Fonts/a.ttf", ""), ("Fonts/OFL.txt", ""), ("Fonts/a.ttf.old", ""), ("midna.exe.old", ""), ("midnad.exe.2.old", ""), ("midna-app.exe.new", ""), ("midna-bundle.txt.old", ""), (LEFTOVERS_FILE, "")], "");
         assert_eq!(remove_install(&install), Ok(vec![]));
         assert!(!install.exists());
         // Unpacked among someone's files: only Midna's go, and the folder stays.
         let downloads = d.join("Downloads");
-        build(&downloads, &[("midna-app.exe", ""), ("midnad.exe", ""), ("report.pdf", ""), ("tool.exe", ""), ("Fonts/a.ttf", ""), ("Fonts/mine.psd", "")], "");
-        assert_eq!(remove_install(&downloads), Ok(vec!["Fonts\\mine.psd".to_string(), "report.pdf".into(), "tool.exe".into()]));
-        assert_eq!(names(&downloads), ["Fonts", "report.pdf", "tool.exe"]);
-        assert_eq!(names(&downloads.join("Fonts")), ["mine.psd"]);
+        build(&downloads, &[("midna-app.exe", ""), ("midnad.exe", ""), ("report.pdf", ""), ("report.old", ""), ("tool.exe.new", ""), ("Fonts/a.ttf", ""), ("Fonts/mine.psd", ""), ("Fonts/mine.psd.old", "")], "");
+        let left = remove_install(&downloads).unwrap();
+        assert_eq!(left, ["Fonts\\mine.psd", "Fonts\\mine.psd.old", "report.old", "report.pdf", "tool.exe.new"]);
+        assert_eq!(names(&downloads), ["Fonts", "report.old", "report.pdf", "tool.exe.new"]);
+        assert_eq!(names(&downloads.join("Fonts")), ["mine.psd", "mine.psd.old"]);
         // Never a folder without the marker.
         assert!(remove_install(&downloads).unwrap_err().contains("isn't an installed Midna"));
-        assert_eq!(names(&downloads), ["Fonts", "report.pdf", "tool.exe"]);
+        assert_eq!(names(&downloads), ["Fonts", "report.old", "report.pdf", "tool.exe.new"]);
         let _ = std::fs::remove_dir_all(&d);
     }
 
