@@ -545,7 +545,11 @@ fn model(m: &MainWindow, t: &Theme, window: &Window) -> Model {
             md.title = vec!["Your terminals,".into(), "wherever you go.".into()];
             md.title_size = 50.;
             md.title_lh = 1.04;
-            md.body = "Five quick jumps and midna can carry your shells and agents across quits, updates and webhooks. Every jump can wait.".into();
+            md.body = os(
+                "Five quick jumps and midna can carry your shells and agents across quits, updates and webhooks. Every jump can wait.",
+                "Five quick jumps and midna can carry your shells and agents across quits and webhooks. Every jump can wait.",
+            )
+            .into();
             md.body_size = 18.;
             md.body_top = 20.;
             md.primary = "Begin ↩".into();
@@ -1298,7 +1302,7 @@ fn guide_daemon(md: &Model) -> Div {
         .w(md.u(400.))
         .flex()
         .flex_col()
-        .child(gbox(md, false).px(md.u(18.)).py(md.u(16.)).child(row("midna", "QUIT · UPDATING", ember)))
+        .child(gbox(md, false).px(md.u(18.)).py(md.u(16.)).child(row("midna", os("QUIT · UPDATING", "QUIT"), ember)))
         .child(div().ml(md.u(36.)).h(md.u(36.)).border_l_2().border_dashed().border_color(rgb(md.pal.line, 1.)))
         .child(
             gbox(md, true)
