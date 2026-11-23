@@ -6,7 +6,7 @@
 //! looking at); with no app connected midnad shows them itself (`via: system`). Each carries
 //! its category's sound file, volume and image (`style`, see `crate::notify_media`), and that
 //! sound rendered at its volume, in `~/Library/Sounds`, for macOS to play with the banner
-//! (`notify_media::banner_sound`).
+//! (`notify_media::banner_sound`). On Windows midnad's own are toasts (`crate::notify_windows`).
 //! Its title and text are midna's own unless `notify.title.<key>` / `notify.body.<key>` hold
 //! a template (`texts`).
 //!
@@ -568,7 +568,8 @@ pub fn style(home: &std::path::Path, setting: &dyn Fn(&str) -> Value, category: 
 /// Play a sound now, with no notification (`notify.play`): `what` is a kind (a notification
 /// category or a sound effect: its sound at its volume) or a sound's name (at `volume`, else
 /// full). Scaled by `notify.volume`; nothing plays with `notify.sounds` off. The app plays it;
-/// with no app, midnad does (`afplay`) when `notify.when_app_closed` allows.
+/// with no app, midnad does (`afplay`; on Windows `PlaySoundW`) when `notify.when_app_closed`
+/// allows.
 pub fn play(d: &Daemon, session: Option<Id>, what: &str, volume: Option<u8>, rate_limit: bool) -> Result<NotifyPlayResult, String> {
     let (file, volume, kind, enabled, when_app_closed) = {
         let core = d.core();
@@ -623,6 +624,11 @@ pub fn play(d: &Daemon, session: Option<Id>, what: &str, volume: Option<u8>, rat
     let played = notify::Played { sound: name.clone(), file: file.clone(), volume: volume as u8, kind, via: via.into() };
     let project = session.as_deref().and_then(|s| d.core().state.session(s).map(|s| s.project_id.clone()));
     d.emit(kinds::NOTIFY_SOUND, Actor::system(), project, session, serde_json::to_value(&played).unwrap_or_default());
+    #[cfg(windows)]
+    if via == "system" {
+        crate::notify_windows::play(&d.cfg.home, &file, volume as u8);
+    }
+    #[cfg(not(windows))]
     if via == "system" {
         let v = format!("{:.2}", volume as f32 / 100.);
         let _ = std::thread::Builder::new().name("notify-afplay".into()).spawn(move || {
@@ -693,7 +699,8 @@ fn post(d: &Daemon, draft: Draft) -> Result<Posted, &'static str> {
         title: truncate(&title, TITLE_MAX),
         body: truncate(&text, BODY_MAX),
         sound: sound.is_some(),
-        notification_sound: sound.as_ref().and_then(|(f, v)| {
+        // Only macOS banners name a sound file (Windows plays the file beside a silent toast).
+        notification_sound: sound.as_ref().filter(|_| cfg!(target_os = "macos")).and_then(|(f, v)| {
             let dir = crate::notify_media::banner_dir(&d.cfg.home, system_allowed(d));
             crate::notify_media::banner_sound(&d.cfg.home, &dir, f, *v)
         }),
@@ -712,9 +719,10 @@ fn post(d: &Daemon, draft: Draft) -> Result<Posted, &'static str> {
         open: draft.extras.open,
         actions: draft.extras.actions,
     };
+    let session = draft.session.clone();
     d.emit(kinds::NOTIFY_POSTED, Actor::system(), draft.project, draft.session, serde_json::to_value(&posted).unwrap_or_default());
     if via == "system" {
-        show_system(&posted);
+        show_system(d, &posted, session.as_deref());
     }
     Ok(posted)
 }
@@ -725,9 +733,16 @@ fn system_allowed(d: &Daemon) -> bool {
     d.cfg.owns_process && std::env::var("MIDNA_NOTIFY_SYSTEM").as_deref() != Ok("0")
 }
 
+/// No app to show it: a toast on Windows (`notify_windows::show`).
+#[cfg(windows)]
+fn show_system(d: &Daemon, p: &Posted, session: Option<&str>) {
+    crate::notify_windows::show(&d.cfg.home, p, session);
+}
+
 /// No app to show it: post through `osascript` (shown as a Script Editor notification, no
 /// image) and play the sound with `afplay` at its volume.
-fn show_system(p: &Posted) {
+#[cfg(not(windows))]
+fn show_system(_: &Daemon, p: &Posted, _: Option<&str>) {
     let q = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!("display notification \"{}\" with title \"{}\"", q(&midna_proto::notify::plain_body(&p.body)), q(&p.title));
     let sound = p.sound_file.clone().map(|f| (f, p.volume.unwrap_or(100)));
