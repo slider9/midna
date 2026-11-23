@@ -202,7 +202,7 @@ fn item_label(item: &str) -> &str {
         "triggers" => "Triggers today",
         "hooks" => "Agent hooks (when they need you)",
         "accessibility" => "Accessibility (when Kass needs it)",
-        "awake" => "Keeping the Mac awake (while it is)",
+        "awake" => midna_proto::wording::os("Keeping the Mac awake (while it is)", "Keeping the PC awake (while it is)"),
         "script" => "Git: worktree and branch",
         "spacer" => "Spacer (push the rest right)",
         "update" => "Update ready",
@@ -326,7 +326,7 @@ fn mac_item(m: &MainWindow, name: String, t: &Theme) -> AnyElement {
     let tip_text = if remote {
         format!("This window shows {name}: its terminals and agents run there, over a link from this Mac.")
     } else {
-        format!("This window shows {name}, this Mac: its terminals run in midnad and keep running when this window closes.")
+        format!("This window shows {name}, this {}: its terminals run in midnad and keep running when this window closes.", midna_proto::wording::MAC)
     };
     // Another Mac's window until its terminals arrive, or while its link is tried again: amber,
     // spinning (design 3 Connecting and Reconnecting). Offline, red: below.
@@ -409,8 +409,9 @@ fn awake_item(m: &MainWindow, t: &Theme, _cx: &mut Context<MainWindow>) -> Optio
 fn awake_tip(line: Option<&str>, mac: Option<&str>) -> String {
     match mac {
         None => {
-            let line = line.unwrap_or("Keeping the Mac awake");
-            format!("{line}. The display may still sleep; closing the lid still sleeps the Mac. Settings › Agents › Keep the Mac awake.")
+            let pc = midna_proto::wording::MAC;
+            let line = line.map_or_else(|| format!("Keeping the {pc} awake"), str::to_string);
+            format!("{line}. The display may still sleep; closing the lid still sleeps the {pc}. Settings › Agents › Keep the {pc} awake.")
         }
         Some(mac) => {
             let line = line.unwrap_or("Keeping awake");

@@ -19,6 +19,7 @@ use crate::notify::Permission;
 use crate::theme::Theme;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use midna_proto::wording::os;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -272,7 +273,10 @@ pub(crate) fn view(m: &MainWindow, s: Step) -> View {
             let (status, action) = match login() {
                 LoginItem::Enabled | LoginItem::Legacy => (Some(("midnad is running and starts at login.".to_string(), true)), None),
                 LoginItem::Dev => (Some(("Dev build: midnad runs without a login item.".to_string(), true)), None),
-                LoginItem::RequiresApproval => (Some(("Waiting for you to switch on midna in System Settings ▸ Login Items.".to_string(), false)), Some("Open Login Items")),
+                LoginItem::RequiresApproval => (
+                    Some((os("Waiting for you to switch on midna in System Settings ▸ Login Items.", "Waiting for you to switch on midna in Settings ▸ Apps ▸ Startup.").to_string(), false)),
+                    Some(os("Open Login Items", "Open Startup apps")),
+                ),
                 LoginItem::Failed(e) => (Some((format!("Couldn't register: {e}"), false)), Some("Try again")),
                 LoginItem::Checking => (None, None),
                 LoginItem::NotRegistered => (None, Some("Install daemon")),
@@ -286,7 +290,7 @@ pub(crate) fn view(m: &MainWindow, s: Step) -> View {
             let (status, action) = match crate::notify::permission() {
                 Permission::Allowed => (Some(("Allowed.".to_string(), true)), None),
                 Permission::Dev => (Some(("Dev build: notifications go through osascript.".to_string(), true)), None),
-                Permission::Denied => (Some(("Off in System Settings ▸ Notifications ▸ midna.".to_string(), false)), Some("Open Notifications")),
+                Permission::Denied => (Some((os("Off in System Settings ▸ Notifications ▸ midna.", "Off in Settings ▸ System ▸ Notifications ▸ midna.").to_string(), false)), Some("Open Notifications")),
                 Permission::NotAsked | Permission::Unknown => (None, Some("Allow notifications")),
             };
             View { status, action }

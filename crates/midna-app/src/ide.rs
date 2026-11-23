@@ -10,6 +10,7 @@ use crate::icons::Icon;
 use crate::theme::Theme;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use midna_proto::wording::os;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -643,7 +644,11 @@ pub fn menu(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> impl Int
         .text_color(t.dim)
         .child(line(dir).font_family(t.mono_font.clone()))
         .child(line(why))
-        .child(line(if project(m).is_some() { "↩ this project · ⌥↩ all projects".into() } else { "↩ remembers it for all folders".into() }));
+        .child(line(if project(m).is_some() {
+            os("↩ this project · ⌥↩ all projects", "Enter this project · Alt+Enter all projects").into()
+        } else {
+            os("↩ remembers it for all folders", "Enter remembers it for all folders").into()
+        }));
     deferred(
         anchored().anchor(Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(
             div()

@@ -24,6 +24,7 @@ use crate::ide::{self, Ide};
 use crate::theme::Theme;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use midna_proto::wording::os;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use midna_proto::LinkPreview;
@@ -551,7 +552,7 @@ impl TerminalView {
             #[cfg(not(target_os = "macos"))]
             crate::opener::reveal(&l.target);
         }
-        self.preview_flash("Revealed in Finder", false, cx);
+        self.preview_flash(os("Revealed in Finder", "Revealed in File Explorer"), false, cx);
     }
 
     fn preview_copy(&mut self, cx: &mut Context<Self>) {
@@ -686,7 +687,7 @@ impl TerminalView {
         } else {
             let tip = match env.path_click {
                 _ if self.preview_elsewhere() => "Copy path".to_string(),
-                PathClick::Reveal => "Reveal in Finder".to_string(),
+                PathClick::Reveal => os("Reveal in Finder", "Reveal in File Explorer").to_string(),
                 PathClick::Copy => "Copy path".to_string(),
                 PathClick::Ide => c.ide.as_ref().map(|(i, _)| format!("Open in {}", i.name)).unwrap_or_else(|| "Open".into()),
             };
