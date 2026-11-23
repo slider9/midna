@@ -121,6 +121,9 @@ fn main() {
         detach(&cfg, &passthrough);
         return;
     }
+    // Windows: a restart plan that the midnad started for it never got to (it died first).
+    #[cfg(windows)]
+    let resume = resume.or_else(|| midnad::upgrade::leftover(&cfg.home));
     #[cfg(windows)]
     let cfg = work_in_home(cfg);
     // launchd's soft limit is 256: ~50 agents with their connections run out of it.

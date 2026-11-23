@@ -1098,6 +1098,21 @@ fn was_supervised(command: &[String]) -> bool {
 /// reopens its conversation with the model and permission mode it had; the launch command is
 /// rebuilt without its initial prompt, so current midna settings (hooks, MCP) apply.
 pub fn restart_now(d: &Arc<Daemon>, sid: &str, resume: bool, reason: &str, actor: Actor) -> Result<Session, RpcError> {
+    restart_on(d, sid, resume, reason, actor, RestartOn::default())
+}
+
+/// Where a restart starts other than as `restart_now` would.
+#[derive(Default)]
+pub struct RestartOn {
+    /// The old screen and scrollback, carried on above the new process (and its size).
+    pub snap: Option<crate::engine::TermSnap>,
+    /// A folder other than the session's own.
+    pub cwd: Option<String>,
+}
+
+/// `restart_now`, on top of `on.snap` and in `on.cwd` when given (Windows: a terminal reopened
+/// by a new midnad after an update).
+pub fn restart_on(d: &Arc<Daemon>, sid: &str, resume: bool, reason: &str, actor: Actor, on: RestartOn) -> Result<Session, RpcError> {
     let s = d.core().state.session(sid).cloned().ok_or_else(|| not_found(sid))?;
     // The old agent's SessionEnd arrives after the restart: it was this, not the agent.
     d.ends.record(sid, "restart", actor.clone(), s.project_id.clone(), false);
@@ -1108,7 +1123,7 @@ pub fn restart_now(d: &Arc<Daemon>, sid: &str, resume: bool, reason: &str, actor
         return crate::adopt::restart(d, &s, resume, reason, actor);
     }
     let info = s.agent_info.clone().unwrap_or_default();
-    let (cols, rows) = d.rt(sid).and_then(|rt| rt.read(true)).map(|(_, c, r)| (c, r)).unwrap_or((100, 30));
+    let (cols, rows) = on.snap.as_ref().map(|t| (t.cols, t.rows)).or_else(|| d.rt(sid).and_then(|rt| rt.read(true)).map(|(_, c, r)| (c, r))).unwrap_or((100, 30));
     let mut env = session_env(d, &s.id, &s.project_id);
     let command = match s.agent {
         Some(agent) if resume => {
@@ -1135,8 +1150,8 @@ pub fn restart_now(d: &Arc<Daemon>, sid: &str, resume: bool, reason: &str, actor
         let _ = old.tx.send(EngineMsg::Stop);
         stop_orphans(&procs);
     }
-    let launch = Launch { sid: s.id.clone(), argv: argv.unwrap_or_else(|| exec_argv(&command)), cwd: s.cwd.clone(), env, cols, rows };
-    let new_rt = term::start(d, launch).map_err(|e| {
+    let launch = Launch { sid: s.id.clone(), argv: argv.unwrap_or_else(|| exec_argv(&command)), cwd: on.cwd.unwrap_or_else(|| s.cwd.clone()), env, cols, rows };
+    let new_rt = term::start_on(d, launch, on.snap).map_err(|e| {
         d.set_status(sid, StatusState::Failed, Some(format!("restart failed: {e}")), None, Actor::system());
         RpcError::bad_params(format!("could not restart: {e}"))
     })?;

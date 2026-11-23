@@ -274,9 +274,8 @@ fn discover_lists_every_method() {
     assert_eq!(names.len(), midna_proto::catalog().len());
     assert_eq!(call_err(&mut d.human(), "no.such", json!({})).code, -32601);
     // An in-process daemon can't re-exec its host (tests/upgrade.rs covers the real binary).
-    // Windows refuses any in-place upgrade (src/upgrade_windows.rs).
-    let code = if cfg!(windows) { REFUSED } else { CONFLICT };
-    assert_eq!(call_err(&mut d.human(), "daemon.upgrade", json!({ "binary_path": "/x" })).code, code);
+    // On Windows it can't restart its host either (src/upgrade_windows.rs).
+    assert_eq!(call_err(&mut d.human(), "daemon.upgrade", json!({ "binary_path": "/x" })).code, CONFLICT);
 }
 
 #[test]
