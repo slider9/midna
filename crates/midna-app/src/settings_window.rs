@@ -3416,7 +3416,7 @@ impl SettingsWindow {
             }
         }
         let ax = accessibility_trusted();
-        push(os("  ", "// read-only · from midnad and Windows, not settings"), "status", "{".into(), t.fg, "// read-only · from midnad and macOS, not settings".into(), t.fg);
+        push("  ", "status", "{".into(), t.fg, os("// read-only · from midnad and macOS, not settings", "// read-only · from midnad and Windows, not settings").into(), t.fg);
         push("    ", "version", format!("\"{}\",", self.info.get("version").and_then(Value::as_str).unwrap_or("?")), t.ok, String::new(), t.dim);
         push(
             "    ",
