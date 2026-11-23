@@ -88,8 +88,9 @@ pub enum Reopen {
     Shell,
     /// An agent terminal, into its conversation when it has one.
     Agent { resume: bool },
-    /// A shell with an agent typed into it: the shell, then `line` typed into it.
-    Adopted { line: String, resume: bool },
+    /// A shell with an agent typed into it: the shell, then `line` typed into it (None: its
+    /// arguments can't be typed into that shell as they were, so it isn't).
+    Adopted { line: Option<String>, resume: bool },
     /// Not reopened (a monitor: its command may not be safe to run again).
     No,
 }
@@ -338,19 +339,11 @@ fn write_plan(d: &Arc<Daemon>, dir: &Path, bin: &Path, reason: &str) -> Result<P
         if shell {
             // PowerShell under midna keeps the process's folder where its location is.
             cwd = crate::procs::cwd(rt.pid).filter(|c| Path::new(c).is_dir());
-            // The new pseudoconsole starts on an empty screen with its cursor at the top, and
-            // paints by its own rows: the old screen goes up into the scrollback, the note last.
-            let rows = rt.read(true).map(|(_, _, r)| r).unwrap_or(30) as usize;
-            let fresh = [NOTE.as_bytes(), &b"\n".repeat(rows), b"\x1b[H"].concat();
-            let _ = rt.with(move |e| e.feed(&fresh, crate::engine::now_ns()));
             let (tx, rx) = std::sync::mpsc::channel();
             if rt.tx.send(EngineMsg::Snapshot(tx)).is_ok()
-                && let Ok(mut snap) = rx.recv_timeout(Duration::from_secs(5))
+                && let Ok(snap) = rx.recv_timeout(Duration::from_secs(5))
             {
-                // The new shell starts on the main screen.
-                snap.alt_active = false;
-                snap.alt_vt = None;
-                snap.alt_cursor = None;
+                let snap = reopened_screen(snap);
                 let f = format!("{}.primary.vt", s.id);
                 std::fs::write(dir.join(&f), &snap.primary_vt).map_err(|e| e.to_string())?;
                 screen_file = Some(f);
@@ -375,22 +368,70 @@ fn write_plan(d: &Arc<Daemon>, dir: &Path, bin: &Path, reason: &str) -> Result<P
     Ok(plan)
 }
 
+/// The screen a reopened shell starts on, made from a copy of its old one (the running terminal
+/// is left as it is, in case the restart fails): the main screen, with the old screen up in the
+/// scrollback and the note last. The new pseudoconsole starts on an empty screen with its cursor
+/// at the top, and paints by its own rows.
+fn reopened_screen(mut snap: TermSnap) -> TermSnap {
+    snap.alt_active = false;
+    snap.alt_vt = None;
+    snap.alt_cursor = None;
+    let mut e = Engine::restored(&snap, None);
+    let fresh = [NOTE.as_bytes(), &b"\n".repeat(snap.rows as usize), b"\x1b[H"].concat();
+    e.feed(&fresh, crate::engine::now_ns());
+    let mut out = e.snapshot();
+    out.alt_active = false;
+    out.alt_vt = None;
+    out.alt_cursor = None;
+    out
+}
+
 /// What to type into the reopened shell to start its agent again: as it was typed, without the
 /// first prompt, into its conversation when it has one.
-fn typed_line(s: &Session, a: &AdoptedAgent, resume: bool) -> String {
+/// None when the shell's quoting isn't known, or a word can't be typed into it as it is.
+fn typed_line(s: &Session, a: &AdoptedAgent, resume: bool) -> Option<String> {
+    let sh = shell_kind(s.command.first()?)?;
     let spec = crate::adopt::spec_for(a.agent, &a.bin, false);
     let base: Vec<String> = std::iter::once(a.agent.as_str().to_string()).chain(midna_proto::agent_cli::resume_args(a.agent, &spec, &a.args)).collect();
     let argv = match &s.agent_info {
         Some(info) if resume => crate::agent_work::resume_command(a.agent, &base, info).unwrap_or(base),
         _ => base,
     };
-    argv.iter().map(|w| quote(w)).collect::<Vec<_>>().join(" ")
+    argv.iter().map(|w| quote(w, sh)).collect::<Option<Vec<_>>>().map(|v| v.join(" "))
 }
 
-/// A word as PowerShell and cmd both read it.
-fn quote(w: &str) -> String {
-    let plain = !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:/\\=@+,".contains(c));
-    if plain { w.to_string() } else { format!("\"{}\"", w.replace('"', "")) }
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Sh {
+    PowerShell,
+    /// sh, bash, zsh (Git Bash, MSYS).
+    Posix,
+    Cmd,
+}
+
+fn shell_kind(program: &str) -> Option<Sh> {
+    match midna_proto::paths::program_name(program).to_ascii_lowercase().as_str() {
+        "powershell" | "pwsh" => Some(Sh::PowerShell),
+        "sh" | "bash" | "zsh" => Some(Sh::Posix),
+        "cmd" => Some(Sh::Cmd),
+        _ => None,
+    }
+}
+
+/// `w` as one literal word of `sh`'s command line; None when that can't be written (cmd has no
+/// escape for `"` or `%` inside quotes).
+fn quote(w: &str, sh: Sh) -> Option<String> {
+    // Nothing in these means anything to the three shells at the start of or inside a word.
+    let plain = |extra: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:/=+".contains(c) || extra.contains(c));
+    Some(match sh {
+        Sh::PowerShell if plain("\\") => w.to_string(),
+        // Single quotes take everything literally; a quote inside is doubled.
+        Sh::PowerShell => format!("'{}'", w.replace('\'', "''")),
+        Sh::Posix if plain("") => w.to_string(),
+        Sh::Posix => format!("'{}'", w.replace('\'', "'\\''")),
+        Sh::Cmd if plain("\\") => w.to_string(),
+        Sh::Cmd if w.contains(['"', '%']) => return None,
+        Sh::Cmd => format!("\"{w}\""),
+    })
 }
 
 /// SIGTERM's graceful restart is Unix only.
@@ -512,7 +553,7 @@ fn reopen(d: &Arc<Daemon>, plan: &Plan, p: &PlanSession) -> Option<Value> {
                 core.agents.remove(&p.id);
             }
             d.mark_dirty();
-            (*resume, crate::rpc::session::RestartOn { snap: p.term.clone(), cwd: p.cwd.clone() }, Some(line.clone()))
+            (*resume, crate::rpc::session::RestartOn { snap: p.term.clone(), cwd: p.cwd.clone() }, line.clone())
         }
     };
     let r = crate::rpc::session::restart_on(d, &p.id, resume, &reason, Actor::system(), on);
@@ -520,8 +561,18 @@ fn reopen(d: &Arc<Daemon>, plan: &Plan, p: &PlanSession) -> Option<Value> {
         (Err(e), _) => format!("{}: not reopened: {}", p.name, e.message),
         (Ok(_), Reopen::Agent { resume: true }) => format!("{}: the agent reopened in its conversation", p.name),
         (Ok(_), Reopen::Agent { resume: false }) => format!("{}: the agent started again (it had no conversation to reopen)", p.name),
-        (Ok(_), Reopen::Adopted { resume, .. }) => {
+        (Ok(_), Reopen::Adopted { line: Some(_), resume }) => {
             format!("{}: the shell reopened{}, and {} was typed into it{}", p.name, folder(p), s.agent.map_or("the agent", |a| a.as_str()), if *resume { " to reopen its conversation" } else { "" })
+        }
+        (Ok(_), Reopen::Adopted { line: None, resume }) => {
+            let agent = s.agent.map_or("the agent", |a| a.as_str());
+            let conv = s.agent_info.as_ref().and_then(|i| i.conversation_id.clone()).filter(|_| *resume);
+            format!(
+                "{}: the shell reopened{}; start {agent} again yourself{} (its arguments can't be typed into this shell as they were)",
+                p.name,
+                folder(p),
+                conv.map(|c| format!(" with --resume {c}")).unwrap_or_default()
+            )
         }
         (Ok(_), _) => format!("{}: the shell reopened{}; what ran in it was stopped", p.name, folder(p)),
     };
@@ -571,4 +622,61 @@ pub fn set_aside_stale(home: &Path) {
 
 pub fn watchdog_main(_path: &Path) -> ! {
     std::process::exit(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_word_is_typed_literally_into_each_shell() {
+        let ps = |w| quote(w, Sh::PowerShell);
+        assert_eq!(ps("--resume").as_deref(), Some("--resume"));
+        assert_eq!(ps(r"C:\work\a.txt").as_deref(), Some(r"C:\work\a.txt"));
+        // PowerShell expands $ in double quotes, splats @x and makes a,b an array.
+        assert_eq!(ps("$HOME").as_deref(), Some("'$HOME'"));
+        assert_eq!(ps("@args").as_deref(), Some("'@args'"));
+        assert_eq!(ps("a,b").as_deref(), Some("'a,b'"));
+        assert_eq!(ps("it's \"x\"").as_deref(), Some("'it''s \"x\"'"));
+        assert_eq!(ps("").as_deref(), Some("''"));
+        let sh = |w| quote(w, Sh::Posix);
+        assert_eq!(sh("$HOME `x`").as_deref(), Some("'$HOME `x`'"));
+        assert_eq!(sh(r"C:\x").as_deref(), Some(r"'C:\x'"));
+        assert_eq!(sh("it's").as_deref(), Some(r"'it'\''s'"));
+        let cmd = |w| quote(w, Sh::Cmd);
+        assert_eq!(cmd("a & b").as_deref(), Some("\"a & b\""));
+        assert_eq!(cmd("say \"hi\""), None);
+        assert_eq!(cmd("%PATH%"), None);
+    }
+
+    #[test]
+    fn the_shell_is_known_by_its_program() {
+        assert_eq!(shell_kind(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"), Some(Sh::PowerShell));
+        assert_eq!(shell_kind("pwsh"), Some(Sh::PowerShell));
+        assert_eq!(shell_kind(r"C:\Program Files\Git\bin\bash.exe"), Some(Sh::Posix));
+        assert_eq!(shell_kind("cmd.exe"), Some(Sh::Cmd));
+        assert_eq!(shell_kind("nu.exe"), None);
+    }
+
+    #[test]
+    fn the_reopened_screen_is_a_copy_and_the_old_one_is_left_alone() {
+        let mut e = Engine::new(40, 6, None);
+        e.feed(b"PS C:\\> echo hi\r\nhi\r\nPS C:\\> ", 0);
+        let before = e.plain_lines();
+        let snap = e.snapshot();
+        let out = reopened_screen(snap);
+        // The live screen didn't change.
+        assert_eq!(e.plain_lines(), before);
+        // The copy has the old screen, then the note, then an empty screen with the cursor at the top.
+        let mut r = Engine::restored(&out, None);
+        assert_eq!(r.cursor(), (0, 0));
+        // What the new shell paints at its own top row lands below the note, over nothing.
+        r.feed(b"PS C:\\> \x1b[1;1HPS D:\\> ", 0);
+        let lines = r.plain_lines();
+        let note = lines.iter().position(|l| l.contains("midna restarted this terminal")).expect("note");
+        assert!(lines[..note].iter().any(|l| l == "hi"), "{lines:?}");
+        let prompt = lines.iter().position(|l| l == "PS D:\\>").expect("prompt");
+        assert!(prompt > note, "{lines:?}");
+        assert_eq!(lines.iter().filter(|l| l.starts_with("PS")).count(), 3, "{lines:?}");
+    }
 }
