@@ -1,6 +1,7 @@
 //! The few registry calls the app makes, all under `HKEY_CURRENT_USER`: the toast app id
-//! (`notify_windows.rs`) and the login entry that starts midnad (`nonmac/install.rs`).
-use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW};
+//! (`notify_windows.rs`), and the login entry that starts midnad and the Settings ▸ Apps entry
+//! (`nonmac/install.rs`).
+use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, REG_DWORD, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegDeleteTreeW, RegGetValueW, RegSetKeyValueW};
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -13,6 +14,19 @@ pub fn set_string(key: &str, value: Option<&str>, data: &str) -> std::io::Result
     // SAFETY: NUL-terminated UTF-16 strings; REG_SZ's size counts the NUL, in bytes.
     let err = unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, k.as_ptr(), v, REG_SZ, d.as_ptr().cast(), (d.len() * 2) as u32) };
     if err == 0 { Ok(()) } else { Err(std::io::Error::from_raw_os_error(err as i32)) }
+}
+
+/// Set a DWORD value, creating the key.
+pub fn set_dword(key: &str, value: &str, data: u32) -> std::io::Result<()> {
+    let (k, v) = (wide(key), wide(value));
+    // SAFETY: NUL-terminated UTF-16 strings and a 4-byte value.
+    let err = unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, k.as_ptr(), v.as_ptr(), REG_DWORD, (&data as *const u32).cast(), 4) };
+    if err == 0 { Ok(()) } else { Err(std::io::Error::from_raw_os_error(err as i32)) }
+}
+
+/// A DWORD value, None when it (or its key) isn't there.
+pub fn get_dword(key: &str, value: &str) -> Option<u32> {
+    get(key, value, RRF_RT_REG_DWORD).and_then(|b| Some(u32::from_le_bytes(b.get(..4)?.try_into().ok()?)))
 }
 
 /// A string value, None when it (or its key) isn't there.
@@ -52,6 +66,15 @@ pub fn delete(key: &str, value: &str) -> std::io::Result<()> {
     if err == 0 || err == 2 { Ok(()) } else { Err(std::io::Error::from_raw_os_error(err as i32)) }
 }
 
+/// Delete a key with everything in it; one that isn't there is fine.
+pub fn delete_key(key: &str) -> std::io::Result<()> {
+    let k = wide(key);
+    // SAFETY: a NUL-terminated UTF-16 string.
+    let err = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, k.as_ptr()) };
+    // ERROR_FILE_NOT_FOUND: nothing to delete.
+    if err == 0 || err == 2 { Ok(()) } else { Err(std::io::Error::from_raw_os_error(err as i32)) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,15 +88,11 @@ mod tests {
         delete(&key, "name").unwrap();
         assert_eq!(get_string(&key, "name"), None);
         delete(&key, "name").unwrap();
-        // The scratch key itself.
-        let k = wide("Software");
-        let sub = wide(&key["Software\\".len()..]);
-        unsafe {
-            let mut h = std::ptr::null_mut();
-            if windows_sys::Win32::System::Registry::RegOpenKeyExW(HKEY_CURRENT_USER, k.as_ptr(), 0, windows_sys::Win32::System::Registry::KEY_ALL_ACCESS, &mut h) == 0 {
-                windows_sys::Win32::System::Registry::RegDeleteKeyW(h, sub.as_ptr());
-                windows_sys::Win32::System::Registry::RegCloseKey(h);
-            }
-        }
+        set_dword(&key, "n", 7).unwrap();
+        assert_eq!(get_dword(&key, "n"), Some(7));
+        assert_eq!(get_string(&key, "n"), None, "a DWORD isn't a string");
+        delete_key(&key).unwrap();
+        assert_eq!(get_dword(&key, "n"), None);
+        delete_key(&key).unwrap();
     }
 }

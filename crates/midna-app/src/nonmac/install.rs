@@ -5,8 +5,8 @@
 //! `%LOCALAPPDATA%\Programs\Midna`, holding `midna-app.exe`, `midnad.exe`, `midna.exe` and
 //! [`BUNDLE_MARKER`]. Run from there, the app installs midnad into `MIDNA_HOME\bin` (`midnad
 //! --install-self`), starts it at login with a value under `HKCU\…\Run` (`midna-app.exe
-//! --start-daemon`, which starts it with no window and exits) and copies the `midna` CLI into
-//! `~\.local\bin`. Anything else (a `cargo` build, Linux) is dev mode: if midnad isn't
+//! --start-daemon`, which starts it with no window and exits), copies the `midna` CLI into
+//! `~\.local\bin` and adds itself to the Start menu and Settings ▸ Apps. Anything else (a `cargo` build, Linux) is dev mode: if midnad isn't
 //! answering, the `midnad` next to this executable is started directly (opt out:
 //! `MIDNA_NO_SPAWN=1`), and the installed-only calls report that they aren't available.
 //!
@@ -297,6 +297,81 @@ pub fn remove_from_start_menu() -> Option<PathBuf> {
     std::fs::remove_file(&lnk).ok().map(|()| lnk)
 }
 
+/// The entry in Settings ▸ Apps (and Control Panel's Programs and Features): a key under
+/// `HKCU\…\Uninstall` named for the build's bundle id, so Midna Dev's never touches the
+/// installed Midna's. Its Uninstall button runs `midna-app.exe --uninstall`; there's nothing to
+/// modify or repair.
+#[cfg(windows)]
+mod apps_entry {
+    use super::*;
+    use crate::winreg;
+
+    pub fn key() -> String {
+        let id = if midna_proto::paths::is_dev() { format!("{}.dev", midna_proto::paths::BUNDLE_ID) } else { midna_proto::paths::BUNDLE_ID.to_string() };
+        format!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{id}")
+    }
+
+    pub enum Data {
+        Text(String),
+        Number(u32),
+    }
+
+    /// What the entry holds for the build in `bundle`, `size_kb` big.
+    pub fn values(bundle: &Path, size_kb: u32) -> Vec<(&'static str, Data)> {
+        let exe = bundle.join(exe_name("midna-app"));
+        vec![
+            ("DisplayName", Data::Text(super::login::name().into())),
+            ("DisplayVersion", Data::Text(midna_proto::VERSION.into())),
+            ("Publisher", Data::Text("Morgan Hunt".into())),
+            ("DisplayIcon", Data::Text(format!("{},0", exe.display()))),
+            ("InstallLocation", Data::Text(bundle.display().to_string())),
+            ("UninstallString", Data::Text(format!("\"{}\" --uninstall", exe.display()))),
+            ("QuietUninstallString", Data::Text(format!("\"{}\" --uninstall", exe.display()))),
+            ("NoModify", Data::Number(1)),
+            ("NoRepair", Data::Number(1)),
+            ("EstimatedSize", Data::Number(size_kb)),
+        ]
+    }
+
+    pub fn write(key: &str, values: Vec<(&'static str, Data)>) -> std::io::Result<()> {
+        for (name, data) in values {
+            match data {
+                Data::Text(s) => winreg::set_string(key, Some(name), &s)?,
+                Data::Number(n) => winreg::set_dword(key, name, n)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// The size of the files in `dir`, in KB.
+    pub fn size_kb(dir: &Path) -> u32 {
+        fn bytes(dir: &Path) -> u64 {
+            let sizes = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| match e.metadata() {
+                Ok(m) if m.is_dir() => bytes(&e.path()),
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            });
+            sizes.sum()
+        }
+        u32::try_from(bytes(dir).div_ceil(1024)).unwrap_or(u32::MAX)
+    }
+}
+
+/// Add this build to Settings ▸ Apps, or bring its entry up to date (version, folder).
+#[cfg(windows)]
+pub fn add_to_apps(bundle: &Path) -> Result<(), String> {
+    let key = apps_entry::key();
+    apps_entry::write(&key, apps_entry::values(bundle, apps_entry::size_kb(bundle))).map_err(|e| format!("{key}: {e}"))
+}
+
+/// Take this build's entry out of Settings ▸ Apps (`--uninstall`). True when there was one.
+#[cfg(windows)]
+pub fn remove_from_apps() -> Result<bool, String> {
+    let key = apps_entry::key();
+    let had = crate::winreg::get_string(&key, "UninstallString").is_some();
+    crate::winreg::delete_key(&key).map(|()| had).map_err(|e| format!("{key}: {e}"))
+}
+
 /// Same size and bytes.
 #[cfg(windows)]
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -571,6 +646,33 @@ mod tests {
         shortcut(&lnk, &bundle.join("midna-app.exe"), &bundle).unwrap();
         assert!(points_at(&lnk, &bundle.join("midna-app.exe")));
         assert!(!points_at(&lnk, &other.join("midna-app.exe")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_apps_entry_names_the_build_and_uninstalls_it_with_no_modify_or_repair() {
+        let d = scratch("apps");
+        std::fs::write(d.join("midna-app.exe"), vec![0u8; 3000]).unwrap();
+        std::fs::create_dir_all(d.join("fonts")).unwrap();
+        std::fs::write(d.join("fonts").join("a.ttf"), vec![0u8; 2000]).unwrap();
+        assert_eq!(apps_entry::size_kb(&d), 5);
+        assert!(apps_entry::key().ends_with(if midna_proto::paths::is_dev() { r"\Uninstall\com.mrgnhnt.midna.dev" } else { r"\Uninstall\com.mrgnhnt.midna" }));
+        // Written under a scratch key, never the real entry.
+        let key = format!(r"Software\midna-test-apps-{}", std::process::id());
+        apps_entry::write(&key, apps_entry::values(&d, 5)).unwrap();
+        let exe = d.join("midna-app.exe");
+        let text = |v| crate::winreg::get_string(&key, v);
+        assert_eq!(text("DisplayName").as_deref(), Some(login::name()));
+        assert_eq!(text("DisplayVersion").as_deref(), Some(midna_proto::VERSION));
+        assert_eq!(text("UninstallString"), Some(format!("\"{}\" --uninstall", exe.display())));
+        assert_eq!(text("DisplayIcon"), Some(format!("{},0", exe.display())));
+        assert_eq!(text("InstallLocation"), Some(d.display().to_string()));
+        assert_eq!(crate::winreg::get_dword(&key, "NoModify"), Some(1));
+        assert_eq!(crate::winreg::get_dword(&key, "NoRepair"), Some(1));
+        assert_eq!(crate::winreg::get_dword(&key, "EstimatedSize"), Some(5));
+        crate::winreg::delete_key(&key).unwrap();
+        assert_eq!(text("DisplayName"), None);
         let _ = std::fs::remove_dir_all(&d);
     }
 

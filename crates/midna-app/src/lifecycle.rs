@@ -319,8 +319,13 @@ impl Worker {
         }
         // Windows: the Start menu entry (macOS lists the app wherever it was put).
         #[cfg(windows)]
-        if let Err(e) = install::add_to_start_menu(bundle) {
-            log(&format!("start menu: {e}"));
+        {
+            if let Err(e) = install::add_to_start_menu(bundle) {
+                log(&format!("start menu: {e}"));
+            }
+            if let Err(e) = install::add_to_apps(bundle) {
+                log(&format!("settings apps entry: {e}"));
+            }
         }
         // 2. the login item
         let mut login = install::register(bundle);
@@ -541,8 +546,10 @@ impl Worker {
 /// Headless subcommands of the bundle executable (no window):
 /// - `--login-item-status`: print the SMAppService state.
 /// - `--uninstall`: stop midnad (`daemon.stop`, which hangs up every terminal), unregister the
-///   login item and remove our `midna` CLI link. MIDNA_HOME's data is left in place. (Windows:
-///   also the CLI copy and the Start menu entry.)
+///   login item and remove our `midna` CLI link. MIDNA_HOME's data is left in place. (Windows,
+///   where Settings ▸ Apps' Uninstall runs it: first quit the app, which would start midnad
+///   again; also remove the CLI copy, the Start menu entry and the Settings ▸ Apps entry. The
+///   app's folder stays.)
 /// - `--start-daemon` (Windows, what the login entry runs): start the installed midnad, with no
 ///   window, unless it's already answering.
 /// - `--quit` (Windows, any build): ask the app using this MIDNA_HOME to quit; exit 1 when none
@@ -586,6 +593,14 @@ pub fn headless(args: &[String]) -> Option<i32> {
             }
         };
     }
+    #[cfg(windows)]
+    if crate::instance::ask_to_quit() {
+        println!("quitting the app");
+        let t0 = Instant::now();
+        while crate::instance::running() && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
     let socket = crate::backend::daemon::socket_path();
     if let Ok(mut c) = midna_proto::Client::connect(&socket) {
         c.set_caller(None);
@@ -613,8 +628,15 @@ pub fn headless(args: &[String]) -> Option<i32> {
         println!("removed {}", link.display());
     }
     #[cfg(windows)]
-    for removed in [install::unlink_cli(), install::remove_from_start_menu()].into_iter().flatten() {
-        println!("removed {}", removed.display());
+    {
+        for removed in [install::unlink_cli(), install::remove_from_start_menu()].into_iter().flatten() {
+            println!("removed {}", removed.display());
+        }
+        match install::remove_from_apps() {
+            Ok(true) => println!("removed the Settings ▸ Apps entry"),
+            Ok(false) => {}
+            Err(e) => eprintln!("Settings ▸ Apps entry: {e}"),
+        }
     }
     Some(code)
 }

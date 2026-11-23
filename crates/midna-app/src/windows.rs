@@ -628,8 +628,10 @@ fn visible(_m: &Main) -> bool {
     true
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the badge, macOS only
-pub fn focus_shown(cx: &mut App) {
+/// Bring the main window you used last (one on screen) to the front. False when there's none.
+/// The badge (macOS) and a second launch (Windows, `instance.rs`) call it.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+pub fn focus_shown(cx: &mut App) -> bool {
     let target = {
         let reg = shared(cx);
         let r = reg.borrow();
@@ -639,8 +641,8 @@ pub fn focus_shown(cx: &mut App) {
             .filter(|m| !r.is_hidden(m.id))
             .find(visible)
     };
-    let Some(t) = target else { return };
-    let _ = t.handle.update(cx, |_, window, _| window.activate_window());
+    let Some(t) = target else { return false };
+    t.handle.update(cx, |_, window, _| window.activate_window()).is_ok()
 }
 
 /// Whether `session` is on screen in the window you're using (notifications skip it).
