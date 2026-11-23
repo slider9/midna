@@ -9,7 +9,9 @@
 #   ./scripts/setup-toolchain.sh
 #
 # Idempotent: what's already there is kept. CI runs it before every build; on a
-# Mac you can copy .toolchain/ from another checkout instead.
+# Mac you can copy .toolchain/ from another checkout instead. On Windows (Git
+# Bash; the release-windows workflow) it fetches Zig's Windows build and skips
+# the SDK shim.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -19,14 +21,23 @@ ghostty_commit=a887df42c56f6de86c0fe6da9c4eeca37931e083
 dir=.toolchain
 mkdir -p "$dir"
 
+windows=0
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) windows=1 ;; esac
+
 if [ "$("$dir/zig/zig" version 2>/dev/null)" != "$zig_version" ]; then
   arch=$(uname -m | sed 's/arm64/aarch64/')
   echo "==> Zig $zig_version ($arch)"
   rm -rf "$dir/zig"
   tmp=$(mktemp -d)
-  curl -fsSL "https://ziglang.org/download/$zig_version/zig-$arch-macos-$zig_version.tar.xz" -o "$tmp/zig.tar.xz"
   mkdir -p "$dir/zig"
-  tar -xJf "$tmp/zig.tar.xz" -C "$dir/zig" --strip-components 1
+  if [ "$windows" = 1 ]; then
+    curl -fsSL "https://ziglang.org/download/$zig_version/zig-$arch-windows-$zig_version.zip" -o "$tmp/zig.zip"
+    # Windows' own tar (bsdtar) reads zips.
+    "$SYSTEMROOT/System32/tar.exe" -xf "$(cygpath -w "$tmp/zig.zip")" -C "$(cygpath -w "$dir/zig")" --strip-components 1
+  else
+    curl -fsSL "https://ziglang.org/download/$zig_version/zig-$arch-macos-$zig_version.tar.xz" -o "$tmp/zig.tar.xz"
+    tar -xJf "$tmp/zig.tar.xz" -C "$dir/zig" --strip-components 1
+  fi
   rm -rf "$tmp"
 fi
 
@@ -36,6 +47,11 @@ if [ "$(cat "$dir/ghostty-src/.ghostty-commit" 2>/dev/null)" != "$ghostty_commit
   git clone -q --filter=blob:none --no-checkout https://github.com/ghostty-org/ghostty.git "$dir/ghostty-src"
   git -C "$dir/ghostty-src" checkout -q "$ghostty_commit"
   echo "$ghostty_commit" > "$dir/ghostty-src/.ghostty-commit"
+fi
+
+if [ "$windows" = 1 ]; then
+  echo "Toolchain ready. Source it before building: . ./env.sh"
+  exit 0
 fi
 
 # Zig 0.15.2 can't link against the macOS 26 SDK. When that's the default,

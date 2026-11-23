@@ -596,6 +596,15 @@ mod tests {
         assert!(!is_newer("0.2.0-beta.1", "0.2.0"));
         assert!(!is_newer("0.1.0", "0.1.0"));
         assert!(!is_newer("garbage", "0.1.0"));
+        // Windows releases add a counter to the upstream version (docs/RELEASING.md, "Windows
+        // releases"); scripts/newest-version.py orders them the same way.
+        assert!(is_newer("0.1.0-beta.58.w.1", "0.1.0-beta.58"));
+        assert!(is_newer("0.1.0-beta.58.w.10", "0.1.0-beta.58.w.9"));
+        assert!(is_newer("0.1.0-beta.59", "0.1.0-beta.58.w.3"));
+        assert!(is_newer("0.2.0-w.1", "0.2.0-beta.9.w.4"));
+        assert!(is_newer("0.2.0-w.2", "0.2.0-w.1"));
+        assert!(is_newer("0.2.1-beta.1.w.1", "0.2.0-w.1"));
+        assert!(!is_newer("0.2.0-w.1", "0.2.0"));
         assert_eq!(feed_url_for("https://h/{channel}.json", "beta", "macos"), "https://h/beta.json");
     }
 

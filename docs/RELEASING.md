@@ -89,6 +89,76 @@ packaging/make-update.sh --app dist/0.2.0/Midna.app \
 `--version` overrides the workspace version for one build (every binary reports
 `midna_proto::VERSION`, from `MIDNA_BUILD_VERSION`).
 
+## Windows releases
+
+Windows builds ship from the fork, `slider9/midna`, with the fork's own update key and no
+Authenticode signature yet. Only slider9 runs them (the workflow checks `github.actor`).
+
+```sh
+git tag windows-v0.1.0-beta.58.w.1 && git push origin windows-v0.1.0-beta.58.w.1
+```
+
+A `windows-v` tag runs `.github/workflows/release-windows.yml`; a bare `v` tag runs
+`release.yml` (macOS) and never this one. Two jobs:
+
+- **build** (`windows-2022`; `windows-latest`'s MSVC 14.52 needs a newer Clang than Zig 0.15.2 has)
+  1. checks the tag's version (below) and that the files say its upstream base
+     (`scripts/set-version.sh --check <base>`)
+  2. sets up `.toolchain/`: Zig and Ghostty's source (`scripts/setup-toolchain.sh`, which on
+     Windows fetches Zig's Windows build) and Microsoft's newer ConPTY (`scripts/setup-conpty.sh`)
+  3. `packaging/build-windows.sh --version <v>` with `MIDNA_UPDATE_PUBKEY` compiled in (it
+     refuses to build without the variable) and checks `midnad.exe --version` says `<v>`
+  4. checks the secret's public half is one of `MIDNA_UPDATE_PUBKEY`'s keys, then
+     `packaging/make-update.sh --windows`: `Midna-<v>-windows-x86_64.zip` and its signed v2 entry
+     `windows-feed.json`, verified against the whole key list
+- **publish** (`ubuntu-latest`)
+  5. publishes the GitHub release `windows-v<v>` with the zip and `windows-feed.json` (betas as
+     prereleases), or replaces its files when a re-run finds it already made
+  6. updates the `channels` release: `windows-stable.json` (builds of a stable base) and
+     `windows-beta.json` (the newest of any, by `scripts/newest-version.py`). `stable.json` and
+     `beta.json` are macOS's and stay as they are.
+
+**Version.** A Windows version is the upstream version the fork last merged, which is what
+`Cargo.toml` says, plus a Windows counter:
+
+| Upstream base | Windows builds |
+|---|---|
+| `0.1.0-beta.58` (a beta) | `0.1.0-beta.58.w.1`, `0.1.0-beta.58.w.2`, … |
+| `0.2.0` (stable) | `0.2.0-w.1`, `0.2.0-w.2`, … |
+
+The files keep the upstream version, so a merge from upstream never conflicts on it; the
+counter lives only in the tag (and in `MIDNA_BUILD_VERSION`, so every binary reports it). The
+counter restarts at 1 for each new base. By semver, which the updater and
+`newest-version.py` both use, `0.1.0-beta.58 < 0.1.0-beta.58.w.1 < 0.1.0-beta.58.w.2 <
+0.1.0-beta.59 < 0.2.0-w.1 < 0.2.0`: more parts win when the rest match, numbers compare as
+numbers, and `beta` sorts before `w`. `0.2.0-w.1` is a semver pre-release of `0.2.0`, which is
+fine because no Windows build is ever plain `0.2.0`; it still counts as a stable release here
+(it has no `-beta.`), so it goes in `windows-stable.json` and is published as the latest release.
+Build metadata (`0.2.0+w.1`) wouldn't work: semver ignores it, so `+w.2` would never be newer.
+
+**Trying it without a release.** Run the workflow by hand on a branch with a version, and it
+makes a **draft** release carrying the zip and `windows-feed.json` and skips the channels:
+
+```sh
+gh workflow run release-windows.yml --ref <branch> -f version=0.1.0-beta.58.w.1 -f draft=true
+gh release download windows-v0.1.0-beta.58.w.1 --pattern '*' --dir /tmp/rw   # drafts too
+packaging/release-tool/target/release/midna-release verify /tmp/rw/windows-feed.json \
+    "$(gh variable get MIDNA_UPDATE_PUBKEY)" /tmp/rw/Midna-0.1.0-beta.58.w.1-windows-x86_64.zip
+gh release delete windows-v0.1.0-beta.58.w.1 --yes
+```
+
+GitHub only dispatches a workflow it knows, so the file has to be on the default branch (or
+have run once from the branch). Run by hand on a `windows-v` tag with `draft` off, it publishes
+that tag like a push would; on a branch it only ever makes drafts. A draft run refuses a
+version that is already published, and a real run replaces a leftover draft of its version
+with a fresh release before any channel points at it.
+
+The same rules hold as for macOS: never skip a version, and a failed run is re-run or cut again
+at the same number. The fork's `MIDNA_UPDATE_KEY` secret and `MIDNA_UPDATE_PUBKEY` variable
+are the fork's key; its secret half is kept offline (`%USERPROFILE%\.config\midna-release-windows`).
+The workflow publishes with `GITHUB_TOKEN` (`contents: write`), and the fork has no ruleset, so
+it needs no deploy key.
+
 ## The bundle (`packaging/build-app.sh`)
 
 ```
@@ -229,9 +299,9 @@ Windows 10 1809, the first with ConPTY, when absent) and drops `minimum_macos`:
 whitespace, and an entry signed by any one of them passes. That is how the release key moves
 (say, from the fork's to upstream's): one bridging release embeds both keys and is signed with
 the old one; releases after it are signed with the new key, and the old key is dropped from the
-list once nobody runs a build older than the bridge. `midna-release verify` takes the same list.
-The release workflow's check that `MIDNA_UPDATE_KEY` matches `MIDNA_UPDATE_PUBKEY` compares
-against a single key, so the bridging release changes it to "is one of".
+list once nobody runs a build older than the bridge. `midna-release verify` takes the same list,
+and both release workflows check that `MIDNA_UPDATE_KEY`'s public half is one of
+`MIDNA_UPDATE_PUBKEY`'s keys, so the bridging release only changes the variable.
 
 **Client flow** (`updater.rs`). It runs about 5s after launch, then every 6h (Settings has
 "Check now"):
