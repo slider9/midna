@@ -212,7 +212,13 @@ pub(crate) fn launch_command(
 pub(crate) fn mark_injected(d: &Daemon, command: &[String], env: &mut Vec<(String, String)>) {
     let full = crate::hooks::claude_settings_path(&d.cfg.home).to_string_lossy().into_owned();
     let notify = crate::hooks::codex_notify_arg(&d.cfg.cli_path);
-    let chained = |a: &str| a.starts_with("notify=") && a.contains(&format!("\"{}\"", crate::agent_args::CODEX_LAUNCH_WRAPPER));
+    // Windows chains through `[cli,"hook","codex","notify","--",…]` (no sh wrapper); the global
+    // entry has `--global` there instead.
+    let win_chain = crate::agent_args::codex_chained_notify(&d.cfg.cli_path, &[]);
+    let win_chain = win_chain.strip_suffix(']').unwrap_or(&win_chain);
+    let chained = |a: &str| {
+        a.starts_with("notify=") && (a.contains(&format!("\"{}\"", crate::agent_args::CODEX_LAUNCH_WRAPPER)) || (cfg!(windows) && a.starts_with(win_chain)))
+    };
     if command.iter().any(|a| *a == full || *a == notify || chained(a) || crate::agent_args::is_merged_with_hooks(&d.cfg.home, a)) {
         env.push(("MIDNA_HOOKS_INJECTED".into(), "1".into()));
     }

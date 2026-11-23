@@ -226,7 +226,7 @@ mod win {
         std::fs::rename(d.fake.join("claude.exe"), npm.join("claude.exe")).unwrap();
         // What npm's cmd-shim writes for a package whose bin is an .exe (for a .js one it runs
         // node.exe on it; `midna_proto::cmd_shim` has that one).
-        let shim = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\node_modules\claude.exe\"   %*\r\n";
+        let shim = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\\node_modules\\claude.exe\"   %*\r\n";
         std::fs::write(d.fake.join("claude.cmd"), shim).unwrap();
         let launches = || std::fs::read_to_string(npm.join("claude-argv")).unwrap_or_default().lines().map(str::to_string).collect::<Vec<_>>();
         let mut h = d.human();
