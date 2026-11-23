@@ -81,6 +81,17 @@ fn main() {
     if let Some(code) = lifecycle::headless(&std::env::args().collect::<Vec<_>>()) {
         std::process::exit(code);
     }
+    // Windows: one app per MIDNA_HOME. A second launch brings the running one to the front and
+    // exits (macOS does this itself). A fake backend, Slate and snapshot runs stand apart.
+    #[cfg(windows)]
+    let (stx, srx) = async_channel::unbounded::<()>();
+    #[cfg(windows)]
+    if single_instance() && !instance::claim(move || {
+        let _ = stx.try_send(());
+    }) {
+        lifecycle::log(&format!("launch: already running for {}, brought it to the front", midna_proto::paths::midna_home().display()));
+        return;
+    }
     let backend = backend::from_env();
     std::thread::spawn(annotate::sweep);
     let w: f32 = std::env::var("MIDNA_W").ok().and_then(|v| v.parse().ok()).unwrap_or(1280.);
@@ -118,6 +129,20 @@ fn main() {
                 if qrx.recv().await.is_ok() {
                     lifecycle::log("quit: asked by --quit");
                     cx.update(|cx| cx.dispatch_action(&Quit));
+                }
+            })
+            .detach();
+            // Another launch handed over: the window you used last comes to the front (a new
+            // one when only Settings or a pop-out is open).
+            let b = backend.clone();
+            cx.spawn(async move |cx| {
+                while srx.recv().await.is_ok() {
+                    lifecycle::log("launch: another launch handed over");
+                    cx.update(|cx| {
+                        if !windows::focus_shown(cx) {
+                            let _ = windows::open(b.clone(), None, cx);
+                        }
+                    });
                 }
             })
             .detach();
@@ -207,6 +232,13 @@ fn main() {
         .detach();
         hidden::activate(cx);
     });
+}
+
+/// Whether this run is the home's one app (`instance::claim`): not with the fake backend, under
+/// Slate or for a snapshot, which run beside the real one.
+#[cfg(windows)]
+fn single_instance() -> bool {
+    std::env::var("MIDNA_BACKEND").as_deref() != Ok("fake") && !hidden::enabled() && std::env::var_os("MIDNA_SNAPSHOT").is_none()
 }
 
 /// Dev: render the main window offscreen to `MIDNA_SNAPSHOT` after `MIDNA_SNAPSHOT_DELAY_MS`

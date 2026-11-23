@@ -67,12 +67,26 @@ the folder to `%LOCALAPPDATA%\Programs\Midna` and run `midna-app.exe`. On each l
 - installs midnad and the ConPTY files beside it (`midnad --install-self`) into
   `MIDNA_HOME\bin\<version>-<hash>`, unless that build is already there;
 - adds itself to the Start menu (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Midna.lnk`);
+- adds itself to Settings ▸ Apps (and Programs and Features), or brings that entry's version and
+  folder up to date: a key under `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall`
+  named for the bundle id (`com.mrgnhnt.midna`, Midna Dev's `com.mrgnhnt.midna.dev`), with its
+  name, version, publisher, icon, folder and size. Its Uninstall button runs `midna-app.exe
+  --uninstall`; there's no Modify or Repair;
 - registers the login entry and starts midnad if it isn't answering;
 - copies the `midna` CLI into `~\.local\bin` when that folder is on PATH.
 
-There's no installer, uninstall entry in Settings ▸ Apps or updater yet. `midna-app.exe
---uninstall` stops midnad (closing its terminals) and removes the login entry, the CLI copy and
-the Start menu entry, but leaves the folder and the home.
+There's no installer or updater yet. `midna-app.exe --uninstall` (also what Settings ▸ Apps'
+Uninstall runs) quits the running app (it would start midnad again), stops midnad (closing its
+terminals) and removes the login entry, the CLI copy, the Start menu entry and the Settings ▸
+Apps entry, but leaves the folder and the home.
+
+One app runs per `MIDNA_HOME`. At launch the app creates a named event,
+`Local\midna-app-show-<hash of MIDNA_HOME>` (`instance.rs`). When it's already there, another
+copy is running: the new launch lets it take the foreground (`AllowSetForegroundWindow`), sets
+the event and exits, and the running copy brings the main window you used last to the front
+(restoring it if minimized), or opens one when only Settings or a pop-out is open. Midna and
+Midna Dev have different homes, so they never hand over to each other. Runs with the fake
+backend, under Slate and for snapshots stand apart and always start.
 
 To try a change in a real app, `scripts/dev-app-windows.sh` (the Windows `dev-app.sh`) builds
 **Midna Dev** and installs it to `%LOCALAPPDATA%\Programs\Midna Dev`. Midna Dev has:
@@ -129,6 +143,8 @@ would build them in with `\r\n`.
 | Start at login | SMAppService LaunchAgent; "Allow in the Background" in Login Items | a value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, "Midna" (Midna Dev: "Midna Dev"), runs `midna-app.exe --start-daemon`. That starts `bin\current`'s midnad with no window, unless it's already answering, and exits. Switching it off in Settings ▸ Apps ▸ Startup or Task Manager is kept in `…\Explorer\StartupApproved\Run` (first byte odd = off) and shows as needing approval, which opens `ms-settings:startupapps`. Registering it starts midnad at once, as launchd does |
 | `midna` CLI for agents | a symlink `~/.local/bin/midna` → `bin/current/midna` | a copy of `bin\current`'s `midna.exe` at `~\.local\bin\midna.exe` (a symlink needs a privilege), made again when that one changes size or time. A running copy is renamed aside and removed next time. A `midna.exe` that isn't midna's (it doesn't name the bundle id) is left alone |
 | Quit from a script | Apple Events (`osascript … quit`) | `midna-app.exe --quit` sets a named event (`Local\midna-app-quit-<hash of MIDNA_HOME>`) the app waits on, and it quits as the Quit action does. Closing its windows instead would ask about, or close, their terminals |
+| One copy | LaunchServices: one app per bundle | a named event per `MIDNA_HOME` (`Local\midna-app-show-<hash>`): a second launch sets it and exits, and the running app brings its window to the front (see Installing) |
+| Uninstall entry | none (the app is dragged to the Trash) | a key under `HKCU\…\CurrentVersion\Uninstall` named for the bundle id; Uninstall runs `--uninstall` (see Installing) |
 | Console | n/a | a release `midna-app.exe` is a GUI program (`windows_subsystem = "windows"`): no console window. Its headless options (`--login-item-status`, `--uninstall`, `--quit`) print to the console they're run from (`AttachConsole`) or to a pipe or file. Console programs it runs get `CREATE_NO_WINDOW`. Debug builds keep their console |
 | Installed binaries | `bin/current` symlink | `bin/current` is a text file naming the version dir; midnad finds `midna.exe` there (`install::current_cli`) or next to itself |
 | Typed `claude` / `codex` (adopt) | sh shims in `MIDNA_HOME/shims` | the sh shims for Git Bash, plus `claude.exe` and `codex.exe` there: copies of midna.exe that run as `midna shim <agent>` under those names (`adopt::exe_shims`, refreshed when midna.exe changes; a running one is renamed aside). Every shell runs them, cmd included, with no argument mangling. `midna-shims.txt` marks the dir so the shim never takes one for the real agent |
@@ -234,12 +250,11 @@ In rough order of how much they matter:
 3. **Shell integration, what's left.** A PowerShell alias for `claude` that names a full path skips the shims, and a profile that rebinds Enter to its own handler gets no output mark. Git Bash and cmd have no prompt marks: each prints its prompt in one write, which ConPTY would reorder. Marks depend on ConPTY painting within 15 ms, so on a very busy machine one may land early.
 4. **Installing and upgrading.** midnad starts at login and the app installs itself on launch
    (see Installing), but:
-   - There's no installer, no uninstall entry in Settings ▸ Apps and no updater (the updater
-     reports itself off: no update key).
+   - There's no installer and no updater (the updater reports itself off: no update key).
+     Uninstalling from Settings ▸ Apps leaves the app's folder (and the home) behind.
    - A new build can't take over a running daemon: `daemon.upgrade` is refused, the app says
      so, and the old daemon runs until it's stopped, which closes its terminals. Keeping them
      would need a separate pty-host process that owns the ConPTYs.
-   - Starting the app twice opens two copies.
    - The login-entry wording in the app (onboarding, Settings ▸ General) still says System
      Settings ▸ Login Items.
 5. **App stubs.** Badge, twilight, Kass composer, haptics and app link previews are missing. Commands that only exist on macOS (`sips`, `plutil`, `mdfind`, `xed`, `open -a`, `defaults`) do nothing, and menus and text still use macOS wording. Notifications show as toasts, but:
