@@ -1,8 +1,10 @@
 //! The method catalog: the single list of every RPC method. `rpc.discover`, `midna schema`
 //! and `midna mcp` are all generated from it. Add a feature = add a row here.
 use crate::cleanup::*;
+use crate::streams::{StreamStatus, StreamsAddParams, StreamsEventsParams, StreamsEventsResult, StreamsNameParams, StreamsPublishParams, StreamsPublishResult, StreamsSetEnabledParams, StreamsUpdateParams};
 use crate::summary::*;
 use crate::methods::*;
+use crate::nearby::*;
 use crate::system::*;
 use crate::types::*;
 use schemars::JsonSchema;
@@ -98,7 +100,8 @@ fn build() -> Vec<MethodSpec> {
         m::<NoParams, Value>("rpc.discover").result_any().d(
             "Return the OpenRPC document describing every midna method. Start here to learn what you can do."),
         m::<NoParams, DaemonInfo>("daemon.info").d(
-            "Daemon version, pid, uptime, MIDNA_HOME, socket path, and the role (human/agent) the daemon assigned to your connection."),
+            "Daemon version, pid, uptime, MIDNA_HOME, socket path, the role (human/agent) the daemon assigned to your connection, \
+             and how the streams it runs are doing (count, and any waiting to start again or failing)."),
         m::<UpgradeParams, UpgradeResult>("daemon.upgrade").mutating().human().d(
             "Replace the running daemon with another midnad binary without killing terminals: the new binary must pass \
              `--selftest`, then every terminal's screen is saved and the daemon re-execs in place (same pid), keeping \
@@ -172,6 +175,12 @@ fn build() -> Vec<MethodSpec> {
              `images` (absolute paths) are attached first, each pasted as a path the agent turns into [Image #N]. \
              Input from agents is logged as session.input_by_agent. \
              Never answer another agent's permission prompt unless session.read shows the prompt."),
+        m::<SessionSendImageParams, SessionSendImageResult>("session.send_image").mutating().human().d(
+            "Save an image in this Mac's images folder and paste its path into a terminal, as session.input's `images` \
+             would. Only for the person driving this Mac from another of theirs, over a drive link: their Midna sends an \
+             image they pasted or dropped there, when their message is sent. `data` is the image, base64 (PNG, JPEG, GIF or \
+             WebP, at most 10 MB); `name` names the saved copy. Returns the saved path. Anyone else is refused outright, \
+             never deferred to the human: here, attach an image with session.input's `images`."),
         m::<SessionReadParams, SessionReadResult>("session.read").d(
             "Read a terminal's text as plain text: the last `lines` lines (default 50) or the visible `screen`."),
         m::<SessionResizeParams, OkResult>("session.resize").mutating().d("Resize a terminal's PTY and engine grid (cols x rows). The GUI does this for terminals it shows; agents rarely need it."),
@@ -253,21 +262,36 @@ fn build() -> Vec<MethodSpec> {
             "Which terminal runs the server behind a link to this Mac (http://localhost:5173, 127.0.0.1, [::1]): the one \
              whose processes listen on that port, with what listens (`vite`). Null when no terminal's process does (another \
              app, or nothing). Not a local link is bad params. Answers from a few seconds' cache."),
+        m::<LinksPreviewParams, LinkPreview>("links.preview").d(
+            "What a link's hover card shows, read on this Mac: a file's lines around `line`, a folder's first entries, \
+             an image's size, for a GitHub pull request, issue or workflow run link what `gh` says about it (its \
+             `--json` output), or for an app link (`taskboard://…`) what its app's preview command prints. With \
+             `preview`, a link pattern's preview command that session.link_at gave for `target` in the last 10 minutes \
+             runs and its output comes back; any other command is refused. The app asks the Mac a window drives, so \
+             another Mac's card is read there. Not an absolute path, a GitHub link or an app link is bad params; `gh` or \
+             a preview command failing, or an app with no preview, is not found."),
         m::<LinksRefreshParams, LinksRefreshResult>("links.refresh").mutating().d(
             "Tell the app a link's state changed so it asks again now instead of when its cache runs out: a pull \
              request you merged, closed or marked ready, a workflow run you re-ran. Its color and icon in the grid and \
              its hover card update within a couple of seconds. Call it right after the change (`gh pr merge` …). With \
              GitHub webhook triggers set up, pull request and run events do this on their own."),
         m::<NoParams, LinkPatternsList>("links.patterns.list").d(
-            "The link patterns apps registered (links.patterns.register), by owner. They apply alongside the user's own \
-             terminal.link_patterns, in the same form."),
+            "The link patterns apps registered (links.patterns.register), by owner, with whether the human approved their \
+             preview commands (`approved`) and the needs-you that asks them (`approval`). They apply alongside the user's \
+             own terminal.link_patterns, in the same form."),
         m::<LinkPatternsRegisterParams, AppLinkPatterns>("links.patterns.register").mutating().d(
             "Register an app's own link patterns: text in terminal output that becomes a link, as rules in \
              terminal.link_patterns form (`<regex> = <url template> [agents] [project:<name>]… [preview:\"<command> $1\"]`; the \
              preview command prints JSON `{\"title\", \"lines\": […]}` that fills the hover card). They replace whatever \
              that owner registered before, survive a daemon restart, apply alongside the user's terminal.link_patterns, and \
-             show read-only in Settings ▸ Terminal ▸ Links and paths as provided by the owner. An app registers them each \
-             time it starts; `patterns: []` removes them. A bad rule refuses the whole call."),
+             show read-only in Settings ▸ Terminal ▸ Links and paths as provided by the owner. Preview commands run only \
+             once the human approves them (a needs-you raised here, again whenever they change); until then the rules \
+             still make links and the card shows the plain URL. An app registers them each time it starts; `patterns: []` \
+             removes them and forgets the approval. A bad rule refuses the whole call."),
+        m::<LinkPatternsApproveParams, AppLinkPatterns>("links.patterns.approve").mutating().human().d(
+            "Approve the preview commands an app's link patterns run (links.patterns.register), as they are now: \
+             `fingerprint` is the one its approval needs-you carries, so a change since then refuses. The human answers \
+             this from that needs-you."),
         m::<NoParams, LinkActionsList>("links.actions.list").d(
             "The link menus apps registered (links.actions.register), by owner, with whether the human approved their \
              commands (`approved`) and the needs-you that asks them (`approval`)."),
@@ -470,6 +494,63 @@ fn build() -> Vec<MethodSpec> {
             "Turn this connection into a binary frame stream for a terminal (GUI renderers). After the {ok:true} line the \
              connection carries u32-LE length-prefixed frames; send 0x01 for credit, 0x02 to resize, 0x03 to type, \
              0x04 key, 0x05 scroll, 0x06 mouse, 0x07 focus, 0x08 paste (see midna_proto::frame::ClientMsg)."),
+        // streams
+        m::<StreamsPublishParams, StreamsPublishResult>("streams.publish").mutating().d(
+            "Hand midna an event from a program on this Mac (local only: it rides the daemon's socket). It lands in the event \
+             log as kind `stream.<stream>.<kind>` with data = your payload (a JSON object, at most 64 KB), and local triggers \
+             match it like any event: event `stream.slack.message` or a glob (`stream.slack.*`), filter.match on payload paths, \
+             templates {{data.<path>}} and {{stream.name|kind|id}}. stream: 1-32 of a-z 0-9 -; kind: 1-64 of a-z 0-9 _ . -; \
+             id (optional): yours for the event, e.g. a Slack message ts. The event belongs to no terminal. A publish a trigger \
+             caused (a process its action started, which has MIDNA_TRIGGER set and the CLI forwards as caller.caused_by) is \
+             recorded with stream.caused_by and result caused_by, and fires no triggers. A stream midna runs (streams.add) \
+             only takes its own producer's publishes (the CLI sends its MIDNA_STREAM_TOKEN as caller.stream_token) or the \
+             human's: anyone else's is refused (error code 1, data {verdict: refused}); other names are open to anyone. \
+             Limits per stream: an id it took in the last 24 hours is a duplicate (result verdict `duplicate`, the first event's seq, \
+             not logged again); past 60 events a minute (bursts of 20) a publish is dropped with error code 7 (busy) and \
+             data {verdict: rate_limited, retry_after_ms}; with 1000 events waiting for the trigger worker it is dropped \
+             with code 7 and verdict busy; a payload over 64 KB is verdict too_large. A stream trigger fires on every \
+             event unless it sets cooldown_secs (then at most once per it, per stream). streams.events lists each publish's verdict. CLI: \
+             `midna stream publish <name> <kind> [--id ID] [--data JSON|@file]` (stdin when --data is left out)."),
+        m::<StreamsEventsParams, StreamsEventsResult>("streams.events").d(
+            "A stream's recent publishes, newest first (the last 200), each with its verdict: accepted (logged as event \
+             `seq`), duplicate (`seq` is the first one's), rate_limited, too_large, busy or refused, plus counts per verdict \
+             since the daemon started. Accepted events from before it started come from the event log. A stream nobody has \
+             published to lists nothing. CLI: `midna stream events <name> [--limit N] [--json]`."),
+        m::<StreamsAddParams, StreamStatus>("streams.add").mutating().d(
+            "Have midna run a stream's producer: a command whose stdout is one JSON object per line, \
+             {\"kind\":\"message\",\"id\":\"…\",\"data\":{…}} (id and data optional), each published to stream `name` like \
+             streams.publish (same dedupe and limits). Lines that aren't events and its stderr go to \
+             $MIDNA_HOME/streams/<name>.log (capped at 1 MB, one older file kept). It runs in its own process group in `cwd` with \
+             the terminal environment plus MIDNA_STREAM=<name>, MIDNA_STREAM_TOKEN (new each start; `midna stream publish` \
+             run by the producer sends it, and only it or the human may publish to this stream), and each named stored secret in its environment (looked up \
+             each start: the project's own, else a global one; values never stored or logged). When it exits midnad starts it \
+             again after 1s, doubling to 5 minutes (back to 1s once a run lasts 10 minutes), and starts every stream again \
+             when the daemon starts and after the Mac wakes. Streams are kept in state.json. An agent's stream is kept paused \
+             (state awaiting_approval) and raises one needs-you approval naming its command, cwd, project and secrets; it \
+             starts when the human approves it (or resumes it). \
+             CLI: `midna stream add <name> [--project P] [--secret NAME]... [--cwd DIR] -- <command...>`."),
+        m::<StreamsUpdateParams, StreamStatus>("streams.update").mutating().d(
+            "Change a stream's command, cwd, project or secrets (left out: unchanged). A running stream starts again with \
+             them. An agent's change pauses it and asks the human again (awaiting_approval, a needs-you approval), even if \
+             it was approved before. CLI: `midna stream update <name> [--project P] [--secret NAME]... [--cwd DIR] [-- <command...>]`."),
+        m::<NoParams, Vec<StreamStatus>>("streams.list").d(
+            "The streams midna runs (streams.add), each with its producer's state (starting, running, backoff, paused, \
+             awaiting_approval with the needs-you `approval` that starts it, failing), pid, restarts, last exit, when it starts \
+             again, its last start error, why it isn't running, its newest accepted event, its publishes per verdict, and its \
+             log file with its last lines. A stream is failing once its producer exits 5 times within 10 minutes: midna keeps \
+             starting it again, raises one `stream_failing` needs-you item and publishes `stream.health` on each state change; \
+             both clear once a run lasts 10 minutes, or when it is paused or removed. \
+             CLI: `midna stream list [--json]`, `midna explain <stream name>`."),
+        m::<StreamsNameParams, OkResult>("streams.remove").mutating().d(
+            "Stop a stream's producer (its whole process group) and forget the stream. Its log file stays. An agent removing \
+             one that isn't paused asks the human (a needs-you approval). CLI: `midna stream remove <name>`."),
+        m::<StreamsSetEnabledParams, StreamStatus>("streams.set_enabled").mutating().d(
+            "Pause (enabled false: its producer's process group is stopped) or resume a stream midna runs. The human resuming \
+             a stream awaiting approval approves it; an agent's resume of one asks the human (a needs-you approval; error \
+             human_only with data.needs_you_id). CLI: `midna stream pause <name>`, `midna stream resume <name>`."),
+        m::<StreamsNameParams, StreamStatus>("streams.restart").mutating().d(
+            "Stop a running stream's producer and start it again now (a stream in backoff starts at once). A paused one is \
+             refused: resume it. CLI: `midna stream restart <name>`."),
         // events
         m::<EventsListParams, Vec<Event>>("events.list").d(
             "List events from the append-only log (seq > since_seq), oldest first. Every state change and every acting call (audit) is an event."),
@@ -520,21 +601,23 @@ fn build() -> Vec<MethodSpec> {
              (source: local) need no secret; pass enabled: true to turn one on at once (agents may, when the human asked for it). \
              event: GitHub `pull_request.opened`/`push` (event[.action]), Bitbucket `pullrequest:created`; local `hook.<HookEvent>` \
              (hook.Stop, hook.Notification; data = the hook payload), a midna event kind (agent.prompt_blocked {hook, message, \
-             prompt}, agent.turn_ended, session.status; data = the event data), `idle` (filter.idle_minutes; once per idle stretch) \
+             prompt}, agent.turn_ended, session.status; data = the event data), `stream.<name>.<kind>` (an event a program \
+             published with streams.publish, e.g. stream.slack.* ; data = its payload; no terminal), `idle` (filter.idle_minutes; once per idle stretch) \
              or `schedule` (filter.cron, window, starts_at, ends_at, max_runs, wake; data {cron, scheduled_for, local_time}; \
              without a session/project/agent filter it fires once about no terminal, with one it acts on every running terminal \
              that matches). filter (globs): repo, branch, action, label; local session, project, agent, match {dotted.path: glob} \
-             (case-insensitive, every entry must match). action kind: start_agent | run_command | attention | notify, and for \
+             (case-insensitive, all must match). action kind: start_agent | run_command | attention | notify, and for \
              local triggers, acting on the terminal that fired, send_to_session (on agent.prompt_blocked the refused prompt Claude \
-             put back in its input box is cleared first) | set_status | clear_status. Templates: {{pr.number}} {{pr.title}} \
+             put back in its input box is cleared first) | set_status | clear_status. action.to (a terminal name or session id) \
+             aims those, notify and attention at that terminal; a stream trigger needs it and refuses session and agent \
+             filters. Templates: {{pr.number}} {{pr.title}} \
              {{repo}} {{branch}} {{sender}} {{url}} {{action}} or any payload path ({{payload}} and object/array paths render as \
              JSON); local {{last_prompt}} (the terminal's latest prompt, in full), {{event}}, {{session.id|name|project_id|agent|status}}, \
-             {{data.<path>}} or {{<path>}}. run_command shell-quotes each value and gets the delivery's JSON body in the file \
+             {{stream.name|kind|id}} (a stream event's envelope), {{data.<path>}} or {{<path>}}. run_command shell-quotes each value and gets the delivery's JSON body in the file \
              $MIDNA_PAYLOAD (headless: also on stdin) with MIDNA_EVENT, MIDNA_ACTION, MIDNA_DELIVERY_GUID and MIDNA_DELIVERY \
              (the delivery id). A webhook trigger's agents run supervised (setting triggers.agent_mode); a local trigger's use \
              the human's normal config. start_agent's permission_mode and allowed_tools are human only: an agent setting or \
-             changing them asks the human, and the trigger is added or changed only if they approve. Set github_hook_id to enable \
-             missed-delivery recovery. cooldown_secs (default 60) spaces firings per terminal; what a trigger causes never fires \
+             changing them needs the human's approval first. github_hook_id enables missed-delivery recovery. cooldown_secs spaces firings per terminal (default 60) or per stream (default 0), dropping events inside it; what a trigger causes never fires \
              triggers. Example (compact, then resend): {source:local, event:agent.prompt_blocked, filter:{match:{message:\"*Compact \
              first*\"}}, action:{kind:send_to_session, steps:[{text:\"/compact\"},{text:\"{{last_prompt}}\"}]}, enabled:true}."),
         m::<TriggerUpdateParams, Trigger>("trigger.update").mutating().d(
@@ -558,11 +641,16 @@ fn build() -> Vec<MethodSpec> {
              timed_out, output (last 50 lines), error}; `trigger.command_finished` is emitted when one ends."),
         m::<TriggerReplayParams, Delivery>("trigger.replay").mutating().d(
             "Run a past delivery through the triggers again (same filters, no signature check since it was verified when it \
-             arrived). Deliveries that failed signature checks can't be replayed."),
+             arrived). Deliveries that failed signature checks can't be replayed. Or stream + event (its seq or publisher id, \
+             from streams.events' last 200): run a recorded stream event through the local triggers again, past dedupe and \
+             cooldown; each firing is recorded as a delivery with verdict replayed, and the result sums them up. An event a \
+             trigger caused still fires nothing."),
         m::<TriggerTestParams, Delivery>("trigger.test").d(
             "Dry-run one trigger against a sample payload: shows how the event and filters evaluate and the rendered \
              prompt/command. Local triggers: payload is the hook payload or event data, event defaults to the trigger's, and \
-             session names the terminal (filters, {{session.*}}, {{last_prompt}}). Nothing runs and nothing is recorded."),
+             session names the terminal (filters, {{session.*}}, {{last_prompt}}). stream {name, kind, id} tests a stream event \
+             without publishing it: payload is its data (filter.match, {{data.*}}), {{stream.*}} its envelope, and a `to` \
+             shows the terminal it resolves to now. Nothing runs and nothing is recorded."),
         // secrets
         m::<SecretListParams, Vec<Secret>>("secret.list").d(
             "Stored secrets (names and metadata only; values never leave midnad). `[secret:NAME]` in a prompt is one of \
@@ -644,6 +732,153 @@ fn build() -> Vec<MethodSpec> {
              administrator's password): a root-owned helper in /Library/PrivilegedHelperTools that can only schedule or \
              cancel this midna's own wakes, and a sudoers.d entry letting you run just that helper. Turns keep_awake.wake on. \
              With remove: cancel midna's wakes, remove both files and turn keep_awake.wake off. Human only."),
+        // nearby
+        m::<NoParams, PeersListResult>("peers.list").d(
+            "Nearby: other Midnas on the same network, found over Bonjour. `me` is this device: its id (fingerprint, \
+             the SHA-256 of its Ed25519 public key; names are display only and can repeat), the name others see \
+             (setting nearby.name, else the computer name), visibility (setting nearby.visibility: off | paired | \
+             everyone; everyone goes back to paired after 10 minutes, at everyone_until), whether it is advertising \
+             and browsing, the Bonjour service type, and local_network: ok, waiting (macOS is likely asking whether \
+             Midna may use the local network; pairing and sending keep trying for up to a minute) or denied (Local \
+             Network access is off in System Settings; event peers.local_network when it changes). `peers` are the \
+             Midnas it sees now. Events peers.appeared \
+             (data: the peer) and peers.left ({fingerprint, name}) fire as they come and go. Changing visibility is \
+             human only. `paired` lists every device paired with this one (tier contact or my_device, nearby or \
+             not) and `pairings` the pairings in progress. A peer with claims_name_of uses a paired device's name \
+             but has another key: it is not that device."),
+        m::<PeersSessionsParams, PeersSessionsResult>("peers.sessions").d(
+            "Nearby: the agent terminals open on one of my devices (a device kept as my_device, on the network now): \
+             each one's id there, name, agent, project name, state and busy (in a turn or waiting on its human). Names \
+             and ids only, never what is on their screens. A contact is refused. Use it to pick the `session` for a \
+             share.send of kind agent_ask."),
+        m::<PeersPairParams, Pairing>("peers.pair").mutating().d(
+            "Nearby: ask a device in peers.list to pair (it must be visible to everyone, or already paired). The two \
+             daemons open an encrypted connection bound to their device keys and agree on a 6-digit code; returns the \
+             pairing (pr_…) once both screens show the code (state comparing). Each side's human then confirms that the \
+             codes match with peers.confirm (human only: agents can't confirm; each side gets a needs-you approval). \
+             Event peers.pairing fires with the code; peers.paired when both confirmed; peers.pairing_ended if it was \
+             declined, timed out (2 minutes) or failed."),
+        m::<PeersConfirmParams, Pairing>("peers.confirm").mutating().human().d(
+            "Nearby: the human confirms a pairing's code matches the one on the other device (accept true, the \
+             default) or says it doesn't / declines (accept false: the pairing ends on both sides). `as` is how this \
+             side keeps the other device: contact (default; whatever it sends asks first) or my_device. allow_drive \
+             true (only with as my_device; a contact is refused) also lets it drive this Mac once paired, as \
+             peers.set_drive would. The devices are paired once both sides confirmed. Human only: an agent can't \
+             confirm a pairing."),
+        m::<PeersForgetParams, PeersForgetResult>("peers.forget").mutating().human().d(
+            "Nearby: forget a paired device. From then on it is unknown here: its connections may only ask to pair \
+             again, and it no longer finds this Mac while visibility is paired, and any drive link it has is cut at \
+             once. Event peers.forgotten (and peers.drive if it could drive this Mac). Human only."),
+        m::<PeersSetTierParams, PairedPeer>("peers.set_tier").mutating().human().d(
+            "Nearby: change how a paired device is kept: `as` contact (whatever it sends asks first) or my_device. \
+             Returns the device; event peers.changed. Human only: an agent can't promote a device. Keeping a device \
+             as a contact turns off everything it auto-accepted, and whether it may drive this Mac (event peers.drive; \
+             its drive links are cut at once)."),
+        m::<PeersSetDriveParams, PairedPeer>("peers.set_drive").mutating().human().d(
+            "Nearby: let one of my devices drive this Mac (on true: open, use and approve terminals and agents here as \
+             if sitting at it), or stop it (on false: any drive link it has is cut at once). `peer` is the paired \
+             device's fingerprint. Off by default; only a device kept as my_device can be allowed (a contact is \
+             refused), and keeping it as a contact or forgetting it turns it off. Returns the device (drive says \
+             whether it may); events peers.drive {peer, name, on} and peers.changed. Human only: an agent's call is \
+             refused, never deferred to the human."),
+        m::<DriveOpenParams, DriveLink>("drive.open").mutating().human().d(
+            "Nearby: open a drive link to one of my devices (kept as my_device here; that Mac must allow it with \
+             peers.set_drive there). Returns the link at once with `socket`, a Unix socket under this home that the app \
+             connects to exactly as it does to midnad.sock (newline JSON-RPC, binary stream.attach); each connection is \
+             carried to that Mac over the encrypted Nearby connection and served there as an ordinary client. Event \
+             drive.state reports the stages (connecting: finding, proving), connected, drops (reconnecting, then offline \
+             after a minute, still retried every 30 s) and closed, each with why. Opening a device that already has a \
+             link from this app returns that link and retries it now. Only the verified Midna app may open a link and \
+             connect to its socket; anyone else is refused outright, never deferred to the human. The link closes with \
+             drive.close or when the app that opened it quits."),
+        m::<DriveCloseParams, DriveCloseResult>("drive.close").mutating().human().d(
+            "Nearby: close a drive link drive.open made: its connections end and its socket goes (event drive.state \
+             closed). The verified Midna app only."),
+        m::<NoParams, DriveListResult>("drive.list").d(
+            "Nearby: the drive links this Mac has open to my other devices, with their state (as event drive.state)."),
+        m::<PeersSetAutoAcceptParams, PairedPeer>("peers.set_auto_accept").mutating().human().d(
+            "Nearby: accept one kind of share (message, snippet, link, file, tab, object, agent_start or agent_ask) from one of my devices \
+             without asking (on true), or ask again (on false). Everything is off by default. Only a device kept as \
+             my_device can have any (a contact is refused), keeping it as a contact or forgetting it turns them all \
+             off, and pairing again starts with none. Auto-accepting does what accepting would: a message is read, a \
+             snippet kept in the inbox (never pasted), a link opened, a file saved into nearby.downloads, a tab opened \
+             as a fresh shell, an agent start's prompt run in a new agent terminal (supervised, as a trigger's \
+             agent would be), an agent ask's prompt queued in its terminal. An object is applied only when it's a Summary record or a theme: rules, triggers, \
+             settings and queued prompts always wait for the human's review. An agent session always asks (kind \
+             agent is refused as bad params). If auto-accepting fails the share asks \
+             as usual. Returns the device (auto_accept lists what is on); event peers.changed. Human only."),
+        m::<PeersSetAgentSendParams, PairedPeer>("peers.set_agent_send").mutating().human().d(
+            "Nearby: let agents on this Mac send one of my devices some kinds of share without asking (on true), \
+             or ask the human first again (on false). `kinds` lists them: message, snippet, link, file, tab, object, \
+             agent, agent_start, agent_ask, file_request. Everything is off by default. Only a device kept as \
+             my_device can have any (a contact is refused), and keeping it as a contact or forgetting it turns them \
+             all off. It stands in for the human's approval only where no rule decides: a rule that denies or asks \
+             still applies. Returns the device (agent_send lists what is on); event peers.changed. Human only: an \
+             agent's call is refused, never deferred to the human."),
+        m::<ShareSendParams, ShareItem>("share.send").mutating().d(
+            "Nearby: offer a paired device that is on the network now a message (kind message, `text`, optional \
+             reply_to: the sh_… it answers), a snippet (kind snippet, `text`, optional title: text the other person can \
+             paste into a terminal), a link (kind link, an http(s) `url`, optional title), a file, image or folder \
+             (kind file, the absolute `path`; midnad reads it, and the offer lists each file with its size and \
+             SHA-256) or a terminal tab (kind tab, `session` or the caller's, optional title: its git remote and path \
+             in the repo, its directory, its shell's name and its scrollback as plain text; never its processes or \
+             environment), or an agent session (kind agent, `session` or the caller's agent terminal, optional title: \
+             the agent (claude or codex), its conversation id, its repo and directory, and its transcript as it is \
+             now, which the other Mac fetches in chunks only once accepted; never the agent's model, settings or \
+             environment), or an agent start (kind agent_start, `prompt`, optional agent claude|codex (default the \
+             sending terminal's, else claude), `session` or the caller's for the project and directory, optional \
+             title, want_reply): the other Mac's person accepting it opens a new agent terminal in their checkout of \
+             that project with the prompt as its first; with want_reply its first answer comes back as a message \
+             replying to the share (event share.answered; share.answer waits for it), \
+             or an agent ask (kind agent_ask, `session`: the id or name of an agent terminal open on the other Mac, \
+             from peers.sessions; `prompt`; want_reply; to one of my devices only): accepted, the prompt is queued in \
+             that terminal and typed once its agent is idle, and with want_reply the agent's last message when that \
+             turn ends comes back the same way. An ask whose terminal isn't there is refused with the reason. \
+             Returns the share (sh_…) once it is in the other device's inbox; event share.sent. Nothing \
+             runs on the other Mac: its person accepts or declines (share.accepted / share.declined fire here when \
+             they do). An accepted file's contents are fetched by the other Mac in chunks, resuming after a dropped \
+             connection; share.progress follows them. From an agent it asks the human first (an approval showing \
+             what would leave; error 1 with needs_you_id if they deny or don't answer) unless a rule the human gave \
+             allows `share send <kind> <device id>`. Kind object sends midna's own things, read from this daemon's \
+             stores: `object` summary (one sm_… id), rules (r_… ids), triggers (t_… ids), theme (one custom theme id), \
+             settings (keys; none = every changed setting that may leave) or queue (q_… ids). Projects travel by name; \
+             secrets, local paths, trust settings and anything tied to one terminal are refused. The receiver's \
+             approval shows what would change there; rules, triggers and human-only settings apply only on its human's \
+             accept, and triggers arrive disabled. Limits: message 4 KiB, snippet 256 KiB, URL 4 KiB, object 256 KiB \
+             or 200 items, 4000 files and folders per share, a tab's scrollback its newest 256 KiB, a transcript 256 MiB, \
+             a prompt 32 KiB."),
+        m::<ShareAcceptParams, ShareItem>("share.accept").mutating().human().d(
+            "Nearby: accept an incoming share. A message is marked read. A snippet is kept in the inbox, or with \
+             `session` pasted into that terminal (never followed by Enter; multi-line text only into a terminal that \
+             takes bracketed paste, so no line runs); accept it again to paste it again. A link is opened (action \
+             open, the default) or pinned to a terminal's links (action pin, `session` or the caller's). A file or \
+             folder is fetched into the nearby.downloads folder (default ~/Downloads/Midna), each file checked against \
+             its SHA-256 and nothing opened or run; `transfer` and event share.progress show how far it got, and \
+             accepting a failed one again starts it over. A tab opens as a new idle shell in this Mac's checkout of \
+             its repo (a project whose remote matches, at the same path inside it), or in `cwd`, or else in the home \
+             folder, with the sender's scrollback shown read-only above it; nothing runs. An agent session's \
+             transcript is fetched like a file, the sender's checkout and home paths in it are changed to this Mac's, \
+             it is put where the agent keeps conversations for that folder (one already there is kept beside it as \
+             .before-<id>), and a new agent terminal opens there (or in `cwd`) resuming the conversation, idle until \
+             prompted; refused while a terminal here runs that conversation. An agent start opens a new agent \
+             terminal where a tab would (or in `cwd`) with its prompt; with want_reply, the agent's last message when \
+             its first turn ends goes back to the sender (cut to 4 KiB), or a note if its terminal ends first. An \
+             agent ask queues its prompt in its terminal (sent once the agent is idle, never typed into a busy \
+             prompt); with want_reply the agent's last message when that turn ends goes back. If the terminal is gone \
+             or no longer an agent, accepting declines it, with the reason sent back. The sender gets share.accepted. Human only: agents can't accept what other devices send."),
+        m::<ShareDeclineParams, ShareItem>("share.decline").mutating().human().d(
+            "Nearby: decline an incoming share; the sender gets share.declined. The share stays in the inbox, \
+             declined. Human only."),
+        m::<ShareAnswerParams, ShareAnswerResult>("share.answer").d(
+            "Nearby: the answer to an agent start or ask this Mac sent with want_reply: the message the other Mac \
+             sent back once its agent's turn ended (`answer`, its text in payload.text), with the share as it is now \
+             (declined: no answer will come; `result` may say why). wait_secs (max 600) waits for it; call again to wait longer. The answer \
+             is also in inbox.list, marked read, and fires share.answered."),
+        m::<InboxListParams, InboxListResult>("inbox.list").d(
+            "Nearby: shares to and from paired devices, newest first, kept across restarts (the latest 500). \
+             Incoming ones in state offered wait for the human (each has a needs-you approval: approving accepts it, \
+             denying declines it). Event share.offered fires as one arrives. Filters: direction (incoming | \
+             outgoing), state (offered | accepted | declined), peer (fingerprint), limit (default 100)."),
         // usage
         m::<NoParams, UsageGetResult>("usage.get").d(
             "Claude's plan usage limits (account-wide): the 5-hour and weekly windows {used_percentage 0-100, resets_at}, \

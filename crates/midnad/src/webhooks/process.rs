@@ -66,11 +66,11 @@ fn payload_dir(d: &Daemon) -> PathBuf {
 }
 
 /// Where a delivery's body is kept for its `run_command`s (`$MIDNA_PAYLOAD`), pruned with it.
-fn body_file(d: &Daemon, delivery_id: &str) -> PathBuf {
+pub(crate) fn body_file(d: &Daemon, delivery_id: &str) -> PathBuf {
     payload_dir(d).join(format!("{delivery_id}.body.json"))
 }
 
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -100,6 +100,7 @@ fn new_delivery(source: TriggerSource, event: &str, guid: &str) -> Delivery {
         replay_of: None,
         body_sha256: None,
         command_runs: vec![],
+        event_seq: None,
     }
 }
 
@@ -466,16 +467,8 @@ pub fn run_action(d: &Arc<Daemon>, t: &Trigger, f: &Facts, payload: &Value, del_
                 runs.push(run);
                 return out;
             }
-            // A terminal's stdin is the terminal, so the body is only in $MIDNA_PAYLOAD there.
             let cmd = match body {
-                Some(b) => {
-                    let env: Vec<String> = [("MIDNA_TRIGGER", t.id.clone()), ("MIDNA_DELIVERY", del_id.to_string())]
-                        .into_iter()
-                        .chain(b.env())
-                        .map(|(k, v)| format!("{k}={}", payload::shell_quote(&v)))
-                        .collect();
-                    format!("export {}; {cmd}", env.join(" "))
-                }
+                Some(b) => b.exported(&t.id, del_id, &cmd),
                 None => cmd,
             };
             match open(json!({ "project_id": project_id, "kind": "monitor", "name": n, "command": [cmd], "background": background })) {
@@ -483,7 +476,7 @@ pub fn run_action(d: &Arc<Daemon>, t: &Trigger, f: &Facts, payload: &Value, del_
                 Err(e) => (None, format!("Could not run command: {e}")),
             }
         }
-        TriggerAction::Attention { message } => {
+        TriggerAction::Attention { message, .. } => {
             let msg = payload::render(message, f, payload, false);
             let mut item = d.new_needs_you(NeedsYouKind::Note, if msg.trim().is_empty() { t.name.clone() } else { msg }, trigger_actor(t), None);
             item.detail = [f.subject.clone(), f.url.clone()].into_iter().flatten().collect::<Vec<_>>().join(" · ");
@@ -492,7 +485,7 @@ pub fn run_action(d: &Arc<Daemon>, t: &Trigger, f: &Facts, payload: &Value, del_
             let item = d.raise_needs_you(item);
             (None, format!("Raised attention ({})", item.id))
         }
-        TriggerAction::Notify { title, body, sound, category, open, id } => {
+        TriggerAction::Notify { title, body, sound, category, open, id, .. } => {
             let (title, body) = (payload::render(title, f, payload, false), payload::render(body, f, payload, false));
             let body = if body.trim().is_empty() { [f.subject.clone(), f.url.clone()].into_iter().flatten().collect::<Vec<_>>().join(" · ") } else { body };
             // Clicking a webhook's notification opens what it's about, unless it says otherwise.
@@ -577,7 +570,7 @@ pub fn dry_run(t: &Trigger, event: &str, payload: Value) -> Delivery {
             let body = if *headless { format!("the {size}-byte body on stdin and in $MIDNA_PAYLOAD") } else { format!("the {size}-byte body in $MIDNA_PAYLOAD") };
             format!("would run{}: {} · with {body}", crate::local::run_where(*background, *headless), payload::render(command, &facts, &payload, true))
         }
-        TriggerAction::Attention { message } => format!("would raise attention: {}", payload::render(message, &facts, &payload, false)),
+        TriggerAction::Attention { message, .. } => format!("would raise attention: {}", payload::render(message, &facts, &payload, false)),
         TriggerAction::Notify { title, body, .. } => format!("would notify: {} {}", payload::render(title, &facts, &payload, false), payload::render(body, &facts, &payload, false)).trim().to_string(),
         a => format!("would do nothing: {} needs a local trigger", crate::local::action_name(a)),
     };

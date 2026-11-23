@@ -35,13 +35,37 @@ pub(crate) fn validate(d: &Daemon, t: &Trigger) -> Result<(), RpcError> {
     let local = t.source == TriggerSource::Local;
     if event.trim().is_empty() {
         return Err(RpcError::bad_params(if local {
-            "event must not be empty, e.g. agent.prompt_blocked, hook.Stop, idle or schedule"
+            "event must not be empty, e.g. agent.prompt_blocked, hook.Stop, stream.slack.*, idle or schedule"
         } else {
             "event must not be empty, e.g. pull_request.opened or pullrequest:created"
         }));
     }
-    if action.needs_session() && !local {
-        return Err(RpcError::bad_params(format!("{} acts on the terminal that fired, so it needs source local", crate::local::action_name(action))));
+    if action.acts_on_terminal() && !local {
+        return Err(RpcError::bad_params(format!("{} acts on a terminal on this Mac, so it needs source local", crate::local::action_name(action))));
+    }
+    if let Some(to) = action.to() {
+        if !local {
+            return Err(RpcError::bad_params("to names a terminal on this Mac, so it needs source local"));
+        }
+        if to.trim().is_empty() {
+            return Err(RpcError::bad_params("to must name a terminal (its name or session id), or be left out"));
+        }
+    }
+    // `stream.<name>.<kind>` (streams.publish): such an event belongs to no terminal.
+    if local && midna_proto::streams::check_event_glob(event).map_err(RpcError::bad_params)? {
+        let f = &t.filter;
+        if f.session.is_some() || f.agent.is_some() || (f.project.is_some() && action.to().is_none()) {
+            return Err(RpcError::bad_params(
+                "stream events belong to no terminal, so filter.session, project and agent never match; filter on the payload with filter.match \
+                 (filter.project only goes with to, where it says which project's terminal to look for)",
+            ));
+        }
+        if action.needs_session() {
+            return Err(RpcError::bad_params(format!(
+                "{} acts on the terminal that fired, and stream events have none: name one with to (e.g. \"to\": \"build-angel\"), or use notify, attention, run_command or start_agent",
+                crate::local::action_name(action)
+            )));
+        }
     }
     if local && event.trim().eq_ignore_ascii_case("idle") && t.filter.idle_minutes.unwrap_or(0) == 0 {
         return Err(RpcError::bad_params("idle triggers need filter.idle_minutes (e.g. 55)"));
@@ -59,9 +83,14 @@ pub(crate) fn validate(d: &Daemon, t: &Trigger) -> Result<(), RpcError> {
             let f = &t.filter;
             if action.needs_session() && f.session.is_none() && f.project.is_none() {
                 return Err(RpcError::bad_params(format!(
-                    "a schedule isn't about a terminal: {} needs filter.session (or filter.project, for every terminal in it)",
+                    "a schedule isn't about a terminal: {} needs filter.session (or filter.project, for every terminal in it), or to (one terminal's name or id)",
                     crate::local::action_name(action)
                 )));
+            }
+            if action.to().is_some() && (f.session.is_some() || f.agent.is_some()) {
+                return Err(RpcError::bad_params(
+                    "a schedule with to fires once, on that terminal: leave out filter.session and agent (filter.project says which project's terminal to look for)",
+                ));
             }
         }
         (None, false) => {}
@@ -100,12 +129,12 @@ pub(crate) fn validate(d: &Daemon, t: &Trigger) -> Result<(), RpcError> {
             }
             d.core().state.project(project_id).ok_or_else(|| RpcError::not_found(format!("no project {project_id}")))?;
         }
-        TriggerAction::Attention { message } => {
+        TriggerAction::Attention { message, .. } => {
             if message.trim().is_empty() {
                 return Err(RpcError::bad_params("attention needs a message"));
             }
         }
-        TriggerAction::SendToSession { steps } => {
+        TriggerAction::SendToSession { steps, .. } => {
             if steps.is_empty() || steps.iter().any(|s| s.text.is_empty() && !s.enter) {
                 return Err(RpcError::bad_params("send_to_session needs steps, e.g. [{\"text\":\"/compact\"},{\"text\":\"{{last_prompt}}\"}]"));
             }
@@ -121,7 +150,7 @@ pub(crate) fn validate(d: &Daemon, t: &Trigger) -> Result<(), RpcError> {
                 return Err(RpcError::bad_params("base must be idle, working, needs_you, done or failed"));
             }
         }
-        TriggerAction::ClearStatus {} => {}
+        TriggerAction::ClearStatus { .. } => {}
         TriggerAction::Notify { title, category, open, id, .. } => {
             if title.trim().is_empty() {
                 return Err(RpcError::bad_params("notify needs a title"));
@@ -255,14 +284,28 @@ pub fn add(d: &Daemon, ctx: &Ctx, p: TriggerAddParams) -> R {
     ok(t)
 }
 
+/// Would `p` change how much the agents `t` starts may do without asking? Agents ask the human
+/// for that, and the person driving from another Mac does it at this one.
+pub(crate) fn changes_access(t: &Trigger, p: &TriggerUpdateParams) -> bool {
+    p.action.as_ref().is_some_and(|a| a.agent_access() != t.action.agent_access())
+}
+
+/// Would `p` change the action or source of a webhook trigger that is on or paused? An agent's
+/// edit sends it back to draft; the person driving from another Mac makes it at this one.
+pub(crate) fn edits_live_webhook(t: &Trigger, p: &TriggerUpdateParams) -> bool {
+    let sensitive = p.action.as_ref().is_some_and(|a| *a != t.action) || p.source.is_some_and(|s| s != t.source);
+    let source = p.source.unwrap_or(t.source);
+    sensitive && source != TriggerSource::Local && matches!(t.state, TriggerState::Active | TriggerState::Paused)
+}
+
 pub fn update(d: &Daemon, ctx: &Ctx, p: TriggerUpdateParams) -> R {
     let mut t = get(d, &p.id)?;
-    if !ctx.is_human() && p.action.as_ref().is_some_and(|a| a.agent_access() != t.action.agent_access()) {
+    if !ctx.is_human() && changes_access(&t, &p) {
         let params = serde_json::to_value(&p).unwrap_or_default();
         return Err(defer_access(d, ctx, &t.name, "trigger.update", params));
     }
+    let back_to_draft = !ctx.is_human() && edits_live_webhook(&t, &p);
     let mut changed = vec![];
-    let mut sensitive = false;
     if let Some(n) = p.name {
         t.name = n.trim().to_string();
         changed.push("name");
@@ -285,14 +328,12 @@ pub fn update(d: &Daemon, ctx: &Ctx, p: TriggerUpdateParams) -> R {
     {
         t.source = s;
         changed.push("source");
-        sensitive = true;
     }
     if let Some(a) = p.action
         && a != t.action
     {
         t.action = a;
         changed.push("action");
-        sensitive = true;
     }
     if let Some(h) = p.github_hook_id {
         t.github_hook_id = Some(h).filter(|h| *h > 0);
@@ -307,11 +348,9 @@ pub fn update(d: &Daemon, ctx: &Ctx, p: TriggerUpdateParams) -> R {
         changed.push("cooldown_secs");
     }
     validate(d, &t)?;
-    let mut back_to_draft = false;
-    if sensitive && !ctx.is_human() && t.source != TriggerSource::Local && matches!(t.state, TriggerState::Active | TriggerState::Paused) {
+    if back_to_draft {
         t.enabled = false;
         t.state = TriggerState::Draft;
-        back_to_draft = true;
     }
     save(d, ctx, &t, json!({ "fields": changed, "back_to_draft": back_to_draft }));
     ok(t)
@@ -407,15 +446,64 @@ pub fn remove(d: &Daemon, ctx: &Ctx, p: IdParams) -> R {
 }
 
 pub fn replay(d: &Arc<Daemon>, _ctx: &Ctx, p: TriggerReplayParams) -> R {
-    let original = d.core().state.deliveries.iter().find(|x| x.id == p.delivery_id).cloned().ok_or_else(|| RpcError::not_found(format!("no delivery {}", p.delivery_id)))?;
-    ok(process::replay(d, &original)?)
+    let (delivery, stream, event) = (p.delivery_id, p.stream, p.event);
+    match (delivery, stream, event) {
+        (Some(id), None, None) => {
+            let original = d.core().state.deliveries.iter().find(|x| x.id == id).cloned().ok_or_else(|| RpcError::not_found(format!("no delivery {id}")))?;
+            ok(process::replay(d, &original)?)
+        }
+        (None, Some(stream), Some(event)) => ok(crate::local::replay_stream(d, &recorded_stream_event(d, &stream, event.trim())?)),
+        (None, Some(stream), None) => Err(RpcError::bad_params(format!("name the event to replay: its seq or id (midna stream events {stream} lists them)"))),
+        _ => Err(RpcError::bad_params("replay either a delivery_id or a stream event (stream + event), not both")),
+    }
+}
+
+/// A stream event `event` (its seq, or the publisher's id) among the stream's last
+/// [`streams::EVENTS_KEPT`] publishes, read back from the event log.
+fn recorded_stream_event(d: &Daemon, stream: &str, event: &str) -> Result<Event, RpcError> {
+    use midna_proto::streams::{EVENTS_KEPT, valid_name};
+    if !valid_name(stream) {
+        return Err(RpcError::bad_params(format!("stream `{stream}` must be 1–32 of a-z 0-9 - (e.g. slack)")));
+    }
+    let (rows, _) = d.streams.events(stream, EVENTS_KEPT);
+    let seq = event.parse::<u64>().ok();
+    // Newest first, and a logged one before a dropped one with the same id.
+    let mut hits: Vec<&StreamPublishRecord> = rows.iter().filter(|r| (seq.is_some() && r.seq == seq) || r.id.as_deref() == Some(event)).collect();
+    hits.sort_by_key(|r| r.seq.is_none());
+    let Some(r) = hits.first() else {
+        return Err(RpcError::not_found(format!("stream `{stream}` has no event {event} among its last {EVENTS_KEPT} publishes (midna stream events {stream} lists them)")));
+    };
+    let Some(seq) = r.seq else {
+        return Err(RpcError::conflict(format!("stream `{stream}` dropped event {event} ({}), so there is nothing recorded to replay", r.verdict.as_str())));
+    };
+    let kind = format!("stream.{stream}.{}", r.kind);
+    let filter = EventFilter { kinds: Some(vec![kind]), ..Default::default() };
+    d.log
+        .list(seq - 1, usize::MAX, &filter)
+        .into_iter()
+        .find(|e| e.seq == seq && e.stream.is_some())
+        .ok_or_else(|| RpcError::not_found(format!("event {seq} of stream `{stream}` is no longer in the event log")))
 }
 
 pub fn test(d: &Daemon, p: TriggerTestParams) -> R {
     let t = get(d, &p.trigger_id)?;
+    if let Some(st) = &p.stream {
+        if t.source != TriggerSource::Local {
+            return Err(RpcError::bad_params(format!("trigger {} is a webhook trigger; only local triggers see stream events", t.id)));
+        }
+        // Checked as streams.publish would, so a test can't pass with an event no publish could send.
+        let publish = midna_proto::streams::StreamsPublishParams { stream: st.name.clone(), kind: st.kind.clone(), id: st.id.clone(), data: p.payload.clone() };
+        let envelope = midna_proto::streams::check_publish(&publish).map_err(RpcError::bad_params)?;
+        let event = envelope.event_kind();
+        if let Some(e) = p.event.as_deref().filter(|e| !e.eq_ignore_ascii_case(&event)) {
+            return Err(RpcError::bad_params(format!("event `{e}` isn't the stream event `{event}`: leave event out with stream")));
+        }
+        let data = if p.payload.is_null() { json!({}) } else { p.payload };
+        return ok(crate::local::dry_run(d, &t, &event, p.session.as_deref(), &data, Some(&envelope)));
+    }
     if t.source == TriggerSource::Local {
         let event = p.event.unwrap_or_else(|| t.event.clone());
-        return ok(crate::local::dry_run(d, &t, &event, p.session.as_deref(), &p.payload));
+        return ok(crate::local::dry_run(d, &t, &event, p.session.as_deref(), &p.payload, None));
     }
     let event = p.event.unwrap_or_else(|| match t.source {
         TriggerSource::Github => t.event.split('.').next().unwrap_or(&t.event).to_string(),

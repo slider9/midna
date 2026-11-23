@@ -3,9 +3,10 @@
 //! (`summary.list`), a list on the left and the one you pick on the right, with apps' panels
 //! (`summary.annotate`) beside it.
 //!
-//! The project's … menu opens it (`keys.project_summary`). A project whose terminals have all
-//! closed keeps its heading with a Summary row instead of leaving the sidebar; closing that row
-//! (its ✕, or ⌘W on the Summary) lets the project go until another terminal closes in it.
+//! The project's … menu opens it (`keys.project_summary`), and so does its row in the sidebar's
+//! Summaries section (`ui::shelf`), there while it has records, terminals open or not. Root
+//! (terminals in no project) has one too. Clearing that row (its ✕, its menu, or Clear on the
+//! Summary) lets it go until another terminal closes there.
 use super::screen_kit::{clock, day_label, hm, now_unix, same_day, weekday_date};
 use crate::actions::{Kind, overlay, overlay_context};
 use crate::app::{MainWindow, Menu, Screen};
@@ -18,13 +19,17 @@ use gpui_kit::*;
 use midna_proto::{ActorKind, AgentKind, ClosedTerminal, LinkKind, SessionKind, StatusState, SummaryListResult, SummaryPanel};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
 
-/// A project whose Summary was on screen this recently gets no Summary row when its last
-/// terminal closes: it leaves the sidebar instead, as if the row was closed.
-const SEEN_FOR: Duration = Duration::from_secs(30 * 60);
-/// How long a close waits for its record (`summary.changed`) to dismiss it (`skip`).
-const SKIP_FOR: Duration = Duration::from_secs(10);
+actions!(
+    midna,
+    [
+        /// ⌘↩ on the Summary (`keys.approve`, bound in `actions::OVERLAY_KEYS`): reopen the
+        /// record on screen.
+        ResumeRecord,
+        /// ⌘⌫ on the Summary (`keys.deny`): remove the record on screen.
+        RemoveRecord,
+    ]
+);
 
 #[derive(Default)]
 pub struct SummaryPage {
@@ -38,115 +43,60 @@ pub struct SummaryPage {
     /// Projects whose Summary row was closed, with the newest record then (`app-state.json`
     /// `summary_closed`). The row comes back once a newer one closes.
     pub dismissed: HashMap<String, String>,
-    /// When each project's Summary last left the screen.
-    seen: HashMap<String, Instant>,
-    /// Projects whose last terminal just closed within `SEEN_FOR` of seeing their Summary: the
-    /// record on its way is dismissed as it arrives (`apply`), and until then they keep no row.
-    /// With when, and the newest record then.
-    skip: HashMap<String, (Instant, Option<String>)>,
     /// Sections the user folded, and sections older than a day the user opened (those start
     /// folded). By `Section::key`.
     folded: HashSet<String>,
     opened: HashSet<String>,
     /// The list, for the heading that sticks to its top.
     scroll: ScrollHandle,
+    /// The sidebar's Summaries section is folded to its heading (`app-state.json`
+    /// `summaries_folded`), and shows all its rows rather than the first few (`ui::shelf`).
+    pub shelf_folded: bool,
+    pub shelf_more: bool,
+    /// The last Clear, for its toast's Undo (`ui::shelf`).
+    pub undo: Option<crate::ui::shelf::Undo>,
 }
 
 impl SummaryPage {
-    pub fn new(dismissed: HashMap<String, String>) -> SummaryPage {
-        SummaryPage { dismissed, ..Default::default() }
+    pub fn new(dismissed: HashMap<String, String>, shelf_folded: bool) -> SummaryPage {
+        SummaryPage { dismissed, shelf_folded, ..Default::default() }
     }
 
     pub fn records<'a>(&'a self, pid: &'a str) -> impl Iterator<Item = &'a ClosedTerminal> + 'a {
         self.closed.iter().filter(move |c| c.project_id == pid)
     }
 
-    fn newest(&self, pid: &str) -> Option<&str> {
+    pub fn newest(&self, pid: &str) -> Option<&str> {
         self.closed.iter().find(|c| c.project_id == pid).map(|c| c.closed_at.as_str())
     }
 
-    /// A project with no terminals keeps its heading for its Summary row: it has records, and
-    /// none closed since the row was closed.
+    /// A project keeps a Summary row in the Summaries section: it has records, and none closed
+    /// since the row was closed.
     pub fn keeps(&self, pid: &str) -> bool {
-        if self.skipping(pid) {
-            return false;
-        }
         let Some(newest) = self.newest(pid) else { return false };
         let seconds = |ts: &str| midna_proto::time::parse_rfc3339(ts).unwrap_or(0);
         self.dismissed.get(pid).is_none_or(|d| seconds(newest) > seconds(d))
     }
 
-    fn skipping(&self, pid: &str) -> bool {
-        self.skip.get(pid).is_some_and(|(at, _)| at.elapsed() < SKIP_FOR)
-    }
-
-    /// `pid`'s Summary just left the screen.
-    fn saw(&mut self, pid: &str) {
-        self.seen.insert(pid.to_string(), Instant::now());
-    }
-
-    /// `pid`'s last terminal is closing: whether it keeps a Summary row. Not when its Summary
-    /// was on screen within `SEEN_FOR`: then the record on its way is skipped.
-    fn last_closed(&mut self, pid: &str) -> bool {
-        if self.seen.get(pid).is_none_or(|at| at.elapsed() >= SEEN_FOR) {
-            return true;
-        }
-        let newest = self.newest(pid).map(str::to_string);
-        self.skip.insert(pid.to_string(), (Instant::now(), newest));
-        false
-    }
-
-    /// Skipped projects whose record turned up: dismiss it, as closing their row would.
-    /// Whether any was (`dismissed` changed).
-    fn dismiss_skipped(&mut self) -> bool {
-        self.skip.retain(|_, (at, _)| at.elapsed() < SKIP_FOR);
-        let arrived: Vec<(String, String)> = self
-            .skip
-            .iter()
-            .filter_map(|(p, (_, before))| self.newest(p).filter(|n| before.as_deref() != Some(*n)).map(|n| (p.clone(), n.to_string())))
-            .collect();
-        for (pid, newest) in &arrived {
-            self.skip.remove(pid);
-            self.dismissed.insert(pid.clone(), newest.clone());
-        }
-        !arrived.is_empty()
-    }
 }
 
 /// ⌘W is closing `ids`, still in `m.sessions`: the projects they leave with no terminals, and
-/// whether each keeps its heading for a Summary row (its record is on its way). One whose
-/// Summary was on screen in the last 30 minutes doesn't: it goes, its record dismissed. The
-/// project whose Summary is on screen counts as seen; its row is already there, so it's left
-/// out (it goes when its Summary does, `moved`).
-pub fn closing(m: &mut MainWindow, ids: &[String]) -> Vec<(String, bool)> {
+/// whether each gets a new Summary row (its record is on its way), which it doesn't when its row
+/// is already there.
+pub fn closing(m: &MainWindow, ids: &[String]) -> Vec<(String, bool)> {
     let emptied: Vec<String> = m
         .groups()
         .iter()
         .filter(|g| !g.sessions.is_empty() && g.sessions.iter().all(|s| ids.contains(&s.id)))
         .filter_map(|g| g.project.map(|p| p.id.clone()))
         .collect();
-    let on_screen = shown(m).map(str::to_string);
-    let mut out = vec![];
-    for pid in emptied {
-        if on_screen.as_deref() == Some(pid.as_str()) {
-            m.summary.saw(&pid);
-            m.summary.last_closed(&pid);
-        } else {
-            out.push((pid.clone(), m.summary.last_closed(&pid)));
-        }
-    }
-    out
+    let shelf = crate::ui::shelf::pids(m);
+    emptied.into_iter().map(|p| (p.clone(), !shelf.contains(&p))).collect()
 }
 
 /// The project on screen, when the Summary is.
 pub fn shown(m: &MainWindow) -> Option<&str> {
     m.summary.project.as_deref().filter(|_| m.screen == Screen::Summary)
-}
-
-/// Whether `pid`'s group shows a Summary row: its Summary is on screen, or it has no
-/// terminals and keeps its heading for one.
-pub fn row_wanted(m: &MainWindow, pid: &str, empty: bool) -> bool {
-    shown(m) == Some(pid) || (empty && m.summary.keeps(pid))
 }
 
 pub fn fetch(m: &mut MainWindow, cx: &mut Context<MainWindow>) {
@@ -159,9 +109,6 @@ pub fn fetch(m: &mut MainWindow, cx: &mut Context<MainWindow>) {
 pub fn apply(m: &mut MainWindow, r: SummaryListResult, cx: &mut Context<MainWindow>) {
     m.summary.closed = r.closed;
     m.summary.keep_days = r.keep_days;
-    if m.summary.dismiss_skipped() {
-        crate::ui::statusbar::save_state(m);
-    }
     if m.summary.sel.as_ref().is_some_and(|s| !m.summary.closed.iter().any(|c| &c.id == s)) {
         m.summary.sel = None;
     }
@@ -181,22 +128,22 @@ pub fn lit_row(m: &MainWindow) -> Option<String> {
 /// and `was` is the project whose Summary was on screen. Its row glides the highlight, and folds
 /// away when it leaves the sidebar (with its whole project, when that goes too).
 pub fn moved(m: &mut MainWindow, from: Option<String>, was: Option<String>, cx: &mut Context<MainWindow>) {
-    if let Some(p) = &was {
-        m.summary.saw(p);
+    // The Summaries section sits below every terminal: the pane slides that way.
+    let shelf = crate::ui::shelf::pids(m);
+    match (&was, shown(m)) {
+        (Some(w), None) => close_anim::summary_slide(m, Some(w.clone()), close_anim::Dir::Above, cx),
+        (None, Some(p)) if shelf.iter().any(|x| x == p) => close_anim::summary_slide(m, None, close_anim::Dir::Below, cx),
+        _ => {}
     }
     let gone = was.filter(|p| shown(m) != Some(p.as_str())).and_then(|p| leaves(m, p));
     let to = lit_row(m);
     close_anim::summary(m, from, to, gone, cx);
 }
 
-/// Whether `pid`'s Summary row is gone from the sidebar, and whether its project went with it.
+/// Whether `pid`'s Summary row is gone from the sidebar. Every Summary row is in the Summaries
+/// section, so it leaves on its own (`whole` false), never with its project's group.
 fn leaves(m: &MainWindow, pid: String) -> Option<(String, bool)> {
-    let groups = m.groups();
-    match groups.iter().find(|g| g.project.is_some_and(|p| p.id == pid)) {
-        None => Some((pid, true)),
-        Some(g) if !row_wanted(m, &pid, g.sessions.is_empty()) => Some((pid, false)),
-        Some(_) => None,
-    }
+    (!crate::ui::shelf::pids(m).contains(&pid)).then_some((pid, false))
 }
 
 /// Show `pid`'s Summary (from the project's … menu, its Summary row or ⌥⌘Y).
@@ -205,6 +152,14 @@ pub fn open(m: &mut MainWindow, pid: String, window: &mut Window, cx: &mut Conte
         return;
     }
     let (from, was) = (lit_row(m), shown(m).map(str::to_string));
+    // From one row in the Summaries section to another: the pane slides the way the rows sit.
+    if let Some(w) = was.as_ref().filter(|_| m.screen == Screen::Summary) {
+        let shelf = crate::ui::shelf::pids(m);
+        let at = |p: &str| shelf.iter().position(|x| x == p);
+        if let (Some(a), Some(b)) = (at(w), at(&pid)) {
+            close_anim::summary_slide(m, Some(w.clone()), if b > a { close_anim::Dir::Below } else { close_anim::Dir::Above }, cx);
+        }
+    }
     m.summary.project = Some(pid);
     m.summary.sel = None;
     if m.screen != Screen::Summary {
@@ -216,15 +171,24 @@ pub fn open(m: &mut MainWindow, pid: String, window: &mut Window, cx: &mut Conte
     cx.notify();
 }
 
-/// Close `pid`'s Summary row: a project with no terminals leaves the sidebar until another
-/// terminal closes in it. Leaves its Summary when it's on screen.
+/// Clear `pid`'s Summary row: a project with no terminals leaves the sidebar until another
+/// terminal closes in it (the toast's Undo brings it back). Its Summary on screen, the one
+/// below it in the Summaries section takes its place, else the one above, else the terminal.
 pub fn close_row(m: &mut MainWindow, pid: &str, window: &mut Window, cx: &mut Context<MainWindow>) {
+    let shelf = crate::ui::shelf::pids(m);
+    let next = shelf.iter().position(|p| p == pid).and_then(|i| shelf.get(i + 1).or(i.checked_sub(1).and_then(|j| shelf.get(j)))).cloned();
+    let name = crate::ui::shelf::name(m, pid);
+    let before = m.summary.dismissed.get(pid).cloned();
     if let Some(newest) = m.summary.newest(pid).map(str::to_string) {
         m.summary.dismissed.insert(pid.to_string(), newest);
         crate::ui::statusbar::save_state(m);
     }
+    crate::ui::shelf::offer_undo(m, format!("{name}’s Summary cleared"), vec![(pid.to_string(), before)], cx);
     if shown(m) == Some(pid) {
-        m.set_screen(Screen::Terminal, window, cx);
+        match next {
+            Some(n) => open(m, n, window, cx),
+            None => m.set_screen(Screen::Terminal, window, cx),
+        }
     } else if let Some(gone) = leaves(m, pid.to_string()) {
         close_anim::summary(m, None, None, Some(gone), cx);
     }
@@ -503,9 +467,55 @@ fn row(m: &MainWindow, t: &Theme, c: &ClosedTerminal, on: bool, now: i64, cx: &m
 pub fn render(m: &mut MainWindow, t: &Theme, _window: &mut Window, cx: &mut Context<MainWindow>) -> AnyElement {
     let m = &*m;
     let pid = m.summary.project.clone().unwrap_or_default();
-    let project = m.projects.iter().find(|p| p.id == pid).map(|p| p.name.clone()).unwrap_or_default();
-    let records = list(m);
-    let cur = current(m);
+    div()
+        .id("summary")
+        .key_context(overlay_context(Kind::Screen, overlay::SUMMARY))
+        .track_focus(&m.overlay_focus)
+        .on_key_down(cx.listener(on_key))
+        .on_action(cx.listener(|m, _: &crate::actions::Dismiss, w, cx| {
+            if m.menu == Menu::Summary {
+                m.menu = Menu::None;
+                cx.notify();
+            } else {
+                m.set_screen(Screen::Terminal, w, cx);
+            }
+        }))
+        .on_action(cx.listener(|m, _: &ResumeRecord, _, cx| {
+            if let Some(c) = current(m) {
+                resume(m, c.id, cx);
+            }
+        }))
+        .on_action(cx.listener(|m, _: &RemoveRecord, _, cx| {
+            if let Some(c) = current(m) {
+                remove(m, c.id, cx);
+            }
+        }))
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .flex()
+        .child(page(m, t, &pid, true, cx))
+        .into_any_element()
+}
+
+/// `pid`'s Summary as it looked, sliding out as another one (or a terminal) comes in
+/// (`close_anim::summary_slide`): its newest record, taking no clicks.
+pub fn ghost_page(m: &MainWindow, t: &Theme, pid: &str, cx: &mut Context<MainWindow>) -> AnyElement {
+    div().id(SharedString::from(format!("summary-ghost-{pid}"))).relative().flex_1().min_w_0().h_full().flex().child(page(m, t, pid, false, cx)).child(div().absolute().inset_0().occlude()).into_any_element()
+}
+
+/// The page itself: `live` is the one on screen (its scroll, its stuck heading, its pick).
+fn page(m: &MainWindow, t: &Theme, pid: &str, live: bool, cx: &mut Context<MainWindow>) -> Div {
+    let project = crate::ui::shelf::name(m, pid);
+    let records: Vec<&ClosedTerminal> = m.summary.records(pid).collect();
+    let cur = if live { current(m) } else { records.first().map(|c| (*c).clone()) };
+    // Its row in the Summaries section: Clear takes it out.
+    let clear = {
+        let p = pid.to_string();
+        super::screen_kit::btn(t, "sum-clear", "Clear")
+            .tooltip(super::header::tip("Take this Summary out of the sidebar. It comes back when another terminal closes here."))
+            .on_click(cx.listener(move |m, _, w, cx| close_row(m, &p, w, cx)))
+    };
     let days = match m.summary.keep_days {
         0 | 1 => "today".to_string(),
         n => format!("last {n} days"),
@@ -524,11 +534,12 @@ pub fn render(m: &mut MainWindow, t: &Theme, _window: &mut Window, cx: &mut Cont
         .child(div().text_size(px(15.)).font_weight(FontWeight::BOLD).child("Summary"))
         .child(div().text_color(t.dim).truncate().child(project))
         .child(div().flex_1())
-        .child(div().flex_none().text_size(px(12.)).text_color(t.dim).child(days.clone()));
+        .child(div().flex_none().text_size(px(12.)).text_color(t.dim).child(days.clone()))
+        .child(clear);
 
     let now = now_unix();
     let groups = sections(&records, now);
-    let mut rows = div().id("sum-list").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().track_scroll(&m.summary.scroll).pb(px(6.));
+    let mut rows = div().id("sum-list").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().when(live, |d| d.track_scroll(&m.summary.scroll)).pb(px(6.));
     for (ix, (sec, recs)) in groups.iter().enumerate() {
         let folded = m.summary.is_folded(sec);
         let mut group = div().flex().flex_col().child(section_head(t, sec, recs, folded, ix > 0, cx));
@@ -544,7 +555,7 @@ pub fn render(m: &mut MainWindow, t: &Theme, _window: &mut Window, cx: &mut Cont
     // The heading of the section scrolled under the list's top edge sticks there.
     let scroll = &m.summary.scroll;
     let top = scroll.top_item();
-    let stuck = scroll.bounds_for_item(top).filter(|b| b.top() < scroll.bounds().top() - px(1.)).and_then(|_| groups.get(top));
+    let stuck = scroll.bounds_for_item(top).filter(|b| live && b.top() < scroll.bounds().top() - px(1.)).and_then(|_| groups.get(top));
     let pane = div()
         .relative()
         .flex()
@@ -571,38 +582,7 @@ pub fn render(m: &mut MainWindow, t: &Theme, _window: &mut Window, cx: &mut Cont
             .into_any_element(),
     };
 
-    div()
-        .id("summary")
-        .key_context(overlay_context(Kind::Screen, overlay::SUMMARY))
-        .track_focus(&m.overlay_focus)
-        .on_key_down(cx.listener(on_key))
-        .on_action(cx.listener(|m, _: &crate::actions::Dismiss, w, cx| {
-            if m.menu == Menu::Summary {
-                m.menu = Menu::None;
-                cx.notify();
-            } else {
-                m.set_screen(Screen::Terminal, w, cx);
-            }
-        }))
-        // ⌘↩ and ⌘⌫ (the approve and deny keys) act on the record on screen.
-        .on_action(cx.listener(|m, _: &crate::actions::ApproveOnce, _, cx| {
-            if let Some(c) = current(m) {
-                resume(m, c.id, cx);
-            }
-        }))
-        .on_action(cx.listener(|m, _: &crate::actions::Deny, _, cx| {
-            if let Some(c) = current(m) {
-                remove(m, c.id, cx);
-            }
-        }))
-        .flex_1()
-        .min_w_0()
-        .h_full()
-        .flex()
-        .bg(t.bg)
-        .child(left)
-        .child(right)
-        .into_any_element()
+    div().flex_1().min_w_0().h_full().flex().bg(t.bg).child(left).child(right)
 }
 
 /// The right side: everything about one closed terminal.
@@ -750,9 +730,12 @@ fn detail(m: &MainWindow, t: &Theme, c: &ClosedTerminal, cx: &mut Context<MainWi
         div().flex().flex_col().child(caps(t, "Your prompts")).child(col).children(more)
     });
 
-    let main = div().flex_1().min_w_0().flex().flex_col().gap(px(18.)).child(grid).children(prompts);
+    // Grows from 360px; when that and the apps' 300px column don't both fit, the column wraps
+    // under it rather than squeezing the facts to a few characters a line.
+    let main = div().flex_grow(1.).flex_shrink(1.).flex_basis(px(360.)).min_w_0().flex().flex_col().gap(px(18.)).child(grid).children(prompts);
 
-    let mut side = div().flex_none().w(px(300.)).flex().flex_col().gap(px(12.));
+    let mut side = div().flex_none().w(px(300.)).max_w_full().flex().flex_col().gap(px(12.));
+    let has_side = !c.apps.is_empty() || !c.links.is_empty();
     for (owner, p) in &c.apps {
         side = side.child(panel(t, owner, p));
     }
@@ -786,7 +769,22 @@ fn detail(m: &MainWindow, t: &Theme, c: &ClosedTerminal, cx: &mut Context<MainWi
         .flex()
         .flex_col()
         .child(header)
-        .child(div().id("sum-detail-body").flex_1().min_h_0().overflow_y_scroll().flex().items_start().gap(px(18.)).px(px(20.)).py(px(18.)).child(main).child(side))
+        .child(
+            div()
+                .id("sum-detail-body")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_wrap()
+                .content_start()
+                .items_start()
+                .gap(px(18.))
+                .px(px(20.))
+                .py(px(18.))
+                .child(main)
+                .when(has_side, |d| d.child(side)),
+        )
 }
 
 /// "today 14:02" or "26 Oct 14:02".
@@ -806,12 +804,15 @@ fn link_icon(k: LinkKind) -> Icon {
 
 /// A link from a closed terminal: URLs open in their app; a file opens in the IDE rules pick,
 /// as a click in a terminal would (its terminal is gone, so any open one stands in for it).
+/// In another Mac's window the file is on that Mac, so it opens in an editor there even with
+/// no terminal to stand in (a new one, in no project), never on this Mac.
 fn open_link(m: &mut MainWindow, target: &str, file: bool, cx: &mut Context<MainWindow>) {
     if crate::dev::var_os("MIDNA_DEBUG_TERM").is_some() {
         eprintln!("midna-app debug-term: link {target}"); // dev runs never launch apps
     } else if file {
         match m.sessions.first().map(|s| s.id.clone()) {
             Some(sid) => crate::terminal::open_file(m.backend.clone(), sid, target.to_string(), None),
+            None if m.remote() => crate::terminal::open_file(m.backend.clone(), String::new(), target.to_string(), None),
             None => cx.open_url(&format!("file://{target}")),
         }
     } else {
@@ -886,75 +887,6 @@ fn panel(t: &Theme, owner: &str, p: &SummaryPanel) -> impl IntoElement + use<> {
         )
 }
 
-/// The Summary row in a project's group: the list icon, "Summary", and when the last terminal
-/// closed where a terminal's icon sits (its ✕ on hover). A click shows it; its ✕ closes the
-/// row (`close_row`).
-pub fn sidebar_row(m: &MainWindow, t: &Theme, pid: &str, compact: bool, cx: &mut Context<MainWindow>) -> AnyElement {
-    let on = shown(m) == Some(pid);
-    // The highlight on its way to or from a terminal's row (`ui::close_anim::summary`); folding
-    // away, the fold draws it.
-    let hl = m.close_anim.highlight(&close_anim::summary_key(pid), on);
-    let own = on && hl == close_anim::Highlight::Own;
-    let moving = match hl {
-        close_anim::Highlight::At { top, h } if m.close_anim.summary_leaving(pid).is_none() => Some((top, h)),
-        _ => None,
-    };
-    let last = m.summary.newest(pid).map(|ts| super::screen_kit::ago(Some(ts)));
-    let (open_id, close_id) = (pid.to_string(), pid.to_string());
-    let group = SharedString::from(format!("sum-side-{pid}"));
-    div()
-        .id(SharedString::from(format!("summary-row-{pid}")))
-        .relative()
-        .flex()
-        .items_center()
-        .gap(px(9.))
-        .w_full()
-        .px(px(14.))
-        .py(px(if compact { 5. } else { 8. }))
-        .cursor_pointer()
-        .group(group.clone())
-        .when_some(moving, |d, (top, h)| d.child(super::sidebar::highlight(t).top(px(top)).h(px(h))))
-        .when(own, |d| d.bg(t.raised).child(div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(t.accent)))
-        .when(!on, |d| d.hover(|s| s.bg(t.raised.opacity(0.5))))
-        .tooltip(super::header::tip_keys("This project's closed terminals", "keys.project_summary"))
-        .on_click(cx.listener(move |m, _, w, cx| open(m, open_id.clone(), w, cx)))
-        .child(div().w(px(12.)).flex_none().flex().items_center().child(Icon::Summary.el(12., if on { t.accent } else { t.dim })))
-        .child(div().flex_1().min_w_0().font_weight(FontWeight::MEDIUM).truncate().child("Summary"))
-        .child(
-            div()
-                .relative()
-                .flex_none()
-                .min_w(px(16.))
-                .h(px(16.))
-                .flex()
-                .items_center()
-                .justify_end()
-                .children(last.map(|a| div().text_size(px(11.5)).text_color(t.dim).whitespace_nowrap().group_hover(group.clone(), |s| s.opacity(0.)).child(a)))
-                .child(
-                    div()
-                        .id(SharedString::from(format!("summary-x-{pid}")))
-                        .absolute()
-                        .top_0()
-                        .right_0()
-                        .size(px(16.))
-                        .rounded(px(4.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .opacity(0.)
-                        .group_hover(group, |s| s.opacity(1.))
-                        .hover(|s| s.bg(t.line))
-                        .tooltip(super::header::tip("Close the Summary"))
-                        .on_click(cx.listener(move |m, _, w, cx| {
-                            cx.stop_propagation();
-                            close_row(m, &close_id, w, cx);
-                        }))
-                        .child(Icon::Cross.el(10., t.dim)),
-                ),
-        )
-        .into_any_element()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{SummaryPage, row_time, section, sections};
@@ -997,33 +929,6 @@ mod tests {
         assert!(!page.keeps("p1"));
         page.closed.insert(0, rec("p1", "2026-10-27T13:00:00Z"));
         assert!(page.keeps("p1"));
-    }
-
-    #[test]
-    fn closing_the_last_terminal_keeps_a_row_unless_the_summary_was_just_seen() {
-        let mut page = SummaryPage { closed: vec![rec("p1", "2026-10-27T12:00:00Z")], ..Default::default() };
-        assert!(page.last_closed("p1"), "never seen");
-        assert!(!page.dismiss_skipped());
-        page.saw("p1");
-        assert!(!page.last_closed("p1"), "seen just now");
-        assert!(!page.keeps("p1"), "no row while its record is on its way");
-        assert!(!page.dismiss_skipped(), "its record hasn't turned up yet");
-        page.closed.insert(0, rec("p1", "2026-10-27T13:00:00Z"));
-        assert!(page.dismiss_skipped());
-        assert_eq!(page.dismissed.get("p1").map(String::as_str), Some("2026-10-27T13:00:00Z"));
-        assert!(!page.keeps("p1"), "dismissed");
-        page.closed.insert(0, rec("p1", "2026-10-27T14:00:00Z"));
-        assert!(page.keeps("p1"), "a later close brings the row back");
-    }
-
-    #[test]
-    fn a_project_never_closed_before_skips_its_first_record_too() {
-        let mut page = SummaryPage::default();
-        page.saw("p1");
-        assert!(!page.last_closed("p1"));
-        page.closed.push(rec("p1", "2026-10-27T12:00:00Z"));
-        assert!(page.dismiss_skipped());
-        assert!(!page.keeps("p1"));
     }
 
     #[test]

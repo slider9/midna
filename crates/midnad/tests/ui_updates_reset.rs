@@ -216,7 +216,8 @@ fn daemon_reset_clears_state_but_keeps_rules_and_log() {
     let pending = call(&mut h, "needs_you.list", json!({})).as_array().unwrap().len();
     assert!(pending >= 2);
     let r = call(&mut h, "daemon.reset", json!({}));
-    assert_eq!((r["sessions_closed"].as_u64(), r["triggers_removed"].as_u64(), r["settings_reset"].as_u64()), (Some(2), Some(1), Some(1)));
+    // The theme, and guard.hold_agents_at, which every test daemon sets (`TestDaemon::calm`).
+    assert_eq!((r["sessions_closed"].as_u64(), r["triggers_removed"].as_u64(), r["settings_reset"].as_u64()), (Some(2), Some(1), Some(2)));
     assert!(r["projects_removed"].as_u64().unwrap() >= 1);
     let triggers = call(&mut h, "trigger.list", json!({}));
     assert_eq!(triggers.as_array().unwrap().iter().map(|t| t["builtin"].as_str()).collect::<Vec<_>>(), vec![Some("prompt_blocked_status")], "only the built-ins");

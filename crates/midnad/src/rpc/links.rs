@@ -53,11 +53,42 @@ const MAX_APP_PATTERNS: usize = 64;
 
 pub fn patterns_list(d: &Daemon) -> R {
     let core = d.core();
-    let apps = core.state.app_link_patterns.iter().map(|(owner, patterns)| AppLinkPatterns { owner: owner.clone(), patterns: patterns.clone() }).collect();
+    let apps = core.state.app_link_patterns.iter().map(|(owner, patterns)| app_patterns(&core.state, owner, patterns)).collect();
     ok(LinkPatternsList { apps })
 }
 
-/// Replace an app's link patterns wholesale; an empty list removes them.
+/// The preview commands an app's rules run, one line each in a stable order. Empty when none.
+pub fn preview_commands(patterns: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = midna_proto::link_patterns::parse_all(patterns).into_iter().filter(|p| !p.preview.is_empty()).map(|p| p.preview.join(" ")).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// What the human approves of an app's link patterns: its name and the preview commands they
+/// run. None when they run none, so there's nothing to approve.
+pub fn preview_fingerprint(owner: &str, patterns: &[String]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let commands = preview_commands(patterns);
+    if commands.is_empty() {
+        return None;
+    }
+    let text = format!("preview\n{owner}\n{}", commands.join("\n"));
+    Some(crate::webhooks::sig::hex_encode(&Sha256::digest(text.as_bytes())))
+}
+
+fn app_patterns(state: &crate::state::State, owner: &str, patterns: &[String]) -> AppLinkPatterns {
+    let fp = preview_fingerprint(owner, patterns);
+    let a = state.app_link_previews.get(owner);
+    let approved = fp.is_none() || a.and_then(|a| a.approved.as_ref()) == fp.as_ref();
+    let open = |id: &Id| state.needs_you.iter().any(|n| n.id == *id);
+    let approval = a.and_then(|a| a.asked.as_ref()).filter(|(f, id)| !approved && Some(f) == fp.as_ref() && open(id)).map(|(_, id)| id.clone());
+    AppLinkPatterns { owner: owner.to_string(), patterns: patterns.to_vec(), approved, approval }
+}
+
+/// Replace an app's link patterns wholesale; an empty list removes them and forgets the
+/// approval. Their links work at once; preview commands not yet approved ask the human once per
+/// set, as `actions_register` does, and don't run until then.
 pub fn patterns_register(d: &Daemon, ctx: &Ctx, p: LinkPatternsRegisterParams) -> R {
     let owner = owner_name(&p.owner)?;
     if p.patterns.len() > MAX_APP_PATTERNS {
@@ -68,21 +99,85 @@ pub fn patterns_register(d: &Daemon, ctx: &Ctx, p: LinkPatternsRegisterParams) -
     for r in &patterns {
         midna_proto::link_patterns::LinkPattern::parse(r).map_err(|e| RpcError::bad_params(format!("rule `{r}`: {e}")))?;
     }
-    {
+    let fp = preview_fingerprint(&owner, &patterns);
+    let (stale, ask) = {
         let mut core = d.core();
-        let apps = &mut core.state.app_link_patterns;
+        let st = &mut core.state;
         if patterns.is_empty() {
-            apps.remove(&owner);
+            st.app_link_patterns.remove(&owner);
+            (st.app_link_previews.remove(&owner).and_then(|a| a.asked).map(|(_, id)| id), false)
         } else {
-            if !apps.contains_key(&owner) && apps.len() >= MAX_OWNERS {
+            if !st.app_link_patterns.contains_key(&owner) && st.app_link_patterns.len() >= MAX_OWNERS {
                 return Err(RpcError::bad_params(format!("at most {MAX_OWNERS} apps can register link patterns")));
             }
-            apps.insert(owner.clone(), patterns.clone());
+            st.app_link_patterns.insert(owner.clone(), patterns.clone());
+            if fp.is_none() && !st.app_link_previews.contains_key(&owner) {
+                (None, false)
+            } else {
+                let a = st.app_link_previews.entry(owner.clone()).or_default();
+                let asked_now = a.asked.as_ref().is_some_and(|(f, _)| Some(f) == fp.as_ref());
+                let stale = if asked_now { None } else { a.asked.take().map(|(_, id)| id) };
+                (stale, fp.is_some() && a.approved != fp && !asked_now)
+            }
+        }
+    };
+    if let Some(id) = stale {
+        let why = if patterns.is_empty() { "the app removed its link patterns" } else { "the app changed its link patterns' preview commands" };
+        d.withdraw_needs_you(&id, why);
+    }
+    if let (true, Some(fp)) = (ask, &fp) {
+        let id = ask_preview_approval(d, ctx, &owner, &patterns, fp);
+        if let Some(a) = d.core().state.app_link_previews.get_mut(&owner) {
+            a.asked = Some((fp.clone(), id));
         }
     }
     d.mark_dirty();
-    d.emit(kinds::LINK_PATTERNS_CHANGED, ctx.actor(), None, None, json!({ "owner": owner, "count": patterns.len() }));
-    ok(AppLinkPatterns { owner, patterns })
+    let view = app_patterns(&d.core().state, &owner, &patterns);
+    d.emit(kinds::LINK_PATTERNS_CHANGED, ctx.actor(), None, None, json!({ "owner": owner, "count": patterns.len(), "approved": view.approved }));
+    ok(view)
+}
+
+/// The needs-you that asks the human to approve an app's preview commands; approving it runs
+/// `links.patterns.approve` for exactly these.
+fn ask_preview_approval(d: &Daemon, ctx: &Ctx, owner: &str, patterns: &[String], fp: &str) -> Id {
+    let mut item = d.new_needs_you(NeedsYouKind::Approval, format!("{owner} wants to run commands to preview its links"), ctx.actor(), ctx.session.clone());
+    let commands: Vec<String> = preview_commands(patterns).iter().map(|c| format!("  {c}")).collect();
+    item.detail = format!(
+        "Approving lets {owner}'s link patterns run these when you hover a link they made, with the matched text in place of $1 and the like:\n{}\n\
+         Until then its links still work and the card shows the plain URL. It asks again whenever these change.",
+        commands.join("\n")
+    );
+    let cli = format!("links.patterns.approve {owner}");
+    item.approval = Some(ApprovalRequest {
+        action: PolicyAction { kind: ActionKind::Cli, value: cli, session: ctx.session.clone(), project: item.project_id.clone() },
+        matched_rule: None,
+        target_session: None,
+    });
+    let params = json!({ "owner": owner, "fingerprint": fp });
+    d.core().state.deferred.insert(item.id.clone(), crate::state::Deferred { method: "links.patterns.approve".into(), params, guard: Some(fp.to_string()) });
+    d.raise_needs_you(item).id
+}
+
+pub fn patterns_approve(d: &Daemon, ctx: &Ctx, p: LinkPatternsApproveParams) -> R {
+    let view = {
+        let mut core = d.core();
+        let st = &mut core.state;
+        let patterns = st.app_link_patterns.get(&p.owner).cloned().ok_or_else(|| RpcError::not_found(format!("{} has no link patterns", p.owner)))?;
+        if preview_fingerprint(&p.owner, &patterns).as_deref() != Some(p.fingerprint.as_str()) {
+            return Err(RpcError::conflict(format!("{}'s preview commands changed since this was asked; it asks again", p.owner)));
+        }
+        st.app_link_previews.entry(p.owner.clone()).or_default().approved = Some(p.fingerprint.clone());
+        app_patterns(st, &p.owner, &patterns)
+    };
+    d.mark_dirty();
+    d.emit(kinds::LINK_PATTERNS_CHANGED, ctx.actor(), None, None, json!({ "owner": p.owner, "count": view.patterns.len(), "approved": true }));
+    ok(view)
+}
+
+/// The owners whose preview commands the human approved as they are now, with that approval:
+/// `session.link_at` drops every other app's preview commands.
+pub fn approved_previews(state: &crate::state::State) -> std::collections::BTreeMap<String, String> {
+    state.app_link_previews.iter().filter_map(|(owner, a)| Some((owner.clone(), a.approved.clone()?))).collect()
 }
 
 /// Ask the app to drop what it cached for a link and fetch it again (a pull request merged, a run re-ran).
@@ -311,4 +406,85 @@ pub fn actions_approve(d: &Daemon, ctx: &Ctx, p: LinkActionsApproveParams) -> R 
     d.mark_dirty();
     d.emit(kinds::LINK_ACTIONS_CHANGED, ctx.actor(), None, None, json!({ "owner": p.owner, "count": view.menus.len(), "approved": true }));
     ok(view)
+}
+
+/// `links.preview`: what a link's hover card shows, read on this Mac (for a window on another
+/// Mac that drives this one, the files, `gh` and preview commands here, not there).
+pub fn preview(p: LinksPreviewParams) -> R {
+    use midna_proto::link_preview::{GithubLink, read_path};
+    use midna_proto::preview_cmd;
+    if let Some(argv) = &p.preview {
+        if !was_issued(&p.target, argv) {
+            return Err(RpcError::refused(format!("not a preview command this Mac's link patterns gave for {}", p.target)));
+        }
+        let out = preview_cmd::run_pattern(argv, user_path(), preview_cmd::PATTERN_TIMEOUT);
+        return app_card(out, &p.target);
+    }
+    if let Some(g) = GithubLink::parse(&p.target) {
+        let out = crate::git::gh_available().then(|| {
+            let args = g.gh_args();
+            let argv: Vec<&str> = std::iter::once(crate::git::gh_bin()).chain(args.iter().map(String::as_str)).collect();
+            crate::git::run_cmd(&argv, "/", std::time::Duration::from_secs(8), None, &[])
+        });
+        let json = out.flatten().filter(|s| s.len() <= g.gh_limit()).and_then(|s| serde_json::from_str(&s).ok());
+        return match json {
+            Some(json) => ok(LinkPreview::Github { json }),
+            None => Err(RpcError::not_found(format!("gh couldn't read {}", p.target))),
+        };
+    }
+    if let Some(bundle) = crate::schemes::app_bundle(&p.target) {
+        let cmd = preview_cmd::preview_command(&bundle);
+        let out = cmd.and_then(|(path, args)| preview_cmd::run_preview(&path, &args, &p.target, preview_cmd::APP_TIMEOUT));
+        return app_card(out, &p.target);
+    }
+    let path = std::path::Path::new(&p.target);
+    if !path.is_absolute() {
+        return Err(RpcError::bad_params(format!("not an absolute path, a GitHub link or an app link: {}", p.target)));
+    }
+    ok(read_path(path, p.line))
+}
+
+/// A preview command's output as the card's JSON; the app reads what it shows.
+fn app_card(out: Option<Vec<u8>>, target: &str) -> R {
+    match out.and_then(|o| serde_json::from_slice::<serde_json::Value>(&o).ok()).filter(serde_json::Value::is_object) {
+        Some(json) => ok(LinkPreview::App { json }),
+        None => Err(RpcError::not_found(format!("no preview for {target}"))),
+    }
+}
+
+/// The login shell's PATH, which preview commands run with (midnad's own from launchd is
+/// minimal), read once.
+fn user_path() -> &'static str {
+    static PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| midna_proto::preview_cmd::user_path(true));
+    &PATH
+}
+
+/// A link pattern's preview command `session.link_at` gave, with its link, this long ago or less
+/// still runs for `links.preview`.
+const ISSUED_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+const ISSUED_MAX: usize = 256;
+
+type Issued = std::collections::VecDeque<(std::time::Instant, String, Vec<String>)>;
+
+/// The preview commands `session.link_at` gave lately. `links.preview` runs only these, so a
+/// caller can't have it run a command the human's (or an app's) link patterns didn't make.
+fn issued_list() -> std::sync::MutexGuard<'static, Issued> {
+    static ISSUED: std::sync::LazyLock<std::sync::Mutex<Issued>> = std::sync::LazyLock::new(Default::default);
+    let mut l = ISSUED.lock().unwrap_or_else(|e| e.into_inner());
+    l.retain(|(at, _, _)| at.elapsed() < ISSUED_FOR);
+    l
+}
+
+/// `session.link_at` gave `argv` as `url`'s preview command.
+pub fn issued(url: &str, argv: &[String]) {
+    let mut l = issued_list();
+    l.retain(|(_, u, a)| !(u == url && a == argv));
+    if l.len() >= ISSUED_MAX {
+        l.pop_front();
+    }
+    l.push_back((std::time::Instant::now(), url.to_string(), argv.to_vec()));
+}
+
+fn was_issued(url: &str, argv: &[String]) -> bool {
+    issued_list().iter().any(|(_, u, a)| u == url && a == argv)
 }

@@ -1,11 +1,12 @@
 //! session.* handlers, plus the engine/reaper callbacks (`on_title`, `on_exit`).
 use super::{Ctx, R, ok};
-use crate::agent_state::{TitleHint, agent_title_hint, screen_waits_on_human, title_text};
+use crate::agent_state::{TitleHint, agent_title_hint, screen_shows_prompt, screen_waits_on_human, title_text};
 use crate::daemon::Daemon;
 use crate::state::hex_id;
 use crate::term::{self, EngineMsg, Launch};
 use midna_proto::*;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -14,7 +15,7 @@ fn not_found(id: &str) -> RpcError {
 }
 
 /// Session with live fields (pid, last activity) filled from the runtime.
-fn live(d: &Daemon, s: &Session) -> Session {
+pub(crate) fn live(d: &Daemon, s: &Session) -> Session {
     let mut s = s.clone();
     if let Some(rt) = d.core().rt.get(&s.id) {
         let t = rt.activity.load(Ordering::Relaxed);
@@ -243,6 +244,12 @@ pub fn open(d: &Arc<Daemon>, ctx: &Ctx, p: SessionOpenParams) -> R {
 }
 
 fn open_session(d: &Arc<Daemon>, ctx: &Ctx, p: SessionOpenParams) -> Result<Session, RpcError> {
+    open_session_with(d, ctx, p, None)
+}
+
+/// `session.open`, with `preface` shown before anything the new process prints
+/// ([`term::start_with_preface`]).
+pub fn open_session_with(d: &Arc<Daemon>, ctx: &Ctx, p: SessionOpenParams, preface: Option<Vec<u8>>) -> Result<Session, RpcError> {
     // Resolve the project: explicit, the caller's, the one containing cwd, or a new one for cwd.
     // With none of those the terminal opens at root: no project, starting in $HOME.
     let root = || Project { id: ROOT_PROJECT_ID.into(), name: "root".into(), path: home_dir(), icon: None, order: 0, commands: vec![], last_opened_at: None, auto_created: false, pinned: false };
@@ -278,10 +285,21 @@ fn open_session(d: &Arc<Daemon>, ctx: &Ctx, p: SessionOpenParams) -> Result<Sess
     }
     let sid = hex_id(8);
     let mut env = session_env(d, &sid, &project.id);
+    // Opened by a trigger's action, or by something one started: the CLI forwards these, so a
+    // stream event published from in here fires no triggers.
+    if let Some(c) = ctx.caused_by() {
+        env.push(("MIDNA_TRIGGER".into(), c.trigger));
+        if let Some(del) = c.delivery {
+            env.push(("MIDNA_DELIVERY".into(), del));
+        }
+    }
+    let mut admission = crate::admit::Admission::Start;
     let (command, agent) = match p.kind {
         SessionKind::Agent => {
             let a = p.agent.ok_or_else(|| RpcError::bad_params("kind=agent needs agent: claude|codex"))?;
             crate::panic::gate(d, ctx)?;
+            // Far above the core count: started by anyone but the human, it waits its turn.
+            admission = crate::admit::admission(d, ctx);
             let supervised = ctx.supervised && d.core().state.setting_str("triggers.agent_mode") != "inherit";
             // A supervised agent's permission prompts are forced on; its own arguments could undo
             // that. Tools the human allowed on the trigger (`--allowedTools`) are all it may take.
@@ -301,8 +319,23 @@ fn open_session(d: &Arc<Daemon>, ctx: &Ctx, p: SessionOpenParams) -> Result<Sess
     });
     let now = time::now_rfc3339();
     let (cols, rows) = (p.cols.unwrap_or(100).max(2), p.rows.unwrap_or(30).max(2));
-    let launch = Launch { sid: sid.clone(), argv: argv.unwrap_or_else(|| exec_argv(&command)), cwd: cwd.clone(), env, cols, rows };
-    let rt = term::start(d, launch).map_err(|e| RpcError::bad_params(format!("could not start {}: {e}", command[0])))?;
+    let mut argv = argv.unwrap_or_else(|| exec_argv(&command));
+    let mut preface = preface;
+    match &admission {
+        crate::admit::Admission::Hold(l) => argv = crate::admit::wrap(d, &sid, l, argv),
+        crate::admit::Admission::Warn(text) => {
+            let mut warned = text.clone().into_bytes();
+            warned.extend(preface.take().unwrap_or_default());
+            preface = Some(warned);
+        }
+        crate::admit::Admission::Start => {}
+    }
+    let launch = Launch { sid: sid.clone(), argv, cwd: cwd.clone(), env, cols, rows };
+    let started = match preface {
+        Some(text) => term::start_with_preface(d, launch, text),
+        None => term::start(d, launch),
+    };
+    let rt = started.map_err(|e| RpcError::bad_params(format!("could not start {}: {e}", command[0])))?;
     let session = Session {
         id: sid.clone(),
         project_id: project.id.clone(),
@@ -339,7 +372,7 @@ fn open_session(d: &Arc<Daemon>, ctx: &Ctx, p: SessionOpenParams) -> Result<Sess
     };
     {
         let mut core = d.core();
-        core.rt.insert(sid.clone(), rt);
+        core.insert_rt(sid.clone(), rt);
         core.state.sessions.push(session.clone());
         if let Some(pr) = core.state.projects.iter_mut().find(|x| x.id == project.id) {
             pr.last_opened_at = Some(session.created_at.clone());
@@ -353,6 +386,10 @@ fn open_session(d: &Arc<Daemon>, ctx: &Ctx, p: SessionOpenParams) -> Result<Sess
     crate::git::refresh_session_async(d, &sid);
     // Outside git, nothing refreshes: name it from its folder now (`terminal.auto_name` = context).
     crate::auto_name::on_context(d, &sid);
+    if let crate::admit::Admission::Hold(l) = &admission {
+        crate::admit::hold(d, &sid, l);
+        return Ok(d.core().state.session(&sid).cloned().unwrap_or(session));
+    }
     Ok(session)
 }
 
@@ -587,7 +624,7 @@ fn refuse_prompt_answer(d: &Daemon, ctx: &Ctx, sid: &str, rt: &term::RtHandle) -
     if pending.is_some() || on_screen {
         let what = pending.map(|n| format!(" (needs-you {n})")).unwrap_or_default();
         return Err(RpcError::human_only(format!(
-            "session {sid} is showing a permission prompt{what}; only the human may answer it. Use needs_you.raise if you are blocked on it."
+            "session {sid} is showing a permission prompt or question{what}; only the human may answer it. Use needs_you.raise if you are blocked on it."
         )));
     }
     Ok(())
@@ -657,6 +694,33 @@ pub fn input(d: &Daemon, ctx: &Ctx, mut p: SessionInputParams) -> R {
         d.emit(kinds::SESSION_INPUT_BY_AGENT, ctx.actor(), project, Some(p.id.clone()), json!({ "text": preview, "enter": p.enter, "bytes": bytes.len(), "images": images }));
     }
     ok(OkResult { ok: true })
+}
+
+/// An image the person driving this Mac from another one pasted or dropped there, as it's sent:
+/// saved in this Mac's images folder, then its path pasted as `session.input` would. Only a drive
+/// link's person may: the app there sends it with their message, and nothing on this Mac (agents,
+/// scripts, the CLI, the app here) has an image it would need to send this way.
+pub fn send_image(d: &Daemon, ctx: &Ctx, p: SessionSendImageParams) -> R {
+    if ctx.as_actor.as_ref().and_then(|a| a.drive_peer()).is_none() {
+        return Err(send_image_refusal());
+    }
+    d.rt(&p.id).ok_or_else(|| not_found(&p.id))?;
+    // base64 is 4 bytes per 3: refuse a long one before decoding it.
+    if p.data.len() > SEND_IMAGE_MAX_BYTES / 3 * 4 + 4 {
+        return Err(RpcError::bad_params(format!("image is too large (limit {} MB)", SEND_IMAGE_MAX_BYTES >> 20)));
+    }
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(p.data.trim()).map_err(|e| RpcError::bad_params(format!("data isn't base64: {e}")))?;
+    let path = crate::images::store(&d.cfg.home.join("images"), &p.name, &bytes, SEND_IMAGE_MAX_BYTES).map_err(RpcError::bad_params)?;
+    let path = path.display().to_string();
+    input(d, ctx, SessionInputParams { id: p.id, text: String::new(), enter: false, images: vec![path.clone()] })?;
+    ok(SessionSendImageResult { path })
+}
+
+pub fn send_image_refusal() -> RpcError {
+    RpcError::human_only(
+        "session.send_image takes an image from the Mac driving this one, sent by its person there; here, attach one with session.input's images",
+    )
 }
 
 /// The `[Image #N]` numbers on the terminal's screen.
@@ -834,7 +898,8 @@ pub fn link_at(d: &Daemon, p: SessionLinkAtParams) -> R {
         let project = session.and_then(|s| core.state.projects.iter().find(|p| p.id == s.project_id));
         let names: Vec<&str> = project.map(|p| vec![p.name.as_str(), p.id.as_str(), p.path.as_str()]).unwrap_or_default();
         let agent = session.is_some_and(|s| s.kind == SessionKind::Agent);
-        let patterns: Vec<_> = link_patterns(&core.state.setting("terminal.link_patterns"), &core.state.app_link_patterns).iter().filter(|r| r.applies(agent, &names)).cloned().collect();
+        let approved = super::links::approved_previews(&core.state);
+        let patterns: Vec<_> = link_patterns(&core.state.setting("terminal.link_patterns"), &core.state.app_link_patterns, &approved).iter().filter(|r| r.applies(agent, &names)).cloned().collect();
         // Terminals a word can name: by id, and agents by their conversation id.
         let mut tabs = Vec::new();
         for s in &core.state.sessions {
@@ -854,24 +919,33 @@ pub fn link_at(d: &Daemon, p: SessionLinkAtParams) -> R {
         Some(Link::App { url, app }) => LinkAtResult { kind: "url".into(), target: Some(url), app: Some(app), ..Default::default() },
         Some(Link::File { path, line, column }) => LinkAtResult { kind: "file".into(), target: Some(path), line, column, ..Default::default() },
         Some(Link::Session(id)) => LinkAtResult { kind: "session".into(), target: Some(id), ..Default::default() },
-        Some(Link::Preview { url, app, preview }) => LinkAtResult { kind: "url".into(), target: Some(url), app, preview: Some(preview), ..Default::default() },
+        Some(Link::Preview { url, app, preview }) => {
+            super::links::issued(&url, &preview);
+            LinkAtResult { kind: "url".into(), target: Some(url), app, preview: Some(preview), ..Default::default() }
+        }
         None => LinkAtResult { kind: "none".into(), ..Default::default() },
     })
 }
 
-/// `terminal.link_patterns` then the apps' registered patterns, compiled once per change.
-fn link_patterns(v: &serde_json::Value, apps: &std::collections::BTreeMap<String, Vec<String>>) -> Arc<Vec<midna_proto::link_patterns::LinkPattern>> {
+/// `terminal.link_patterns` then the apps' registered patterns, compiled once per change. An
+/// app's preview commands stay only while `approved` (owner → fingerprint) holds them as they are.
+fn link_patterns(v: &serde_json::Value, apps: &BTreeMap<String, Vec<String>>, approved: &BTreeMap<String, String>) -> Arc<Vec<midna_proto::link_patterns::LinkPattern>> {
+    use midna_proto::link_patterns::{LinkPattern, parse_all};
     use std::sync::{LazyLock, Mutex};
-    type Cache = Option<(serde_json::Value, std::collections::BTreeMap<String, Vec<String>>, Arc<Vec<midna_proto::link_patterns::LinkPattern>>)>;
+    type Cache = Option<(serde_json::Value, BTreeMap<String, Vec<String>>, BTreeMap<String, String>, Arc<Vec<LinkPattern>>)>;
     static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Default::default);
     let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, _, pats)) = c.as_ref().filter(|(k, a, _)| k == v && a == apps) {
+    if let Some((_, _, _, pats)) = c.as_ref().filter(|(k, a, ok, _)| k == v && a == apps && ok == approved) {
         return pats.clone();
     }
-    let mut rules: Vec<String> = v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
-    rules.extend(apps.values().flatten().cloned());
-    let pats = Arc::new(midna_proto::link_patterns::parse_all(&rules));
-    *c = Some((v.clone(), apps.clone(), pats.clone()));
+    let rules: Vec<String> = v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    let mut pats = parse_all(&rules);
+    for (owner, rules) in apps {
+        let previews = super::links::preview_fingerprint(owner, rules).is_none_or(|fp| approved.get(owner) == Some(&fp));
+        pats.extend(parse_all(rules).into_iter().map(|p| if previews { p } else { LinkPattern { preview: vec![], ..p } }));
+    }
+    let pats = Arc::new(pats);
+    *c = Some((v.clone(), apps.clone(), approved.clone(), pats.clone()));
     pats
 }
 
@@ -1063,7 +1137,7 @@ pub fn restart_now(d: &Arc<Daemon>, sid: &str, resume: bool, reason: &str, actor
     {
         let mut core = d.core();
         let pid = new_rt.pid;
-        core.rt.insert(s.id.clone(), new_rt);
+        core.insert_rt(s.id.clone(), new_rt);
         if let Some(sess) = core.state.session_mut(&s.id) {
             sess.pid = Some(pid);
         }
@@ -1087,6 +1161,9 @@ pub(crate) fn after_restart(d: &Daemon, s: &Session, info: &AgentInfo, resume: b
                 i.restart = None;
                 i.update_available = None;
                 i.update_declined = None;
+                // The old process's version: the new one reports its own on its first status
+                // line. Kept, an update check before then would restart it again.
+                i.version = None;
             }
         }
         if s.agent.is_some() {
@@ -1188,6 +1265,7 @@ pub fn on_exit(d: &Arc<Daemon>, sid: &str, generation: u64, code: Option<i32>, s
     };
     d.emit(kinds::SESSION_EXITED, Actor::system(), Some(project), Some(sid.to_string()), json!({ "exit_code": code, "signal": signal, "state": state, "reason": reason }));
     crate::rpc::agent::end_turn_if_open(d, sid, "process exited");
+    crate::nearby::agent_start::ended(d, sid);
     d.set_status(sid, state, Some(reason.clone()), code, Actor::system());
     d.clear_session_needs_you(sid, NeedsYouKind::PermissionPrompt);
     if close_on_exit && state == StatusState::Exited {
@@ -1261,7 +1339,7 @@ fn swap_to_shell(d: &Arc<Daemon>, sid: &str, generation: u64, reason: &str) -> R
         sess.title.clear();
     }
     core.agents.remove(sid);
-    core.rt.insert(sid.to_string(), rt);
+    core.insert_rt(sid.to_string(), rt);
     drop(core);
     d.mark_dirty();
     let agent = s.agent.map_or("agent", |a| a.as_str());
@@ -1313,7 +1391,7 @@ pub fn on_title(d: &Arc<Daemon>, sid: &str, generation: u64, title: &str, screen
             }
         }
         (TitleHint::Working, StatusState::Idle | StatusState::Done) if agent == AgentKind::Codex => {
-            let actor = Actor { kind: ActorKind::Agent, session: Some(sid.to_string()), name: Some(agent.as_str().into()), trigger: None, via: None };
+            let actor = Actor { kind: ActorKind::Agent, session: Some(sid.to_string()), name: Some(agent.as_str().into()), trigger: None, via: None, peer: None };
             crate::rpc::agent::start_turn(d, sid, &project, &actor);
             d.set_status(sid, StatusState::Working, Some("working (title)".into()), None, Actor::system());
         }
@@ -1364,6 +1442,11 @@ fn settle_loop(d: &Arc<Daemon>, sid: &str, generation: u64) {
         }
         let Some((screen, _, _)) = rt.read(true) else { return };
         if screen_waits_on_human(&screen) {
+            // Codex's approval title ("Action Required") is a stopped one; its prompt comes
+            // with no hook, so this is the only place it can be raised.
+            if state == StatusState::Working && agent == AgentKind::Codex && screen_shows_prompt(&screen) {
+                crate::rpc::agent::raise_codex_prompt(d, sid, &screen);
+            }
             continue;
         }
         if state == StatusState::Working {

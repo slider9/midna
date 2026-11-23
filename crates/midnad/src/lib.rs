@@ -1,5 +1,6 @@
 //! midnad library: the daemon's modules, kept in a lib so they're testable.
 //! See docs/ARCHITECTURE.md. Entry point: [`server::start`].
+pub mod admit;
 pub mod adopt;
 pub mod agent_args;
 pub mod agent_state;
@@ -14,6 +15,7 @@ pub mod daemon;
 pub mod ended;
 pub mod engine;
 pub mod eventlog;
+pub mod fd_limit;
 pub mod git;
 pub mod global_hooks;
 pub mod guard;
@@ -23,6 +25,12 @@ pub mod images;
 pub mod insights;
 pub mod install;
 pub mod keep_awake;
+#[cfg(unix)]
+pub mod nearby;
+/// Nearby isn't on Windows yet: the same calls, refusing.
+#[cfg(windows)]
+#[path = "nearby_windows.rs"]
+pub mod nearby;
 pub mod links;
 pub mod local;
 pub mod queue;
@@ -32,9 +40,12 @@ pub mod panic;
 pub mod peer;
 pub mod policy;
 pub mod procs;
+pub mod producers;
 pub mod prompts;
 pub mod pty;
 pub mod question;
+#[cfg(unix)]
+pub mod reaper;
 pub mod restart;
 pub mod resume;
 pub mod rpc;
@@ -43,6 +54,7 @@ pub mod server;
 pub mod state;
 pub mod sys;
 pub mod stream;
+pub mod streams;
 pub mod subagent_log;
 pub mod summary;
 pub mod term;

@@ -13,6 +13,7 @@ pub fn render(m: &MainWindow, t: &Theme, _window: &mut Window, cx: &mut Context<
         return div().h(px(44.)).flex_none().border_b_1().border_color(t.line).into_any_element();
     };
     let segs = m.header_segments.get(&s.id).cloned().unwrap_or_default();
+    let down = m.remote_down();
     div()
         .flex()
         .flex_none()
@@ -24,6 +25,8 @@ pub fn render(m: &MainWindow, t: &Theme, _window: &mut Window, cx: &mut Context<
         .border_b_1()
         .border_color(t.line)
         .child(match crate::app::background_note(s).filter(|_| m.effective_state(s) == crate::model::StatusState::Done) {
+            // Another Mac's link down: its state is as of then, so the dot is grey.
+            _ if down.is_some() => div().size(px(9.)).flex_none().rounded_full().bg(t.dim).into_any_element(),
             Some(note) => div().id("header-dot").child(terminal_dot(m, t, s, 9.)).tooltip(tip(format!("Turn done · {note}"))).into_any_element(),
             None => terminal_dot(m, t, s, 9.).into_any_element(),
         })
@@ -48,6 +51,10 @@ pub fn render(m: &MainWindow, t: &Theme, _window: &mut Window, cx: &mut Context<
         })
         .child(terminal_icon(m, t, s, 14., t.dim))
         .when_some(status_label(m, s), |d, mut c| {
+            if down.is_some() {
+                // As of when the link dropped, like the sidebar's rows.
+                c.color = "gray".into();
+            }
             if s.paused.is_some() {
                 // "Paused 3m"; Resume is on the card over the terminal.
                 let since = c.since.as_deref().map(crate::model::since_short).filter(|x| x != "now");
@@ -72,7 +79,14 @@ pub fn render(m: &MainWindow, t: &Theme, _window: &mut Window, cx: &mut Context<
                     .child(Icon::BellOff.el(13., t.dim)),
             )
         })
-        .when(!segs.is_empty(), |d| d.child(div().w(px(1.)).h(px(18.)).flex_none().bg(t.line)).child(div().min_w_0().overflow_hidden().child(segments(&segs, t, 12., cx))))
+        .when(!segs.is_empty(), |d| {
+            d.child(div().w(px(1.)).h(px(18.)).flex_none().bg(t.line))
+                .child(div().min_w_0().overflow_hidden().child(segments(&segs, t, 12., cx)))
+                .children(crate::ui::statusbar::on_mac(m, t).map(|d| d.text_size(px(12.))))
+        })
+        .when(down.is_some(), |d| {
+            d.child(div().flex_none().text_size(px(12.)).text_color(t.dim).whitespace_nowrap().child(format!("as of {}", crate::ui::link_down::when(m))))
+        })
         .child(
             // empty header space drags the window like a titlebar
             div().id("header-drag").flex_1().h(px(44.)).on_mouse_down(MouseButton::Left, |ev: &MouseDownEvent, window, _| {
@@ -120,10 +134,16 @@ pub fn custom_buttons(m: &MainWindow) -> Vec<String> {
     buttons(m).into_iter().filter(|b| midna_proto::paths::is_absolute(b)).collect()
 }
 
-/// Built-in buttons left out of `ui.header.buttons`: their actions live in the More menu.
+/// Built-in buttons left out of `ui.header.buttons`: their actions live in the More menu. In
+/// another Mac's window the IDE button is too, so the More menu can say why it's off.
 pub fn hidden(m: &MainWindow) -> Vec<String> {
     let shown = buttons(m);
-    midna_proto::settings::HEADER_BUTTONS.iter().filter(|b| !shown.iter().any(|s| s == *b)).map(|s| s.to_string()).collect()
+    let remote = m.remote();
+    midna_proto::settings::HEADER_BUTTONS
+        .iter()
+        .filter(|b| !shown.iter().any(|s| s == *b) || (remote && **b == "ide"))
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Add image shows only while the selected terminal, or the split beside it, runs an agent.
@@ -170,7 +190,11 @@ fn toolbar(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> impl Into
                 cx.notify();
             }),
         )
-        .children(buttons(m).into_iter().filter_map(|b| toolbar_button(m, b, t, cx)))
+        .children(buttons(m).into_iter().filter_map(|b| match m.remote_down() {
+            // Another Mac's link down: its tools wait, greyed, until it's back; More still opens.
+            Some(_) => disabled_button(&b, t),
+            None => toolbar_button(m, b, t, cx),
+        }))
         .child(
             div()
                 .relative()
@@ -182,6 +206,17 @@ fn toolbar(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> impl Into
                 .children(popover_on_more),
         )
         .when(m.menu == Menu::HeaderButtons, |d| d.child(buttons_menu(m, t, cx)))
+}
+
+/// Split, Pop out and Restart, greyed and doing nothing, while another Mac's link is down.
+fn disabled_button(b: &str, t: &Theme) -> Option<AnyElement> {
+    let icon = match b {
+        "split" => Icon::Split,
+        "popout" => Icon::PopOut,
+        "restart" => Icon::Restart,
+        _ => return None,
+    };
+    Some(div().size(px(32.)).flex().items_center().justify_center().opacity(0.4).child(icon.el(16., t.dim)).into_any_element())
 }
 
 /// One `ui.header.buttons` entry: a built-in button, or a custom one (a script path).
@@ -301,6 +336,14 @@ fn more_menu(m: &MainWindow, hidden: &[String], t: &Theme, cx: &mut Context<Main
                 let n = m.selected.as_ref().and_then(|s| m.links.by_session.get(s)).map_or(0, Vec::len);
                 menu_item(t, &id, "Session links", &n.to_string(), cx.listener(|m, _, w, cx| crate::ui::links::toggle(m, w, cx))).children(keys("keys.links"))
             }
+            "ide" if m.remote() => {
+                let why = crate::ide::off_here(m).unwrap_or_default();
+                // Another Mac's window: the editor would open on that Mac's screen, so its path
+                // is copied instead (screen 5, state C of the remote Mac windows design).
+                moved = moved.child(off_item(t, "more-ide-open", &format!("Open in {}", crate::ide::name(m)), &why));
+                let mac = m.backend.mac().map(|x| x.name.clone()).unwrap_or_default();
+                menu_item(t, "more-copy-path", &format!("Copy path on {mac}"), "", cx.listener(|m, _, _, cx| crate::ide::copy_path(m, cx)))
+            }
             "ide" => {
                 let name = crate::ide::current(m).map(|(i, _)| i.name).unwrap_or_else(|| "IDE".into());
                 moved = moved.child(
@@ -374,6 +417,22 @@ fn more_menu(m: &MainWindow, hidden: &[String], t: &Theme, cx: &mut Context<Main
     .with_priority(1)
 }
 
+/// A More menu row that can't be used here, greyed, with why on its right.
+fn off_item(t: &Theme, id: &str, label: &str, why: &str) -> Stateful<Div> {
+    div()
+        .id(SharedString::from(id.to_string()))
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .w_full()
+        .px(px(10.))
+        .py(px(8.))
+        .text_color(t.dim)
+        .opacity(0.7)
+        .child(div().flex_1().child(label.to_string()))
+        .child(div().text_size(px(11.5)).child(why.to_string()))
+}
+
 /// Tooltip view: the text, and the shortcut keys when the thing has one.
 pub struct Tip {
     pub text: SharedString,
@@ -420,8 +479,8 @@ pub fn tip_setting(text: impl Into<SharedString>, values: Vec<SharedString>, key
 }
 
 impl Render for Tip {
-    fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = cx.global::<Theme>();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = crate::theme::of(window, cx);
         // long text wraps in a card; a short tip, or one with keys, stays one line
         if self.keys.is_empty() && (!self.footer.is_empty() || self.text.chars().count() > super::tooltip::LONG) {
             return super::tooltip::card(t, &self.text, &self.values, &self.footer);

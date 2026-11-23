@@ -205,6 +205,9 @@ fn ready_is_busy(why: &str) -> bool {
 /// will as things are (the terminal closed or its process ended). An input box holding exactly
 /// `restored` (a refused prompt Claude put back) counts as empty.
 pub fn readiness(d: &Daemon, sid: &str, check_input_box: bool, restored: Option<&str>) -> Result<Option<String>, String> {
+    if crate::admit::is_waiting(d, sid) {
+        return Ok(Some("the Mac to calm down".into()));
+    }
     let (rt, agent, title, state, labelled, in_turn, alive) = {
         let core = d.core();
         let s = core.state.session(sid).ok_or("the terminal closed")?;
@@ -464,6 +467,8 @@ fn finish(d: &Daemon, sid: &str, m: &QueuedMessage, res: Result<(), String>) {
             }
             edit(d, sid, |q| q.retain(|x| x.id != m.id));
             changed(d, sid, m.by.clone(), "sent", json!({ "id": m.id, "text": clip(&m.text, 200), "trigger_id": m.trigger_id }));
+            // A paired Mac's agent ask: the turn this starts answers it.
+            crate::nearby::agent_ask::sent(d, sid, &m.id);
         }
         Err(why) => {
             edit(d, sid, |q| {
@@ -610,18 +615,20 @@ pub fn update(d: &Daemon, sid: &str, p: QueueUpdateParams, by: Actor) -> Result<
 pub fn remove(d: &Daemon, sid: &str, id: &str, by: Actor) -> Result<(), RpcError> {
     let m = with_item(d, sid, id, |q, i| q.remove(i))?;
     changed(d, sid, by, "removed", json!({ "id": m.id, "text": clip(&m.text, 200) }));
+    crate::nearby::agent_ask::unqueued(d, sid, std::slice::from_ref(&m.id));
     Ok(())
 }
 
 pub fn clear(d: &Daemon, sid: &str, by: Actor) -> Result<QueueListResult, RpcError> {
-    let n = edit(d, sid, |q| {
-        let before = q.len();
+    let gone = edit(d, sid, |q| {
+        let gone: Vec<String> = q.iter().filter(|x| x.state != QueueState::Sending).map(|x| x.id.clone()).collect();
         q.retain(|x| x.state == QueueState::Sending);
-        before - q.len()
+        gone
     })
     .ok_or_else(|| RpcError::not_found(format!("no terminal {sid}")))?;
-    if n > 0 {
-        changed(d, sid, by, "cleared", json!({ "removed": n }));
+    if !gone.is_empty() {
+        changed(d, sid, by, "cleared", json!({ "removed": gone.len() }));
+        crate::nearby::agent_ask::unqueued(d, sid, &gone);
     }
     list(d, sid)
 }

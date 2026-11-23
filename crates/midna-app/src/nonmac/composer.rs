@@ -87,3 +87,12 @@ mod tests {
         assert_eq!(encode("a\r\nb", false), "a\rb");
     }
 }
+
+/// What the secret sheet tells macOS's composer field. Off macOS there's no field to tell.
+#[allow(dead_code)]
+pub enum ComposerEvent {
+    Insert(String),
+    Refocus,
+}
+
+pub fn emit(_e: ComposerEvent) {}

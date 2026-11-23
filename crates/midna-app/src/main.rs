@@ -5,8 +5,21 @@
 //! - `MIDNA_HOME` / `MIDNA_SOCKET` — where to find midnad.
 //! - `MIDNA_FAKE_SETTINGS="theme=light,density=compact"` — fake backend initial settings.
 //! - `MIDNA_SELECT=<session id>` — initial selection; `MIDNA_W` / `MIDNA_H` — window size.
-//! - `MIDNA_DEBUG_APPROVE_MENU=1`, `MIDNA_DEBUG_SCREEN=rules|triggers|insights|commands|system-upgrade|system-overload[-midna]` — screenshot states.
-//! - `MIDNA_NO_ACTIVATE=1` — don't take focus on launch (automated screenshots).
+//! - `MIDNA_DEBUG_APPROVE_MENU=1`, `MIDNA_DEBUG_SCREEN=rules|triggers|insights|commands|more-menu|share|nearby:<share id>|system-upgrade|system-overload[-midna]|commands:<query>` — screenshot states.
+//! - `MIDNA_DEBUG_REMOTE=1|<name>` — also open another of my Macs' window (the fake's second Mac).
+//! - `MIDNA_FAKE_LINK=finding|proving|loading` — hold that window on a connecting step;
+//!   `reconnecting|offline` — its link drops 3 s in (`offline`: the pill's Mac tab goes asleep).
+//! - `MIDNA_FAKE_NEEDS=<n>` / `MIDNA_FAKE_MAC_NEEDS=<n>` — keep that many needs-you items on this
+//!   Mac / the Mac mini (the other Macs get none); `MIDNA_FAKE_MAC_ARRIVE=<s>` — one comes in on
+//!   the Mac mini after that.
+//! - `MIDNA_NO_ACTIVATE=1` — don't take focus on launch.
+//! - `SLATE=1` (set by `slate shoot` / `slate drive`, see `scripts/slate.sh`) — run hidden below
+//!   the desktop, never focused, and shoot or drive the main window (`hidden.rs`).
+//! - `MIDNA_DEBUG_BADGE_DOCK=1` — the needs-you pill docks in the window though midna isn't in front.
+//! - `MIDNA_DEBUG_BADGE=list|card|menu|mac|switch:<ms>|tip` — once something's waiting, open this
+//!   Mac's list (with its first card) or the menu; the first other Mac's list (`mac`); or this
+//!   Mac's, then switch to the other Mac's and hold the slide `<ms>` in (`switch`); or rest on the
+//!   pill with its tooltip up (`tip`).
 //! - `MIDNA_DEV=1` — dev mode even inside a bundle: no install / login item / updates; a missing
 //!   midnad is spawned from next to this binary (`MIDNA_NO_SPAWN=1` to skip). See `lifecycle.rs`.
 //!
@@ -26,6 +39,7 @@ mod finder;
 mod frame;
 #[cfg_attr(not(target_os = "macos"), path = "nonmac/haptics.rs")]
 mod haptics;
+mod hidden;
 mod icons;
 mod ide;
 #[cfg(windows)]
@@ -36,6 +50,10 @@ mod install;
 mod kass;
 mod lifecycle;
 mod list_edit;
+#[cfg_attr(not(target_os = "macos"), path = "nonmac/local_auth.rs")]
+mod local_auth;
+mod mac_feed;
+mod macs;
 mod model;
 mod notify;
 mod opener;
@@ -70,7 +88,7 @@ fn main() {
     // Folders from Finder's "Open in Midna" (finder.rs) or dropped on the Dock icon; they can
     // arrive before the windows exist, so they wait in a channel.
     let (otx, orx) = async_channel::unbounded::<Vec<String>>();
-    let app = gpui_kit::application().with_assets(icons::Assets);
+    let app = hidden::application(gpui_kit::application()).with_assets(icons::Assets);
     app.on_open_urls(move |urls| drop(otx.try_send(urls)));
     app.run(move |cx| {
         let (ui_font, mono_font) = theme::load_fonts(cx);
@@ -125,24 +143,23 @@ fn main() {
         cx.on_action(move |_: &NewWindow, cx| {
             let _ = windows::open(b.clone(), None, cx);
         });
-        cx.set_menus(vec![Menu {
-            name: "midna".into(),
-            items: vec![
-                MenuItem::action("New Window", NewWindow),
-                MenuItem::action("Settings…", OpenSettings),
-                MenuItem::separator(),
-                MenuItem::action("Hide midna", Hide),
-                MenuItem::action("Hide Others", HideOthers),
-                MenuItem::action("Show All", ShowAll),
-                MenuItem::separator(),
-                MenuItem::action("Close", CloseWindow),
-                MenuItem::action("Quit midna", Quit),
-            ],
-            disabled: false,
-        }]);
-        // The windows, places and terminals from last time (or one centered window).
+        // ⌃⌘1…9, the Window menu and the Mac switcher: that Mac's window (opened over a drive
+        // link the first time).
+        let b = backend.clone();
+        cx.on_action(move |a: &SwitchMac, cx| macs::switch(&b, a.0, cx));
+        let b = backend.clone();
+        cx.on_action(move |_: &PairMac, cx| settings_window::open_nearby(b.clone(), cx));
+        // The Window menu's Macs come from peers.list and drive.list (and follow pairing and
+        // the links, see `MainWindow`).
+        macs::set_menus(cx);
+        macs::refresh(backend.clone(), cx);
+        // This Mac's picks for its other Macs' windows (Settings → Nearby).
+        theme::refresh_picks(backend.clone(), cx);
+        // The windows, places and terminals from last time (or one centered window). A hidden
+        // run opens just the one window Slate shoots.
         let fallback = Bounds::centered(None, size(px(w), px(h)), cx);
-        let handle = windows::restore(backend.clone(), fallback, cx).expect("open main window");
+        let handle = if hidden::enabled() { windows::open(backend.clone(), Some(fallback), cx) } else { windows::restore(backend.clone(), fallback, cx) };
+        let handle = handle.expect("open main window");
         // A clicked notification shows its terminal, in whichever window has it (notify.rs).
         let (ntx, nrx) = async_channel::unbounded::<notify::Clicked>();
         notify::start(ntx);
@@ -167,11 +184,18 @@ fn main() {
         #[cfg(feature = "snapshot")]
         snapshot(handle, cx);
         let _ = handle;
+        // Screenshots: the fake's other Mac in its own window, in front.
+        if let Ok(name) = crate::dev::var("MIDNA_DEBUG_REMOTE") {
+            let name = if name == "1" { "Morgan's Mac mini".to_string() } else { name };
+            windows::open_mac(&backend, Some(backend::Mac { peer: "f".repeat(64), name }), cx);
+        }
         if crate::dev::var("MIDNA_DEBUG_SETTINGS").is_ok() {
             settings_window::open(backend.clone(), cx);
         }
-        // The floating badge (hidden until there's something to show).
-        ui::badge::init(backend.clone(), cx);
+        // The floating badge (hidden until there's something to show), never in a hidden run.
+        if !hidden::enabled() {
+            ui::badge::init(backend.clone(), cx);
+        }
         let b = backend.clone();
         cx.on_window_closed(move |cx, _| {
             // The badge alone doesn't keep midna running.
@@ -181,14 +205,13 @@ fn main() {
             }
         })
         .detach();
-        if std::env::var("MIDNA_NO_ACTIVATE").is_err() {
-            cx.activate(true);
-        }
+        hidden::activate(cx);
     });
 }
 
 /// Dev: render the main window offscreen to `MIDNA_SNAPSHOT` after `MIDNA_SNAPSHOT_DELAY_MS`
-/// (`MIDNA_SNAPSHOT_WINDOW=last`: the window opened last instead, e.g. a pop-out).
+/// (`MIDNA_SNAPSHOT_WINDOW=last`: the window opened last instead, e.g. a pop-out; `badge`: the
+/// needs-you pill's window).
 #[cfg(feature = "snapshot")]
 fn snapshot(handle: WindowHandle<app::MainWindow>, cx: &mut App) {
     let Ok(path) = std::env::var("MIDNA_SNAPSHOT") else {
@@ -196,10 +219,14 @@ fn snapshot(handle: WindowHandle<app::MainWindow>, cx: &mut App) {
     };
     let delay: u64 = std::env::var("MIDNA_SNAPSHOT_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(2500);
     let main: AnyWindowHandle = handle.into();
-    let last = std::env::var("MIDNA_SNAPSHOT_WINDOW").is_ok_and(|v| v == "last");
+    let which = std::env::var("MIDNA_SNAPSHOT_WINDOW").unwrap_or_default();
     cx.spawn(async move |cx| {
         cx.background_executor().timer(std::time::Duration::from_millis(delay)).await;
-        let any = if last { cx.update(|cx| cx.windows().last().copied()).unwrap_or(main) } else { main };
+        let any = match which.as_str() {
+            "last" => cx.update(|cx| cx.windows().into_iter().rfind(|w| !ui::badge::is_badge(*w, cx))).unwrap_or(main),
+            "badge" => cx.update(|cx| cx.windows().into_iter().find(|w| ui::badge::is_badge(*w, cx))).unwrap_or(main),
+            _ => main,
+        };
         // two passes so layout-dependent state (terminal size, frames) settles
         for _ in 0..2 {
             let _ = cx.update_window(any, |_, window, cx| {

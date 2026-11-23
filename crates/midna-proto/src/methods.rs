@@ -18,6 +18,15 @@ pub struct Caller {
     /// answers. Poll it with needs_you.get.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_wait: bool,
+    /// The call comes from something a trigger's action started (`MIDNA_TRIGGER`): a stream
+    /// event it publishes is recorded but fires no triggers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caused_by: Option<crate::streams::TriggerCause>,
+    /// The token midnad gave the stream producer this call comes from (`MIDNA_STREAM_TOKEN`,
+    /// new at each start): a declared stream (`streams.add`) only takes publishes that carry
+    /// its producer's current token, or the human's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -191,6 +200,55 @@ pub struct ServedBy {
     pub port: u16,
 }
 
+/// `links.preview`: what a link's hover card shows, read on this Mac: a file's lines, a
+/// folder's entries, what `gh` says about a GitHub pull request, issue or workflow run, or what
+/// an app's or a link pattern's preview command prints. The app asks the Mac a window drives, so
+/// a card in another Mac's window is read on that Mac.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct LinksPreviewParams {
+    /// An absolute path, a `https://github.com/<owner>/<repo>/{pull,issues,actions/runs}/<n>`
+    /// link, or an app link (`taskboard://…`) whose app on this Mac declares a preview.
+    pub target: String,
+    /// For a file: the line to center on (1-based).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    /// A link pattern's preview command for `target`, as `session.link_at` on this Mac gave it.
+    /// Only a command it gave for that link lately runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<Vec<String>>,
+}
+
+/// What [`LinksPreviewParams`] found.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LinkPreview {
+    /// A text file's numbered lines around `line` (the top without one), and that line when
+    /// it's among them.
+    Lines { lines: Vec<(u32, String)>, #[serde(default, skip_serializing_if = "Option::is_none")] focus: Option<u32> },
+    /// A folder's first entries (folders first, then by name) and how many it has.
+    Dir { entries: Vec<DirEntry>, total: usize },
+    /// An image file and its size.
+    Image { size: u64 },
+    /// A binary file and its size.
+    Binary { size: u64 },
+    /// Nothing to show: an empty file, or why it couldn't be read.
+    Note { text: String },
+    /// `gh pr|issue|run view --json …` for a GitHub link, as `gh` printed it.
+    Github { json: Value },
+    /// What an app's or a link pattern's preview command printed (`{"title", "lines", …}`).
+    App { json: Value },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DirEntry {
+    pub name: String,
+    #[serde(default)]
+    pub dir: bool,
+    /// A file's size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
 /// `links.patterns.register`: an app's own `terminal.link_patterns` rules, replacing what it
 /// registered before.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -207,6 +265,26 @@ pub struct LinkPatternsRegisterParams {
 pub struct AppLinkPatterns {
     pub owner: String,
     pub patterns: Vec<String>,
+    /// The human approved its rules' preview commands (true when they have none). Until then
+    /// the rules still make links, but hovering one shows the plain URL and runs nothing.
+    #[serde(default = "approved_default")]
+    pub approved: bool,
+    /// The needs-you asking the human to approve them, while open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<Id>,
+}
+
+/// A daemon from before preview approvals ran every app's preview commands.
+fn approved_default() -> bool {
+    true
+}
+
+/// `links.patterns.approve` (human only): approve an owner's preview commands as they are now.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct LinkPatternsApproveParams {
+    pub owner: String,
+    /// The fingerprint of the commands being approved; refused once they changed.
+    pub fingerprint: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -805,6 +883,9 @@ pub struct DaemonInfo {
     /// runs the installed `bin/current` build).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
+    /// How the streams midnad runs are doing (`midna stream list` has the details).
+    #[serde(default)]
+    pub streams: crate::streams::StreamsHealth,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -1004,6 +1085,26 @@ pub struct SessionInputParams {
     /// Codex turn into an image attachment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+}
+
+/// The most `session.send_image` takes: the image's own bytes, before base64.
+pub const SEND_IMAGE_MAX_BYTES: usize = 10 << 20;
+
+/// `session.send_image`: an image the person driving this Mac from another one confirmed there.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SessionSendImageParams {
+    pub id: Id,
+    /// The image's file name on the Mac it came from. Only names the saved copy.
+    #[serde(default)]
+    pub name: String,
+    /// The image, base64: PNG, JPEG, GIF or WebP, at most 10 MB before encoding.
+    pub data: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SessionSendImageResult {
+    /// Where it was saved on this Mac: the path typed into the terminal.
+    pub path: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -1595,7 +1696,30 @@ pub struct TriggerDeliveriesParams {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct TriggerReplayParams {
-    pub delivery_id: Id,
+    /// The delivery to run again (`trigger.deliveries`). Or name a stream event with `stream`
+    /// and `event` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_id: Option<Id>,
+    /// A stream whose recorded event to run through the local triggers again (`slack`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
+    /// With `stream`: the event, as its seq or the publisher's id (`streams.events` lists both
+    /// for the stream's last 200 publishes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+}
+
+/// A stream event for `trigger.test` to dry-run, as `streams.publish` would take it (its data is
+/// `payload`). Nothing is published.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct TriggerTestStream {
+    /// The stream's name (`slack`).
+    pub name: String,
+    /// The event's kind (`message`).
+    pub kind: String,
+    /// The publisher's id for it (`{{stream.id}}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -1612,6 +1736,10 @@ pub struct TriggerTestParams {
     /// Local triggers: the terminal the event is about (filters and `{{session.*}}`).
     #[serde(default)]
     pub session: Option<Id>,
+    /// Local triggers: test a stream event: `event` is then `stream.<name>.<kind>` and
+    /// `payload` its data, and `{{stream.*}}` shows this envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<TriggerTestStream>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

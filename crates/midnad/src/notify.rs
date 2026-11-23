@@ -130,6 +130,8 @@ struct Draft {
     test: bool,
     /// `notify.send`'s id, URL and buttons.
     extras: Extras,
+    /// The title (`{{heading}}`) when it isn't about a terminal or project here: a nearby Mac's answer.
+    heading: Option<String>,
 }
 
 impl Draft {
@@ -147,6 +149,7 @@ impl Draft {
             key: None,
             test: false,
             extras: Extras::default(),
+            heading: None,
         }
     }
 
@@ -176,7 +179,7 @@ fn texts(templates: (&str, &str), draft: &Draft, session: Option<&Session>, proj
         m.insert("project".into(), json!(project.unwrap_or("")));
     }
     let facts = session.map(|s| crate::local::SessionFacts { id: s.id.clone(), name: s.name.clone(), project_id: s.project_id.clone(), agent: s.agent, status: s.status.state });
-    let render = |tpl: &str| crate::local::render(tpl, &draft.event, facts.as_ref(), &vars, None, false).trim().to_string();
+    let render = |tpl: &str| crate::local::render(tpl, &draft.event, None, facts.as_ref(), &vars, None, false).trim().to_string();
     let title = Some(title_tpl).filter(|t| !t.is_empty()).map(render).filter(|t| !t.is_empty()).unwrap_or_else(|| heading.clone());
     let body = match body_tpl {
         "" => draft.body.clone(),
@@ -197,7 +200,7 @@ fn s<'a>(v: &'a Value, k: &str) -> &'a str {
 }
 
 /// The agent's background tasks still running (what the sidebar's background ring shows).
-fn running(info: &AgentInfo) -> impl Iterator<Item = &BackgroundTask> {
+pub(crate) fn running(info: &AgentInfo) -> impl Iterator<Item = &BackgroundTask> {
     info.background.iter().filter(|b| b.status.is_empty() || b.status == "running")
 }
 
@@ -210,7 +213,7 @@ fn draft_for(d: &Daemon, e: &Event) -> Option<Draft> {
             let category = match item.kind {
                 NeedsYouKind::Approval | NeedsYouKind::PermissionPrompt => "approval",
                 NeedsYouKind::Blocked | NeedsYouKind::Note => "attention",
-                NeedsYouKind::Failed => "failed",
+                NeedsYouKind::Failed | NeedsYouKind::StreamFailing => "failed",
                 NeedsYouKind::TriggerWaiting | NeedsYouKind::SecretNeeded | NeedsYouKind::RuleRemoval => "requests",
             };
             let mut body = capitalize(&item.title);
@@ -242,8 +245,9 @@ fn draft_for(d: &Daemon, e: &Event) -> Option<Draft> {
                 return None;
             }
             // Background shells or agents still running: the terminal's row still shows it
-            // working, and the agent comes back when they end.
-            if d.core().state.session(&sid).and_then(|s| s.agent_info.as_ref()).is_some_and(|i| running(i).next().is_some()) {
+            // working, and the agent comes back when they end. Counted when the turn ended, not
+            // now: a later turn may already have changed them.
+            if e.data.get("background").and_then(Value::as_u64).unwrap_or(0) > 0 {
                 return None;
             }
             let reply = first_line(s(&e.data, "message"));
@@ -318,6 +322,7 @@ fn draft_for(d: &Daemon, e: &Event) -> Option<Draft> {
             draft.key = Some(format!("triggers:{}", s(&e.data, "delivery_id")));
             Some(draft)
         }
+        kinds::SHARE_ANSWERED => answer_draft(e),
         kinds::SESSION_RESTARTED => {
             // A restart the human asked for needs no notification.
             if e.actor.kind == ActorKind::Human {
@@ -359,6 +364,7 @@ pub fn send_as(d: &Daemon, category: &str, session: Option<Id>, title: &str, bod
         sound: Some(sound),
         test: false,
         extras: Extras { id: Some(id.clone()), ..extras },
+        heading: None,
     };
     let (actions, on, sent_by) = (draft.extras.actions.clone(), draft.extras.on.clone(), draft.extras.sent_by.clone());
     // Remembered before it's shown, so a response can't arrive for a notification midnad
@@ -516,6 +522,7 @@ pub fn test(d: &Daemon, session: Option<Id>, category: &str) -> NotifySendResult
         key: None,
         test: true,
         extras: Extras::default(),
+        heading: None,
     };
     match post(d, draft) {
         Ok(p) => NotifySendResult { posted: true, reason: None, id: None, via: Some(p.via), ..Default::default() },
@@ -531,6 +538,7 @@ fn sample_vars(category: &str) -> Value {
         "attention" | "requests" => json!({ "title": "Which branch should I use?", "detail": "", "kind": "blocked" }),
         "failed" => json!({ "title": "Exited with status 101", "detail": "", "kind": "failed", "reason": "API error" }),
         "turn_done" => json!({ "elapsed": "2m 5s", "secs": 125, "reply": "All tests pass.", "message": "All tests pass.\nI also tidied the README." }),
+        "nearby" => json!({ "mac": "Studio", "reply": "Fixed: the login test was racing the seed.", "message": "Fixed: the login test was racing the seed.\nPR #42 is up." }),
         "agent" | "from_trigger" => json!({ "title": "Build is green", "body": "Ready to ship" }),
         "background" => json!({ "count": 1 }),
         "pr_checks" => json!({ "number": 42, "checks": "failing", "failing": 2 }),
@@ -638,6 +646,7 @@ fn post(d: &Daemon, draft: Draft) -> Result<Posted, &'static str> {
         }
         let project = draft.project.as_deref().or(session.map(|s| s.project_id.as_str())).and_then(|p| st.project(p)).map(|p| p.name.clone());
         let heading = match (session, project.as_deref()) {
+            _ if draft.heading.is_some() => draft.heading.clone().unwrap_or_default(),
             (Some(s), Some(p)) if p != s.name => format!("{} · {p}", s.name),
             (Some(s), _) => s.name.clone(),
             (None, Some(p)) => p.to_string(),
@@ -736,6 +745,20 @@ fn capitalize(s: &str) -> String {
     c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
 }
 
+/// An agent this Mac started or asked on a nearby Mac sent its answer back (`share.answered`,
+/// data: the incoming message). Titled by that Mac, since no terminal here is behind it.
+fn answer_draft(e: &Event) -> Option<Draft> {
+    let item: midna_proto::nearby::ShareItem = serde_json::from_value(e.data.clone()).ok()?;
+    let midna_proto::nearby::SharePayload::Message { text, .. } = &item.payload else { return None };
+    let mac = if item.peer_name.trim().is_empty() { "A nearby Mac".to_string() } else { item.peer_name.trim().to_string() };
+    let reply = first_line(text);
+    let body = if reply.is_empty() { "Its answer is in Notifications › Nearby".to_string() } else { reply.clone() };
+    let mut draft = Draft::new("nearby", e, body).var("mac", mac.clone()).var("reply", reply).var("message", text.clone());
+    draft.heading = Some(if item.peer_name.trim().is_empty() { "An agent on a nearby Mac answered".into() } else { format!("{mac}'s agent answered") });
+    draft.key = Some(format!("nearby:{}", item.id));
+    Some(draft)
+}
+
 fn first_line(s: &str) -> String {
     s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string()
 }
@@ -790,7 +813,7 @@ mod tests {
 
     fn turn_done() -> Draft {
         let data = json!({ "reason": "Stop", "message": "All done.\nmore" });
-        let e = Event { seq: 1, at: "2026-10-06T12:00:00Z".into(), kind: "agent.turn_ended".into(), actor: Actor::system(), project_id: None, session_id: None, data };
+        let e = Event { seq: 1, at: "2026-10-06T12:00:00Z".into(), kind: "agent.turn_ended".into(), actor: Actor::system(), project_id: None, session_id: None, data, stream: None };
         Draft::new("turn_done", &e, "Finished in 2m 5s: All done.").var("elapsed", "2m 5s").var("reply", "All done.")
     }
 
@@ -814,6 +837,29 @@ mod tests {
         // The title never is.
         assert_eq!(texts_of("Done in {{elapsed}} ({{heading}})", "", &d), ("Done in 2m 5s (api · midna)".into(), own.1.clone()));
         assert_eq!(texts_of("{{missing}}", "none", &d), (own.0.clone(), String::new()));
+    }
+
+    #[test]
+    fn a_nearby_answer_is_titled_by_the_mac_that_sent_it() {
+        let item = json!({
+            "id": "sh_ans", "direction": "incoming", "peer": "fp", "peer_name": "Studio", "from": "Studio", "size": 40,
+            "payload": { "kind": "message", "text": "\n  Fixed the login test.\nPR #42 is up.", "reply_to": "sh_start" },
+            "state": "accepted", "sent_at": "2026-10-06T12:00:00Z",
+        });
+        let e = Event { seq: 1, at: "2026-10-06T12:00:00Z".into(), kind: kinds::SHARE_ANSWERED.into(), actor: Actor::system(), project_id: None, session_id: None, data: item.clone(), stream: None };
+        let d = answer_draft(&e).expect("an answer drafts a notification");
+        assert_eq!((d.category.as_str(), d.body.as_str(), d.heading.as_deref(), d.key.as_deref()), ("nearby", "Fixed the login test.", Some("Studio's agent answered"), Some("nearby:sh_ans")));
+        assert_eq!((d.vars["mac"].as_str(), d.vars["reply"].as_str()), (Some("Studio"), Some("Fixed the login test.")));
+        assert_eq!(texts(("", "{{mac}}: {{reply}}"), &d, None, None, d.heading.clone().unwrap()).1, "Studio: Fixed the login test.");
+        let mut empty = item.clone();
+        empty["payload"]["text"] = json!("");
+        empty["peer_name"] = json!("");
+        let d = answer_draft(&Event { data: empty, ..e.clone() }).unwrap();
+        assert_eq!((d.body.as_str(), d.heading.as_deref()), ("Its answer is in Notifications › Nearby", Some("An agent on a nearby Mac answered")));
+        // Anything but a message isn't an answer.
+        let mut file = item;
+        file["payload"] = json!({ "kind": "link", "url": "https://x.dev" });
+        assert!(answer_draft(&Event { data: file, ..e }).is_none());
     }
 
     #[test]

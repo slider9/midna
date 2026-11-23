@@ -5,10 +5,12 @@ mod guide;
 mod help;
 mod hook;
 mod mcp;
+mod nearby;
 mod print;
 mod queue;
 mod secret;
 mod shim;
+mod stream;
 mod summary;
 mod triggers;
 
@@ -75,9 +77,12 @@ fn main() {
     if let Some(agent) = shim::started_as() {
         shim::run(&[vec![agent], raw].concat());
     }
-    // `queue` gives a few flags values (`--idle 10m`) that are booleans elsewhere (`restart --idle`).
+    // `queue` gives a few flags values (`--idle 10m`) that are booleans elsewhere (`restart --idle`);
+    // `share` the other way round (`share send --agent`, `open --agent claude`).
     let args = match Args::parse(raw.clone()) {
         Ok(a) if a.pos.first().map(String::as_str) == Some("queue") => Args::parse_with(raw, queue::VALUE_FLAGS),
+        Ok(a) if matches!(a.pos.first().map(String::as_str), Some("share" | "inbox")) => nearby::parse_args(raw),
+        Err(_) if matches!(raw.first().map(String::as_str), Some("share" | "inbox")) => nearby::parse_args(raw),
         r => r,
     };
     let args = match args {
@@ -198,10 +203,17 @@ fn run(a: &Args) -> Res {
     };
     match verb {
         "capabilities" => {
+            // Best effort: with midnad down it still prints, without the streams section.
+            let info = connect().ok().and_then(|mut c| c.call_value("daemon.info", json!({})).ok());
             if json {
-                println!("{}", serde_json::to_string_pretty(&guide::capabilities_json()).unwrap_or_default());
+                let mut v = guide::capabilities_json();
+                v["overview"] = json!(guide::capabilities_with(info.as_ref()));
+                if let Some(i) = &info {
+                    v["streams"] = i["streams"].clone();
+                }
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
             } else {
-                println!("{}", guide::capabilities());
+                println!("{}", guide::capabilities_with(info.as_ref()));
             }
             Ok(())
         }
@@ -491,8 +503,12 @@ fn run(a: &Args) -> Res {
         "permissions" => permissions(a, &out),
         "hooks" => hooks(a, &out),
         "events" => events(a),
+        "stream" | "streams" => stream::stream(a, &out),
         "insights" => insights(a, &out),
         "keep-awake" | "keepawake" | "awake" => keep_awake(a, &out),
+        "peers" | "peer" | "nearby" => nearby::peers(a, &out),
+        "share" => nearby::share(a, &out),
+        "inbox" => nearby::inbox(a, &out),
         "system" | "load" => system(a, &out),
         "worktrees" | "worktree" => worktrees(a, &out),
         "cleanup" | "clean-up" => cleanup(a, &out),
@@ -1435,7 +1451,12 @@ fn links(a: &Args, out: OutFn) -> Res {
                         println!("no app has registered link patterns");
                     }
                     for app in apps {
-                        println!("{}", s_(&app, "owner"));
+                        let state = match (app["approved"] != false, app["approval"].as_str()) {
+                            (true, _) => String::new(),
+                            (false, Some(id)) => format!("  (preview commands wait for your approval: {id})"),
+                            (false, None) => "  (preview commands not approved; cards show the plain URL)".into(),
+                        };
+                        println!("{}{state}", s_(&app, "owner"));
                         for r in app["patterns"].as_array().into_iter().flatten() {
                             println!("    {}", r.as_str().unwrap_or(""));
                         }
@@ -1452,7 +1473,13 @@ fn links(a: &Args, out: OutFn) -> Res {
                 let v = call("links.patterns.register", json!({ "owner": owner, "patterns": rules }))?;
                 out(&v, &|v| match v["patterns"].as_array().map_or(0, Vec::len) {
                     0 => println!("cleared {}'s link patterns", s_(v, "owner")),
-                    n => println!("{} now has {n} link pattern{}", s_(v, "owner"), if n == 1 { "" } else { "s" }),
+                    n => {
+                        let wait = match v["approval"].as_str() {
+                            Some(id) if v["approved"] == false => format!("; its preview commands wait for your approval ({id})"),
+                            _ => String::new(),
+                        };
+                        println!("{} now has {n} link pattern{}{wait}", s_(v, "owner"), if n == 1 { "" } else { "s" })
+                    }
                 });
             }
             other => return Err(Fail::Usage(format!("unknown `links patterns {other}`; see midna links --help"))),

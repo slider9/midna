@@ -177,6 +177,36 @@ fn hook_bridge_prints_claude_decision() {
     assert!(cmd.contains(env!("CARGO_BIN_EXE_midna")) && cmd.ends_with("hook claude"));
 }
 
+/// A claude the terminal's agent starts (a script's `claude -p` in its Bash tool) inherits
+/// MIDNA_SESSION. Its hooks must not end the outer agent's turn. Here this test process is
+/// the terminal's agent and a `perl` it starts is the nested one.
+#[test]
+fn hooks_from_an_agent_inside_the_terminals_agent_leave_its_status_alone() {
+    let d = D::start();
+    let s = d.sock();
+    let mut h = d.human();
+    let sess = h.call_value("session.open", json!({ "kind": "shell", "cwd": common::tmp(), "command": [common::sh()] })).unwrap();
+    let sid = sess["id"].as_str().unwrap();
+    let state = |h: &mut midna_proto::Client| h.call_value("session.get", json!({ "id": sid })).unwrap()["status"]["state"].clone();
+    midna(&s, &["hook", "claude"], Some(r#"{"hook_event_name":"UserPromptSubmit","prompt":"review it"}"#), Some(sid));
+    assert_eq!(state(&mut h), "working");
+    let nested = |event: &str| {
+        let mut cmd = Command::new(if cfg!(windows) { common::posix_bin("perl") } else { "/usr/bin/perl".into() });
+        cmd.args(["-e", "exit(system(@ARGV) >> 8)", env!("CARGO_BIN_EXE_midna"), "hook", "claude"]);
+        cmd.env("MIDNA_SOCKET", &s).env("MIDNA_SESSION", sid).env_remove("MIDNA_HOME");
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(format!(r#"{{"hook_event_name":"{event}"}}"#).as_bytes()).unwrap();
+        assert!(child.wait_with_output().unwrap().status.success());
+    };
+    for event in ["SessionStart", "Stop", "SessionEnd"] {
+        nested(event);
+        assert_eq!(state(&mut h), "working", "after the nested agent's {event}");
+    }
+    midna(&s, &["hook", "claude"], Some(r#"{"hook_event_name":"Stop"}"#), Some(sid));
+    assert_eq!(state(&mut h), "done");
+}
+
 #[test]
 fn codex_notify_runs_the_previous_command() {
     // `notify --global -- PREV… <json>` is what `hooks install` writes on Windows: it reports
@@ -547,4 +577,161 @@ fn status_sets_shows_and_clears_a_label() {
         assert_eq!(code(&midna(&s, &bad, None, Some(&id))), 2, "{bad:?}");
     }
     assert_eq!(code(&midna(&s, &["status", "set", "x"], None, None)), 2, "no terminal outside midna");
+}
+
+/// Unix only: Nearby isn't on Windows yet, so midnad refuses every share and inbox call there.
+#[cfg(unix)]
+#[test]
+fn share_and_inbox_parse_and_agents_cant_decide() {
+    let d = D::start();
+    let s = d.sock();
+    let err = |o: &Output| String::from_utf8_lossy(&o.stderr).into_owned();
+    let o = midna(&s, &["inbox"], None, None);
+    assert_eq!((code(&o), stdout(&o).trim()), (0, "The inbox is empty."), "{o:?}");
+    let o = midna(&s, &["inbox", "--waiting", "--json"], None, None);
+    assert_eq!(serde_json::from_str::<Value>(&stdout(&o)).unwrap(), json!({ "items": [], "waiting": 0 }));
+    // Deciding is the human's.
+    for verb in ["accept", "decline"] {
+        let o = midna(&s, &["inbox", verb, "sh_abcdabcd"], None, None);
+        assert_eq!(code(&o), 1, "{verb}: {o:?}");
+        assert!(err(&o).contains("human only") && err(&o).contains("can't accept or decline"), "{verb}: {}", err(&o));
+    }
+    // The peer has to be paired; flags and text are checked before anything is sent.
+    let o = midna(&s, &["share", "send", "Bravo", "hi"], None, None);
+    assert_eq!(code(&o), 2, "{o:?}");
+    assert!(err(&o).contains("no paired device called or with id `Bravo`"), "{}", err(&o));
+    assert_eq!(code(&midna(&s, &["share", "send"], None, None)), 2);
+    assert_eq!(code(&midna(&s, &["share", "send", "Bravo", "--link"], None, None)), 2);
+    assert_eq!(code(&midna(&s, &["share", "Bravo", "hi"], None, None)), 2);
+    assert_eq!(code(&midna(&s, &["inbox", "accept", "sh_abcdabcd", "--open"], None, None)), 2);
+    let o = midna(&s, &["share", "send", "Bravo", "--link", "https://example.com", "--title", "t"], None, None);
+    assert!(err(&o).contains("no paired device"), "--link takes a value: {}", err(&o));
+    // A file or folder goes on its own: `--file <path>`, or one word that names one.
+    assert_eq!(code(&midna(&s, &["share", "send", "Bravo", "--file"], None, None)), 2);
+    let o = midna(&s, &["share", "send", "Bravo", "--file", "/tmp", "and words"], None, None);
+    assert!(code(&o) == 2 && err(&o).contains("a file is sent on its own"), "{}", err(&o));
+    let o = midna(&s, &["share", "send", "Bravo", "--file", "/tmp", "--message"], None, None);
+    assert!(code(&o) == 2 && err(&o).contains("a file is sent on its own"), "{}", err(&o));
+    let o = midna(&s, &["share", "send", "Bravo", "/tmp"], None, None);
+    assert!(code(&o) == 2 && err(&o).contains("no paired device"), "{}", err(&o));
+    // A tab or an agent session is a terminal and nothing else; --session only goes with one.
+    for bad in [
+        &["share", "send", "Bravo", "--tab", "hi"][..],
+        &["share", "send", "Bravo", "--tab", "--link", "https://x.y"],
+        &["share", "send", "Bravo", "--session", "t_x", "hi"],
+        &["share", "send", "Bravo", "--agent", "hi"],
+        &["share", "send", "Bravo", "--agent", "--tab"],
+        &["share", "send", "Bravo", "--agent", "--file", "/tmp"],
+    ] {
+        let o = midna(&s, bad, None, None);
+        assert!(code(&o) == 2 && !err(&o).contains("no paired device"), "{bad:?}: {}", err(&o));
+    }
+    let o = midna(&s, &["share", "send", "Bravo", "--tab", "--session", "t_x", "--title", "api"], None, None);
+    assert!(err(&o).contains("no paired device"), "--tab parses: {}", err(&o));
+    for ok in [&["share", "send", "Bravo", "--agent", "--session", "t_x", "--title", "api"][..], &["share", "send", "Bravo", "--title", "api", "--agent"]] {
+        let o = midna(&s, ok, None, None);
+        assert!(err(&o).contains("no paired device"), "{ok:?} parses: {}", err(&o));
+    }
+    // An agent start goes --to a device with one prompt; --agent names the agent there, and
+    // --timeout only goes with --wait.
+    for ok in [
+        &["share", "send", "agent-start", "--to", "Bravo", "--prompt", "why?"][..],
+        &["share", "send", "agent-start", "--to", "Bravo", "--agent", "codex", "--wait", "--timeout", "5m", "why", "now?"],
+    ] {
+        let o = midna(&s, ok, None, None);
+        assert!(err(&o).contains("no paired device"), "{ok:?} parses: {}", err(&o));
+    }
+    for bad in [
+        &["share", "send", "agent-start", "--prompt", "why?"][..],
+        &["share", "send", "agent-start", "--to", "Bravo", "--prompt", "why?", "and words"],
+        &["share", "send", "agent-start", "--to", "Bravo", "--timeout", "5m", "why?"],
+        &["share", "answer"],
+    ] {
+        let o = midna(&s, bad, None, None);
+        assert!(code(&o) == 2 && !err(&o).contains("no paired device"), "{bad:?}: {}", err(&o));
+    }
+    let o = midna(&s, &["share", "answer", "sh_abcdabcd"], None, None);
+    assert!(code(&o) != 0 && err(&o).contains("no share sh_abcdabcd"), "{}", err(&o));
+    let o = midna(&s, &["inbox", "accept", "sh_abcdabcd", "--cwd", "/tmp"], None, None);
+    assert!(err(&o).contains("human only"), "--cwd takes a value: {}", err(&o));
+    let o = midna(&s, &["call", "share.send", r#"{"peer":"ab","kind":"link","url":"javascript:alert(1)"}"#], None, None);
+    assert_eq!(code(&o), 2, "{o:?}");
+}
+
+/// `midna stream publish` run by a stream's producer sends its MIDNA_STREAM_TOKEN, so it gets
+/// in; the same command from anywhere else is refused (exit 1) once midna runs that stream.
+#[test]
+fn only_a_stream_s_own_producer_publishes_to_it_from_the_cli() {
+    let d = D::start();
+    let s = d.sock();
+    let cli = env!("CARGO_BIN_EXE_midna");
+    let script = format!("'{cli}' stream publish tail ready --id p1 --data '{{\"from\":\"producer\"}}' && exec sleep 60");
+    d.human().call_value("streams.add", json!({ "name": "tail", "command": [common::sh(), "-c", script], "cwd": common::tmp() })).unwrap();
+    let mut got = String::new();
+    for _ in 0..100 {
+        got = stdout(&midna(&s, &["events", "--kind", "stream.tail.ready", "--json"], None, None));
+        if got.contains("producer") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(got.contains(r#""from":"producer""#), "the producer's publish got in: {got}");
+    let o = midna(&s, &["stream", "publish", "tail", "ready", "--id", "x1", "--data", "{}"], None, None);
+    assert_eq!(code(&o), 1, "{o:?}");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("stream `tail` is one midna runs") && err.contains("MIDNA_STREAM_TOKEN"), "{err}");
+    let o = midna(&s, &["stream", "publish", "elsewhere", "ready", "--data", "{}"], None, None);
+    assert_eq!(code(&o), 0, "a name midna doesn't run is open: {o:?}");
+}
+
+#[test]
+fn an_agent_s_stream_waits_for_approval_and_the_rest_manage_it() {
+    let d = D::start();
+    let s = d.sock();
+    let err = |o: &Output| String::from_utf8_lossy(&o.stderr).into_owned();
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), err(o));
+    let o = midna(&s, &["stream", "add", "tail"], None, None);
+    assert_eq!(code(&o), 2, "the command goes after --: {o:?}");
+    assert!(stdout(&midna(&s, &["stream", "list"], None, None)).starts_with("no streams"));
+    // The CLI is an agent: its stream waits, paused, for the human's approval.
+    let sleep = common::posix_bin("sleep");
+    let o = midna(&s, &["stream", "add", "tail", "--cwd", &common::tmp_s(), "--", &sleep, "60"], None, None);
+    ok(&o);
+    assert!(stdout(&o).contains("waiting for the human's approval (needs-you "), "{}", stdout(&o));
+    let o = midna(&s, &["stream", "resume", "tail"], None, None);
+    assert_eq!(code(&o), 1, "{o:?}");
+    assert!(err(&o).contains("waits for the human's approval"), "{}", err(&o));
+    let o = midna(&s, &["stream", "update", "tail"], None, None);
+    assert_eq!(code(&o), 2, "say what changes: {o:?}");
+    let o = midna(&s, &["stream", "update", "tail", "--", &sleep, "61"], None, None);
+    ok(&o);
+    assert!(stdout(&o).starts_with("updated stream tail: waiting for the human's approval"), "{}", stdout(&o));
+    ok(&midna(&s, &["stream", "rm", "tail"], None, None));
+
+    d.human().call_value("streams.add", json!({ "name": "tail", "command": [&sleep, "60"], "cwd": common::tmp() })).unwrap();
+    let mut listed = String::new();
+    for _ in 0..50 {
+        listed = stdout(&midna(&s, &["stream", "ls"], None, None));
+        if listed.contains("running (pid ") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(listed.starts_with("tail ") && listed.contains("running (pid ") && listed.contains(&format!("$ {sleep} 60")), "{listed}");
+    let o = midna(&s, &["stream", "pause", "tail"], None, None);
+    ok(&o);
+    assert!(stdout(&o).starts_with("paused: paused"), "{}", stdout(&o));
+    let o = midna(&s, &["stream", "resume", "tail", "--json"], None, None);
+    ok(&o);
+    assert_eq!(serde_json::from_str::<Value>(&stdout(&o)).unwrap()["enabled"], true);
+    ok(&midna(&s, &["stream", "restart", "tail"], None, None));
+    // Removing a running stream asks the human; a paused one is the agent's to remove.
+    let o = midna(&s, &["stream", "rm", "tail"], None, None);
+    assert_eq!(code(&o), 1, "{o:?}");
+    assert!(err(&o).contains("streams.remove is human only; asked the human"), "{}", err(&o));
+    ok(&midna(&s, &["stream", "pause", "tail"], None, None));
+    let o = midna(&s, &["stream", "rm", "tail"], None, None);
+    ok(&o);
+    assert_eq!(stdout(&o).trim(), "removed stream tail; its producer was stopped");
+    assert_eq!(code(&midna(&s, &["stream", "remove", "tail"], None, None)), 1, "not found");
 }

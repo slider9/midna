@@ -76,8 +76,17 @@ fn merge_order(base: &[String], mine: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_left, merge_order, moved, pace, scripts_wanted, toggled};
+    use super::{awake_tip, cache_left, merge_order, moved, pace, scripts_wanted, toggled};
     use ::core::prelude::v1::test;
+
+    #[test]
+    fn another_macs_sun_says_whose_keep_awake_it_is() {
+        let here = awake_tip(Some("Keeping awake: build"), None);
+        assert!(here.starts_with("Keeping awake: build. The display may still sleep"));
+        let there = awake_tip(Some("Keeping awake: build"), Some("Bravo"));
+        assert!(there.starts_with("Bravo: Keeping awake: build."));
+        assert!(there.ends_with("Set at Bravo in Settings › Agents › Keep the Mac awake."));
+    }
 
     fn v(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
@@ -254,7 +263,13 @@ pub fn render(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> impl I
                 cx.notify();
             }),
         );
-    // The bell is always first, like VS Code's: notifications and how many are unread.
+    // The Mac's name starts the bar while the window shows one; it stands in for the daemon item.
+    let named = m.shown_name();
+    let has_named = named.is_some();
+    if let Some(name) = named {
+        bar = bar.child(mac_item(m, name, t));
+    }
+    // The bell comes next, like VS Code's first item: notifications and how many are unread.
     if connected {
         bar = bar.child(crate::ui::notifications::bell(m, t, cx));
     }
@@ -262,12 +277,13 @@ pub fn render(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> impl I
     // CPU and paused terminals: not a `ui.status.items` choice, it only shows while it matters
     // (after the daemon item, else first).
     let mut load = if connected { crate::ui::paused::status_item(m, t, cx) } else { None };
-    if !items.iter().any(|i| i == "daemon") {
+    if has_named || !items.iter().any(|i| i == "daemon") {
         bar = bar.children(load.take());
     }
     for item in items {
         // The daemon-backed items need midnad; the rest always show.
         let el = match item.as_str() {
+            "daemon" if has_named => None,
             "daemon" => Some(daemon_item(m, t)),
             "usage" if connected => usage_item(m, t, cx),
             "cache" if connected => cache_item(m, t),
@@ -303,38 +319,104 @@ fn dot(c: Hsla) -> Div {
     div().text_color(c).child("●")
 }
 
+/// "● Work MacBook Pro · 4 terminals": the Mac this window shows, its dot the state of its
+/// daemon (this Mac) or of the link to it (another Mac).
+fn mac_item(m: &MainWindow, name: String, t: &Theme) -> AnyElement {
+    let remote = m.remote();
+    let tip_text = if remote {
+        format!("This window shows {name}: its terminals and agents run there, over a link from this Mac.")
+    } else {
+        format!("This window shows {name}, this Mac: its terminals run in midnad and keep running when this window closes.")
+    };
+    // Another Mac's window until its terminals arrive, or while its link is tried again: amber,
+    // spinning (design 3 Connecting and Reconnecting). Offline, red: below.
+    let reconnecting = m.remote_down() == Some(crate::app::Down::Reconnecting);
+    if m.remote_loading() || reconnecting {
+        return div()
+            .id("daemon")
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .text_color(t.need)
+            .child(crate::icons::spinner("connecting-status", 10., t.need))
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
+            .child(if reconnecting { "· reconnecting" } else { "· connecting" })
+            .tooltip(tip(tip_text))
+            .into_any_element();
+    }
+    let (c, rest) = match &m.conn {
+        ConnState::Connected => {
+            let n = m.sessions.len();
+            (t.ok, format!("{n} terminal{}", if n == 1 { "" } else { "s" }))
+        }
+        ConnState::Connecting if remote => (t.dim, "connecting…".to_string()),
+        ConnState::Connecting => (t.dim, "connecting to midnad…".to_string()),
+        ConnState::NotRunning { .. } if remote => (t.err, "can't reach it".to_string()),
+        ConnState::NotRunning { .. } if m.daemon_restarting() => (t.need, "midnad restarting…".to_string()),
+        ConnState::NotRunning { .. } => (t.err, "midnad not running".to_string()),
+        ConnState::Link(p) if p.state == midna_proto::nearby::DriveState::Offline => (t.err, "offline".to_string()),
+        ConnState::Link(_) => (t.need, "reconnecting…".to_string()),
+    };
+    div()
+        .id("daemon")
+        .flex()
+        .gap(px(4.))
+        .child(dot(c))
+        .child(div().text_color(t.fg).font_weight(FontWeight::SEMIBOLD).child(name))
+        .child(format!("· {rest}"))
+        .tooltip(tip(tip_text))
+        .into_any_element()
+}
+
+/// This Mac's daemon, while the window shows no Mac's name (another Mac's window always does).
 fn daemon_item(m: &MainWindow, t: &Theme) -> AnyElement {
     let daemon = match &m.conn {
         ConnState::Connected => div().flex().gap(px(4.)).child(dot(t.ok)).child(m.backend.label()),
         ConnState::Connecting => div().flex().gap(px(4.)).child(dot(t.dim)).child("connecting to midnad…"),
         ConnState::NotRunning { .. } if m.daemon_restarting() => div().flex().gap(px(4.)).child(dot(t.need)).child("midnad restarting…"),
-        ConnState::NotRunning { .. } => div().flex().gap(px(4.)).child(dot(t.err)).child("midnad not running"),
+        ConnState::NotRunning { .. } | ConnState::Link(_) => div().flex().gap(px(4.)).child(dot(t.err)).child("midnad not running"),
     };
     div().id("daemon").child(daemon).tooltip(tip("midnad: the background daemon that runs your terminals. They keep running when this window closes.")).into_any_element()
 }
 
-/// A sun while midnad holds its keep-awake assertion (nothing otherwise); the tooltip says why. Click: Settings.
+/// A sun while midnad holds its keep-awake assertion (nothing otherwise); the tooltip says why.
+/// Click: Settings. Another Mac's window shows that Mac's keep-awake (design option C), says so,
+/// and has no click: this Mac's Settings would set this Mac's.
 fn awake_item(m: &MainWindow, t: &Theme, _cx: &mut Context<MainWindow>) -> Option<AnyElement> {
     let k = &m.keep_awake;
     if k["held"] != true {
         return None;
     }
-    let line = k["line"].as_str().unwrap_or("Keeping the Mac awake").to_string();
+    let mac = m.backend.mac().map(|x| x.name.clone());
     let backend = m.backend.clone();
     let fg = t.fg;
-    Some(
-        div()
-            .id("keep-awake")
-            .flex()
-            .items_center()
-            .gap(px(4.))
-            .cursor_pointer()
-            .hover(move |s| s.text_color(fg))
-            .child(Icon::Sun.el(12., t.work))
-            .tooltip(tip(format!("{line}. The display may still sleep; closing the lid still sleeps the Mac. Settings › Agents › Keep the Mac awake.")))
-            .on_click(move |_, _, cx| crate::settings_window::open(backend.clone(), cx))
-            .into_any_element(),
-    )
+    let item = div()
+        .id("keep-awake")
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .child(Icon::Sun.el(12., t.work))
+        .tooltip(tip(awake_tip(k["line"].as_str(), mac.as_deref())));
+    let item = match mac {
+        Some(_) => item,
+        None => item.cursor_pointer().hover(move |s| s.text_color(fg)).on_click(move |_, _, cx| crate::settings_window::open(backend.clone(), cx)),
+    };
+    Some(item.into_any_element())
+}
+
+/// The keep-awake sun's tooltip: midnad's `line`, and where it's set; `mac` names that Mac in
+/// its window.
+fn awake_tip(line: Option<&str>, mac: Option<&str>) -> String {
+    match mac {
+        None => {
+            let line = line.unwrap_or("Keeping the Mac awake");
+            format!("{line}. The display may still sleep; closing the lid still sleeps the Mac. Settings › Agents › Keep the Mac awake.")
+        }
+        Some(mac) => {
+            let line = line.unwrap_or("Keeping awake");
+            format!("{mac}: {line}. Its display may still sleep; closing its lid still sleeps it. Set at {mac} in Settings › Agents › Keep the Mac awake.")
+        }
+    }
 }
 
 /// Claude's plan limits in the taskboard's usage pill: a rounded pill with, per window, a label,
@@ -508,7 +590,23 @@ fn triggers_item(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> Any
 /// worktree and branch), or a script path from the list.
 fn script_item(m: &MainWindow, item: &str, t: &Theme, cx: &mut Context<MainWindow>) -> Option<AnyElement> {
     let segs = m.status_segments.get(m.selected.as_ref()?)?.get(item)?;
-    (!segs.is_empty()).then(|| div().id(SharedString::from(format!("status-{item}"))).child(crate::ui::sidebar::segments(segs, t, 11.5, cx).gap(px(10.))).into_any_element())
+    (!segs.is_empty()).then(|| {
+        div()
+            .id(SharedString::from(format!("status-{item}")))
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .child(crate::ui::sidebar::segments(segs, t, 11.5, cx).gap(px(10.)))
+            .children(on_mac(m, t))
+            .into_any_element()
+    })
+}
+
+/// "· on <Mac>" after a script's output in another Mac's window: the script is that Mac's,
+/// run there (screen 5, state C of the remote Mac windows design).
+pub fn on_mac(m: &MainWindow, t: &Theme) -> Option<Div> {
+    let mac = m.backend.mac()?;
+    Some(div().flex_none().whitespace_nowrap().text_color(t.ansi[6]).child(format!("· on {}", mac.name)))
 }
 
 /// A status bar item being dragged in the right-click menu.

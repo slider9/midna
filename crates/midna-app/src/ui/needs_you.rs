@@ -11,7 +11,8 @@ use crate::model::*;
 use crate::theme::Theme;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use std::collections::HashMap;
+use midna_proto::nearby::ShareKind;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
@@ -50,7 +51,7 @@ pub struct Stack {
     pub menu: bool,
     filter: Filter,
     /// The item a clicked notification opened ("from your notification").
-    clicked: Option<String>,
+    pub(crate) clicked: Option<String>,
     scroll: ScrollHandle,
     /// Handled during this pass, for the "All clear" summary.
     log: Vec<(String, Outcome)>,
@@ -61,6 +62,19 @@ pub struct Stack {
     pub(super) edits: HashMap<String, serde_json::Value>,
     /// The setting change showing its current value instead of the ask.
     pub(super) current: Option<String>,
+    /// Pairing cards whose "Also let … drive this Mac" box is ticked, by item (off at first).
+    drive: HashSet<String>,
+    /// Pair as my Mac with that box ticked: macOS's Touch ID or password check, by item.
+    drive_check: Option<(String, DriveCheck)>,
+}
+
+enum DriveCheck {
+    /// The prompt is up (dropping it takes the prompt down).
+    Asking(#[allow(dead_code)] crate::local_auth::Asking),
+    /// The prompt went away: nothing was confirmed, and Pair as my Mac asks again.
+    Cancelled,
+    /// macOS said no (its own words).
+    Failed(String),
 }
 
 impl Stack {
@@ -77,6 +91,8 @@ impl Stack {
             gone: HashMap::new(),
             edits: HashMap::new(),
             current: None,
+            drive: HashSet::new(),
+            drive_check: None,
         }
     }
 }
@@ -91,6 +107,8 @@ pub fn on_open(m: &mut MainWindow) {
     s.clicked = None;
     s.log.clear();
     s.gone.clear();
+    s.drive.clear();
+    s.drive_check = None;
     // dev: screenshot the approve dropdown
     s.menu = crate::dev::var("MIDNA_DEBUG_APPROVE_MENU").is_ok();
     if s.menu {
@@ -147,7 +165,12 @@ fn meta(t: &Theme, n: &NeedsYou) -> Meta {
         NeedsYouKind::SecretNeeded => ("Secret needed", t.accent),
         NeedsYouKind::Other => ("Needs you", t.need),
     };
-    let label = if n.setting.is_some() { "Setting change" } else { label };
+    let (label, color) = match () {
+        _ if n.setting.is_some() => ("Setting change", color),
+        _ if super::nearby::pairing_of(n).is_some() => ("Pairing", t.accent),
+        _ if super::share::offer_of(n).is_some() => ("Nearby share", t.accent),
+        _ => (label, color),
+    };
     Meta { label, color, approve: approves(n) }
 }
 
@@ -173,10 +196,26 @@ fn other_actions(n: &NeedsYou) -> (Option<(&'static str, Option<Resolution>)>, O
     }
 }
 
+/// The Mac where `n` has to be approved, in another Mac's window (`mac`, its name): an item
+/// that Mac's daemon marks `local_only` (a share, a pairing, a protection removed) can't be
+/// approved over the link. Deny and dismiss still work. None: approve it here.
+fn decide_at<'a>(mac: Option<&'a str>, n: &NeedsYou) -> Option<&'a str> {
+    mac.filter(|_| n.local_only)
+}
+
+/// The name of the Mac this window drives; None in this Mac's own windows.
+fn that_mac(m: &MainWindow) -> Option<String> {
+    m.backend.mac().map(|x| x.name.clone())
+}
+
 /// What the approve and deny keys do to the selected item, for the footer: approve / deny,
 /// else its own actions (a question is only dismissed; its options are answered in its terminal).
-fn key_actions(n: Option<&NeedsYou>) -> (Option<String>, Option<String>) {
+/// An item to decide at that Mac (`decide_at`) has no approve key.
+fn key_actions(n: Option<&NeedsYou>, mac: Option<&str>) -> (Option<String>, Option<String>) {
     let Some(n) = n else { return (None, None) };
+    if decide_at(mac, n).is_some() {
+        return (None, key_actions(Some(n), None).1);
+    }
     if approves(n) {
         return (Some("approve".into()), Some("deny".into()));
     }
@@ -194,6 +233,10 @@ fn project_name(m: &MainWindow, pid: Option<&str>) -> String {
 
 /// Its terminal's name (the project is in the list row), else its project.
 fn terminal_of(m: &MainWindow, n: &NeedsYou) -> String {
+    // a pairing or a share comes from another Mac, not from a terminal or project here
+    if super::nearby::pairing_of(n).is_some() || super::share::offer_of(n).is_some() {
+        return "Nearby".into();
+    }
     match session_of(m, n) {
         Some(s) => match crate::windows::name_note(m, s) {
             Some(w) => format!("{} ({w})", s.name),
@@ -204,6 +247,10 @@ fn terminal_of(m: &MainWindow, n: &NeedsYou) -> String {
 }
 
 fn where_of(m: &MainWindow, n: &NeedsYou) -> String {
+    // a pairing or a share comes from another Mac, not from a terminal or project here
+    if super::nearby::pairing_of(n).is_some() || super::share::offer_of(n).is_some() {
+        return "Nearby".into();
+    }
     match session_of(m, n) {
         Some(s) => match crate::windows::name_note(m, s) {
             Some(w) => format!("{} › {} ({w})", project_name(m, s.project_id.as_deref()), s.name),
@@ -249,7 +296,10 @@ fn resolve_cur(m: &mut MainWindow, res: Resolution, cx: &mut Context<MainWindow>
 
 fn primary(m: &mut MainWindow, window: &mut Window, cx: &mut Context<MainWindow>) {
     let Some(n) = current(m) else { return };
-    let t = cx.global::<Theme>().clone();
+    if let Some(mac) = decide_at(that_mac(m).as_deref(), &n) {
+        return m.toast(format!("Decide at {mac}: approving this can't be done from another Mac"), cx);
+    }
+    let t = crate::theme::of(window, cx).clone();
     if meta(&t, &n).approve {
         return resolve_cur(m, Resolution::Approve { scope: ApprovalScope::Once }, cx);
     }
@@ -274,6 +324,107 @@ fn secondary(m: &mut MainWindow, cx: &mut Context<MainWindow>) {
     if let Some((_, res)) = other_actions(&n).1 {
         resolve_cur(m, res, cx);
     }
+}
+
+/// A pairing card's "Pair as my Mac": confirm it keeping the other Mac as one of yours
+/// (`peers.confirm` closes the needs-you item itself). With the drive box ticked, macOS checks
+/// it's you first, and the confirm carries `allow_drive`.
+fn pair_as_mine(m: &mut MainWindow, cx: &mut Context<MainWindow>) {
+    let Some(n) = current(m) else { return };
+    let Some(ask) = super::nearby::pairing_of(&n) else { return };
+    if !m.stack.drive.contains(&n.id) {
+        return confirm_mine(m, &n, &ask.id, false, cx);
+    }
+    if matches!(&m.stack.drive_check, Some((id, DriveCheck::Asking(_))) if *id == n.id) {
+        return;
+    }
+    let asking = crate::local_auth::ask(&format!("let “{}” drive this Mac", ask.name));
+    let answer = asking.answer.clone();
+    m.stack.drive_check = Some((n.id.clone(), DriveCheck::Asking(asking)));
+    let id = n.id.clone();
+    cx.spawn(async move |this, cx| {
+        let outcome = answer.recv().await.unwrap_or(crate::local_auth::Outcome::Cancelled);
+        let _ = this.update(cx, |m, cx| {
+            if !matches!(&m.stack.drive_check, Some((i, DriveCheck::Asking(_))) if *i == id) {
+                return;
+            }
+            m.stack.drive_check = match outcome {
+                crate::local_auth::Outcome::Allowed => None,
+                crate::local_auth::Outcome::Cancelled => Some((id.clone(), DriveCheck::Cancelled)),
+                crate::local_auth::Outcome::Failed(e) => Some((id.clone(), DriveCheck::Failed(e))),
+            };
+            // still waiting (and still ticked): confirm it, wherever the stack has moved since
+            if m.stack.drive_check.is_none()
+                && m.stack.drive.contains(&id)
+                && let Some(n) = m.needs.iter().find(|x| x.id == id).cloned()
+                && let Some(ask) = super::nearby::pairing_of(&n)
+            {
+                confirm_mine(m, &n, &ask.id, true, cx);
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+    cx.notify();
+}
+
+/// `peers.confirm` as my device (`allow_drive`: also let it drive this Mac), and the card
+/// leaves the stack.
+fn confirm_mine(m: &mut MainWindow, n: &NeedsYou, pairing: &str, allow_drive: bool, cx: &mut Context<MainWindow>) {
+    let order = ordered(m);
+    if let Some(i) = order.iter().position(|x| x.id == n.id)
+        && current_index(m, &order) == Some(i)
+    {
+        m.stack.pos = i;
+        m.stack.cur = None;
+    }
+    m.stack.menu = false;
+    m.stack.drive.remove(&n.id);
+    m.stack.log.push((n.title.clone(), Outcome::Approved));
+    m.stack.gone.insert(n.id.clone(), std::time::Instant::now());
+    m.needs.retain(|x| x.id != n.id);
+    crate::sounds::play("approved");
+    let params = super::nearby::confirm_mine_params(pairing, allow_drive);
+    m.rpc("peers.confirm", params, cx, |m, _, _, cx| m.request_refresh(crate::app::refresh::NEEDS, cx));
+    cx.notify();
+}
+
+/// A pairing card's drive box: tick or untick it. Unticking takes down a prompt that's up.
+fn toggle_drive(m: &mut MainWindow, id: &str, cx: &mut Context<MainWindow>) {
+    if !m.stack.drive.remove(id) {
+        m.stack.drive.insert(id.to_string());
+    }
+    if m.stack.drive_check.as_ref().is_some_and(|(i, _)| i == id) {
+        m.stack.drive_check = None;
+    }
+    cx.notify();
+}
+
+/// Dev (`MIDNA_DEBUG_SCREEN=needs:<id>+drive`): tick that pairing card's drive box.
+pub fn debug_tick_drive(m: &mut MainWindow, id: &str, cx: &mut Context<MainWindow>) {
+    m.stack.drive.insert(id.to_string());
+    cx.notify();
+}
+
+/// A share card's paste-into / pin-to: accept it into terminal `sid` (`share.accept` closes the
+/// needs-you item itself). The card leaves the stack once it worked.
+fn offer_into(m: &mut MainWindow, sid: String, pin: bool, cx: &mut Context<MainWindow>) {
+    let Some(n) = current(m) else { return };
+    let Some(offer) = super::share::offer_of(&n) else { return };
+    m.stack.menu = false;
+    cx.notify();
+    super::share::accept(m, offer.id, Some(sid), pin, cx, move |m, cx| {
+        let order = ordered(m);
+        if current_index(m, &order).is_some_and(|i| order[i].id == n.id) {
+            m.stack.pos = current_index(m, &order).unwrap_or(0);
+            m.stack.cur = None;
+        }
+        m.stack.log.push((n.title.clone(), Outcome::Approved));
+        m.stack.gone.insert(n.id.clone(), std::time::Instant::now());
+        m.needs.retain(|x| x.id != n.id);
+        crate::sounds::play("approved");
+        cx.notify();
+    });
 }
 
 fn approve_all(m: &mut MainWindow, cx: &mut Context<MainWindow>) {
@@ -316,6 +467,16 @@ fn select_at(m: &mut MainWindow, i: usize, cx: &mut Context<MainWindow>) {
     m.stack.menu = false;
     m.stack.scroll.scroll_to_item(i);
     cx.notify();
+}
+
+/// ⌘J with the list closed: open it on the newest item (the list's last), or as it opens with
+/// nothing waiting.
+pub fn open_newest(m: &mut MainWindow, window: &mut Window, cx: &mut Context<MainWindow>) {
+    m.set_overlay(Overlay::NeedsYou, window, cx);
+    let last = ordered(m).len().checked_sub(1);
+    if let Some(i) = last.filter(|_| !m.stack.menu) {
+        select_at(m, i, cx);
+    }
 }
 
 /// Open the list on item `id` (a clicked notification), keeping it open if it already is.
@@ -461,7 +622,7 @@ pub fn render(m: &mut MainWindow, t: &Theme, _window: &mut Window, cx: &mut Cont
 /// The left column: title and count, kind chips, one row per item, key hints.
 fn list(m: &MainWindow, t: &Theme, order: &[&NeedsYou], cur: usize, approve_key: &str, deny_key: &str, cx: &mut Context<MainWindow>) -> impl IntoElement + use<> {
     let all = waiting(m);
-    let (approve_hint, deny_hint) = key_actions(order.get(cur).copied());
+    let (approve_hint, deny_hint) = key_actions(order.get(cur).copied(), that_mac(m).as_deref());
     let mut chips = div().flex().flex_none().flex_wrap().gap(px(6.)).px(px(18.)).pb(px(12.));
     for (f, label) in FILTERS {
         let count = if f == Filter::All { all.len() } else { all.iter().filter(|n| filter_of(n) == f).count() };
@@ -765,11 +926,30 @@ fn card(m: &MainWindow, t: &Theme, n: &NeedsYou, cx: &mut Context<MainWindow>) -
                         .when(clicked, |d| d.child(div().text_size(px(11.)).text_color(t.dim.opacity(0.7)).child("from your notification"))),
                 )
         )
-        .map(|d| match n.setting.is_some() {
-            true => d
+        .map(|d| match (n.setting.is_some(), super::nearby::pairing_of(n), super::share::offer_of(n)) {
+            (true, _, _) => d
                 .child(div().text_size(px(22.)).line_height(px(28.)).font_weight(FontWeight::BOLD).child(format!("{who} wants to change a setting")))
                 .child(super::setting_change::panel(m, t, n, cx)),
-            false => d
+            (false, Some(ask), _) => {
+                let ticked = m.stack.drive.contains(&n.id);
+                let id = n.id.clone();
+                let check = m.stack.drive_check.as_ref().filter(|(i, _)| *i == n.id).map(|(_, c)| match c {
+                    DriveCheck::Asking(_) => ("Confirm with Touch ID or your password…".to_string(), t.need),
+                    DriveCheck::Cancelled => ("Cancelled, so nothing was paired. Pair as my Mac asks again.".into(), t.dim),
+                    DriveCheck::Failed(e) => (format!("{}. Nothing was paired.", e.trim_end_matches('.')), t.err),
+                });
+                d.child(div().text_size(px(22.)).line_height(px(28.)).font_weight(FontWeight::BOLD).child(format!("Pair with {}?", ask.name)))
+                    .child(super::nearby::panel(t, &ask, &n.detail))
+                    .child(
+                        super::nearby::drive_box(t, "ny-pair-drive", &ask.name, "this Mac", ticked)
+                            .on_click(cx.listener(move |m, _, _, cx| toggle_drive(m, &id, cx))),
+                    )
+                    .children(check.map(|(s, c)| div().text_size(px(12.)).text_color(c).child(s)))
+            }
+            (false, None, Some(offer)) => d
+                .child(div().text_size(px(22.)).line_height(px(28.)).font_weight(FontWeight::BOLD).child(n.title.clone()))
+                .child(super::share::panel(m, t, &offer)),
+            (false, None, None) => d
                 .child(div().text_size(px(22.)).line_height(px(28.)).font_weight(FontWeight::BOLD).child(n.title.clone()))
                 .child(grid)
                 .children(long)
@@ -783,12 +963,128 @@ fn actions(m: &MainWindow, t: &Theme, n: &NeedsYou, approve_key: &str, deny_key:
     let mt = meta(t, n);
     let sess = session_of(m, n);
     let mut actions = div().flex().flex_wrap().items_center().gap(px(8.));
-    if mt.approve {
+    let pairing = super::nearby::pairing_of(n).is_some();
+    let asking = matches!(&m.stack.drive_check, Some((i, DriveCheck::Asking(_))) if *i == n.id);
+    let button = |id: &'static str, label: String| {
+        div().id(id).flex().items_center().h(px(38.)).px(px(16.)).rounded(px(7.)).border_1().border_color(t.line).text_size(px(14.)).cursor_pointer().hover(|s| s.bg(t.raised)).child(label)
+    };
+    let mac = that_mac(m);
+    if let Some(mac) = decide_at(mac.as_deref(), n) {
+        // design option C: approving it is done at that Mac; denying works from here, and a
+        // message can still be answered (`share.send` runs on that Mac)
+        let deny = if pairing {
+            "Codes differ"
+        } else if super::share::offer_of(n).is_some() {
+            "Decline"
+        } else if mt.approve {
+            "Deny"
+        } else {
+            other_actions(n).1.map_or("Dismiss", |(l, _)| l)
+        };
+        actions = actions.child(
+            div()
+                .id("ny-decide")
+                .flex()
+                .items_center()
+                .h(px(38.))
+                .px(px(16.))
+                .rounded(px(7.))
+                .border_1()
+                .border_color(t.line)
+                .text_size(px(14.))
+                .text_color(t.dim)
+                .child(format!("Decide at {mac}")),
+        );
+        if let Some(offer) = super::share::offer_of(n).filter(|o| o.kind == ShareKind::Message) {
+            let (id, peer) = (offer.id.clone(), super::share::offer_peer(m, &offer));
+            actions = actions.child(
+                button("ny-share-reply", "Reply…".into()).on_click(cx.listener(move |m, _, w, cx| super::share::open_message(m, Some(id.clone()), Some(peer.clone()), None, w, cx))),
+            );
+        }
+        actions = actions.child(button("ny-deny", format!("{deny} {deny_key}")).on_click(cx.listener(|m, _, _, cx| secondary(m, cx))));
+    } else if pairing {
+        // no scopes: each pairing is confirmed once, as a contact or as one of your Macs
+        actions = actions
+            .child(
+                div()
+                    .id("ny-approve")
+                    .flex()
+                    .items_center()
+                    .h(px(38.))
+                    .px(px(16.))
+                    .rounded(px(7.))
+                    .bg(t.accent)
+                    .text_color(t.accent_fg)
+                    .font_weight(FontWeight::BOLD)
+                    .text_size(px(14.))
+                    .cursor_pointer()
+                    .hover(|s| s.opacity(0.92))
+                    .on_click(cx.listener(|m, _, _, cx| resolve_cur(m, Resolution::Approve { scope: ApprovalScope::Once }, cx)))
+                    .child(format!("Pair as a contact {approve_key}")),
+            )
+            .child(
+                button("ny-pair-mine", if asking { "Waiting…".into() } else { "Pair as my Mac".into() })
+                    .on_click(cx.listener(|m, _, _, cx| pair_as_mine(m, cx))),
+            )
+            .child(button("ny-deny", format!("Codes differ {deny_key}")).on_click(cx.listener(|m, _, _, cx| secondary(m, cx))));
+    } else if let Some(offer) = super::share::offer_of(n) {
+        // approve accepts the share, deny declines it; a snippet can also go into a terminal
+        // and a link onto one's links, from the chooser
+        let primary_btn = |label: &str| {
+            div()
+                .id("ny-approve")
+                .flex()
+                .items_center()
+                .h(px(38.))
+                .px(px(16.))
+                .rounded(px(7.))
+                .bg(t.accent)
+                .text_color(t.accent_fg)
+                .font_weight(FontWeight::BOLD)
+                .text_size(px(14.))
+                .cursor_pointer()
+                .hover(|s| s.opacity(0.92))
+                .on_click(cx.listener(|m, _, _, cx| resolve_cur(m, Resolution::Approve { scope: ApprovalScope::Once }, cx)))
+                .child(format!("{label} {approve_key}"))
+        };
+        let chooser = |id: &'static str, label: &str, pin: bool| {
+            let menu = m.stack.menu.then(|| {
+                let pick = move |m: &mut MainWindow, sid: String, cx: &mut Context<MainWindow>| offer_into(m, sid, pin, cx);
+                div().absolute().left_0().bottom(px(44.)).child(deferred(super::share::chooser(m, t, id, pick, cx)).with_priority(3))
+            });
+            div()
+                .relative()
+                .child(button(id, label.to_string()).on_click(cx.listener(|m, _, _, cx| {
+                    m.stack.menu = !m.stack.menu;
+                    cx.notify();
+                })))
+                .children(menu)
+        };
+        actions = match offer.kind {
+            ShareKind::Message => {
+                let (id, peer, need) = (offer.id.clone(), super::share::offer_peer(m, &offer), n.id.clone());
+                actions.child(primary_btn("Mark read")).child(
+                    button("ny-share-reply", "Reply…".into())
+                        .on_click(cx.listener(move |m, _, w, cx| super::share::open_message(m, Some(id.clone()), Some(peer.clone()), Some(need.clone()), w, cx))),
+                )
+            }
+            ShareKind::Snippet => actions.child(chooser("ny-share-into", "Paste into…", false)).child(primary_btn("Keep in inbox")),
+            ShareKind::Link => actions.child(primary_btn("Open")).child(chooser("ny-share-pin", "Pin to…", true)),
+            ShareKind::File => actions.child(primary_btn("Save")),
+            ShareKind::Tab => actions.child(primary_btn("Open tab")),
+            ShareKind::Object => actions.child(primary_btn("Apply")),
+            ShareKind::Agent => actions.child(primary_btn("Resume")),
+            ShareKind::AgentStart => actions.child(primary_btn("Start agent")),
+            ShareKind::AgentAsk => actions.child(primary_btn("Queue prompt")),
+            ShareKind::FileRequest => actions.child(primary_btn("Send file")),
+        };
+        actions = actions.child(button("ny-deny", format!("Decline {deny_key}")).on_click(cx.listener(|m, _, _, cx| secondary(m, cx))));
+    } else if mt.approve {
         let start = n.kind == NeedsYouKind::TriggerWaiting;
         let session_name = sess.map(|s| s.name.clone()).unwrap_or_else(|| "it".into());
         let scope_hint = if start { "this trigger" } else { "this command" };
         // A folder-trust dialog (midnad's trust.rs) has no scopes: trusting saves the folder.
-        let trust = n.kind == NeedsYouKind::PermissionPrompt && n.title.starts_with("Trust this folder?");
+        let trust = n.kind == NeedsYouKind::PermissionPrompt && is_trust(&n.title);
         // Nor does a setting change: saving sets it, once.
         let save = n.setting.is_some();
         let options: Vec<(&str, String, ApprovalScope)> = vec![
@@ -1009,8 +1305,30 @@ mod tests {
         let question = NeedsYou { question: Some(NeedsYouQuestion { text: "Which?".into(), ..Default::default() }), ..prompt.clone() };
         assert!(!super::approves(&question));
         assert!(matches!(super::filter_of(&question), super::Filter::Other));
-        assert_eq!(super::key_actions(Some(&prompt)), (Some("approve".into()), Some("deny".into())));
-        assert_eq!(super::key_actions(Some(&question)), (None, Some("dismiss".into())));
-        assert_eq!(super::key_actions(None), (None, None));
+        assert_eq!(super::key_actions(Some(&prompt), None), (Some("approve".into()), Some("deny".into())));
+        assert_eq!(super::key_actions(Some(&question), None), (None, Some("dismiss".into())));
+        assert_eq!(super::key_actions(None, None), (None, None));
     }
+
+    #[test]
+    fn a_local_only_item_is_decided_at_that_mac() {
+        use crate::model::{NeedsYou, NeedsYouKind};
+        let share = NeedsYou { kind: NeedsYouKind::Approval, local_only: true, ..Default::default() };
+        // another Mac's window: no approve key, deny still works
+        assert_eq!(super::decide_at(Some("Bravo"), &share), Some("Bravo"));
+        assert_eq!(super::key_actions(Some(&share), Some("Bravo")), (None, Some("deny".into())));
+        // this Mac's own window approves it as before
+        assert_eq!(super::decide_at(None, &share), None);
+        assert_eq!(super::key_actions(Some(&share), None), (Some("approve".into()), Some("deny".into())));
+        // an item a link can approve is approved from that Mac's window too
+        let plain = NeedsYou { local_only: false, ..share };
+        assert_eq!(super::decide_at(Some("Bravo"), &plain), None);
+    }
+}
+
+/// An agent's "trust this folder?" startup dialog (midnad's trust.rs titles its item
+/// `Trust this folder? <cwd>`, and its notification says the same). Its buttons say Trust and
+/// Don't trust, not Approve and Deny.
+pub fn is_trust(title: &str) -> bool {
+    title.trim_start().starts_with("Trust this folder?")
 }

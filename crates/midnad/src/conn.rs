@@ -12,6 +12,7 @@
 use crate::daemon::Daemon;
 use crate::peer;
 use crate::rpc::{self, Ctx, Role};
+use midna_proto::types::Actor;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use midna_proto::ipc::UnixStream;
@@ -204,7 +205,7 @@ fn peer_closed(s: &UnixStream) -> bool {
 /// The connection's role: the GUI is human, unless it runs inside one of this daemon's
 /// terminals (then an agent launched it, e.g. `Midna.app/Contents/MacOS/midna-app` typed into
 /// a midna shell). Everything else is an agent.
-fn base_role(d: &Daemon, token: Option<[u8; 32]>, pid: Option<i32>) -> Role {
+pub(crate) fn base_role(d: &Daemon, token: Option<[u8; 32]>, pid: Option<i32>) -> Role {
     let (Some(pid), Some(exe)) = (pid, pid.and_then(peer::pid_path)) else { return Role::Agent };
     let gui = peer::GuiIdentity { app_path: d.cfg.app_path.clone(), requirement: d.cfg.gui_requirement.clone() };
     if !gui.matches(&exe, pid, token.as_ref()) {
@@ -236,10 +237,35 @@ fn trusted_client(d: &Daemon, method: &str, ctx: &Ctx, token: Option<[u8; 32]>) 
     peer::trusted_client(&entries, &exe, pid, token.as_ref(), team.as_deref())
 }
 
+/// Who is on the other end of a connection.
+enum Who<'a> {
+    /// A process on this Mac (`midnad.sock`).
+    Local,
+    /// A paired device driving this Mac over a drive link (`nearby/relay.rs`), by fingerprint.
+    Peer(&'a str),
+}
+
 pub fn serve(d: Arc<Daemon>, s: UnixStream, conn_id: u64) {
-    let token = peer::stream_token(&s);
-    let pid = peer::stream_pid(&s);
-    let role = base_role(&d, token, pid);
+    serve_as(d, s, conn_id, Who::Local)
+}
+
+/// Serve one stream of a drive link from paired device `fp` as an ordinary client connection.
+/// The person driving is the human here: human role, acting as `{kind: human, via: peer, peer:
+/// <fp>}`, never with a terminal of its own, and refused what is local-only
+/// (`nearby::local_only`). It has no process here.
+pub fn serve_peer(d: Arc<Daemon>, s: UnixStream, conn_id: u64, fp: &str) {
+    serve_as(d, s, conn_id, Who::Peer(fp))
+}
+
+fn serve_as(d: Arc<Daemon>, s: UnixStream, conn_id: u64, who: Who) {
+    let (token, pid, role) = match who {
+        Who::Local => {
+            let (token, pid) = (peer::stream_token(&s), peer::stream_pid(&s));
+            (token, pid, base_role(&d, token, pid))
+        }
+        // The socket's other end is midnad's own relay thread: its pid says nothing.
+        Who::Peer(_) => (None, None, Role::Human),
+    };
     let (Ok(ws), Ok(ctl)) = (s.try_clone(), s.try_clone()) else { return };
     let (tx, rx) = OutTx::pair();
     let tx = OutTx { sock: Some(Arc::new(ctl)), ..tx };
@@ -278,6 +304,14 @@ pub fn serve(d: Arc<Daemon>, s: UnixStream, conn_id: u64) {
         let method = req.get("method").and_then(Value::as_str).unwrap_or("").to_string();
         let params = req.get("params").cloned().unwrap_or(Value::Null);
         let mut ctx = Ctx::new(role, &params, conn_id, tx.clone(), pid);
+        match who {
+            Who::Local => ctx.app = ctx.is_human(),
+            Who::Peer(fp) => {
+                // Always the person, never an agent: `caller` claims say nothing over a link.
+                (ctx.role, ctx.session) = (Role::Human, None);
+                ctx.as_actor = Some(Actor::peer(fp));
+            }
+        }
         if method == "stream.attach" {
             // Answer, stop the line writer, then hand the socket to the binary stream.
             match crate::stream::prepare(&d, &params) {

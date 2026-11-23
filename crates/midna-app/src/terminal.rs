@@ -30,10 +30,14 @@ mod pr_status;
 mod prompt_nav;
 mod queue_pill;
 mod secret_paste;
+mod up_burst;
+pub mod send_image;
 
 pub use link_preview::share as share_preview_env;
 pub(crate) use pr_status::stale as link_stale;
 pub use prompt_nav::share as share_prompt_bar;
+#[cfg(test)]
+pub use prompt_nav::shared as prompt_bar_shared;
 
 pub const FONT_SIZE: f32 = 12.5;
 /// Design: line-height 1.6 at 12.5px.
@@ -170,6 +174,10 @@ pub struct TerminalView {
     kbd_sel: Option<KbdSel>,
     /// `kbd_sel` in Claude's long input, where its ends can scroll out of view.
     long_sel: Option<LongSel>,
+    /// Plain ↑ pressed fast in Claude's input, kept from running past its first row.
+    up_burst: Option<up_burst::UpBurst>,
+    /// A timer is checking on `up_burst` for ↑ the screen never shows.
+    up_watch: bool,
     /// Until when a redraw of an agent's input may renumber its list (`list_key`).
     list_watch: Option<Instant>,
     /// Bumped by each redraw while `list_watch` runs; a renumber waits for it to settle.
@@ -182,6 +190,9 @@ pub struct TerminalView {
     project_id: Option<String>,
     /// Asking whether to store the secrets in a paste (`terminal/secret_paste.rs`).
     secret_sheet: Option<secret_paste::Sheet>,
+    /// Text the composer's secret sheet already reviewed (Out::Composer): the next submit with
+    /// the same text skips the scan so the sheet doesn't open twice.
+    composer_vetted: Option<String>,
     /// Claude Code or Codex found running in this terminal's full-screen app (started from a
     /// shell), probed each time the alternate screen turns on.
     agent_proc: Option<&'static str>,
@@ -195,6 +206,9 @@ pub struct TerminalView {
     /// (Claude Code can apply a typed letter in the middle of a burst of deletes). The job is
     /// None when the erase needs no check, only that wait.
     erasing: Option<(Option<term_edit::Pending>, Vec<ClientMsg>)>,
+    /// Another Mac's link is down: keys and clicks go nowhere (never saved up to send later) and
+    /// the last screen stays, without the "stream ended" note.
+    frozen: bool,
     /// Bumped per scheduled erase check, so only the latest one runs.
     erase_gen: u64,
     /// A message over the terminal, and when it goes.
@@ -363,7 +377,7 @@ impl TerminalView {
     /// Like [`Self::new`], attaching at `size` (cols, rows) when known: switching terminals in
     /// the same pane reuses the pane's measured size, so the PTY isn't resized twice.
     pub fn new_sized(session_id: String, backend: Arc<dyn Backend>, size: (u16, u16), window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let theme = cx.global::<Theme>().clone();
+        let theme = crate::theme::of(window, cx).clone();
         let font_family = theme.mono_font.clone();
         let ts = window.text_system();
         let fid = ts.resolve_font(&font(font_family.clone()));
@@ -439,7 +453,7 @@ impl TerminalView {
             loop {
                 cx.background_executor().timer(Duration::from_millis(60)).await;
                 let r = this.update(cx, |t, _| {
-                    if let (Some(m), Some(s)) = (t.drag_out, t.stream()) {
+                    if let (Some(m), Some(s), false) = (t.drag_out, t.stream(), t.frozen) {
                         s.send(&ClientMsg::Mouse(m));
                     }
                 });
@@ -521,16 +535,20 @@ impl TerminalView {
             preview: Default::default(),
             kbd_sel: None,
             long_sel: None,
+            up_burst: None,
+            up_watch: false,
             list_watch: None,
             list_gen: 0,
             agent: None,
             project_id: None,
             secret_sheet: None,
+            composer_vetted: None,
             agent_press: None,
             press_at: None,
             agent_proc: None,
             alt_probed: false,
             erasing: None,
+            frozen: false,
             erase_gen: 0,
             notice: None,
             redo: Vec::new(),
@@ -707,8 +725,20 @@ impl TerminalView {
         self.blink_on = true;
     }
 
+    /// Typing off while another Mac's link is down (`MainWindow::remote_down`), or back on.
+    pub fn freeze(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.frozen = on;
+        if on {
+            self.erasing = None;
+        }
+        cx.notify();
+    }
+
     /// Raw bytes for the PTY (text). The daemon snaps the viewport back and clears the selection.
     pub fn send(&mut self, bytes: &[u8]) {
+        if self.frozen {
+            return;
+        }
         if let Some(s) = self.stream() {
             s.input(bytes);
         }
@@ -716,6 +746,9 @@ impl TerminalView {
     }
 
     fn send_msg(&self, m: ClientMsg) {
+        if self.frozen {
+            return;
+        }
         if let Some(s) = self.stream() {
             s.send(&m);
         }
@@ -723,6 +756,9 @@ impl TerminalView {
 
     /// The user's input: sent now, or after the selection being erased is gone.
     fn deliver(&mut self, m: ClientMsg) {
+        if self.frozen {
+            return;
+        }
         match self.erasing.as_mut() {
             Some((_, queued)) => queued.push(m),
             None => self.send_msg(m),
@@ -734,7 +770,7 @@ impl TerminalView {
         if self.sink.is_ended() && self.status == StreamStatus::Live {
             self.status = StreamStatus::Ended;
         }
-        let Some(f) = self.sink.take() else { return };
+        let Some((f, credits)) = self.sink.take() else { return };
         self.painted = Instant::now();
         if let Some(m) = self.fps.as_mut() {
             m.frames += 1;
@@ -784,17 +820,26 @@ impl TerminalView {
         }
         if rows_changed || moved {
             self.follow_long_sel();
+            self.follow_up_burst();
         }
         if let Some((pending, _)) = &self.erasing {
             // Check once the app has gone quiet, not between its redraws.
-            let quiet = if let Some(Pending::Read(job)) = pending { job.quiet_ms().min(120) } else { 120 };
+            let quiet = match pending {
+                Some(Pending::Read(job)) => job.quiet_ms().min(120),
+                Some(Pending::ToEdge(walk)) => walk.quiet_ms(),
+                _ => 120,
+            };
             self.check_erase_later(quiet, cx);
         }
         if (rows_changed || moved) && self.list_watch.is_some() {
             self.fix_list_numbers_later(cx);
         }
+        // Give back a credit for every stream frame this one folded in, or a drive link's
+        // window of frames in flight would shrink each time two arrived between paints.
         if let Some(s) = self.stream() {
-            s.want();
+            for _ in 0..credits.max(1) {
+                s.want();
+            }
         }
     }
 
@@ -863,6 +908,15 @@ impl TerminalView {
             return;
         }
         self.list_watch = None;
+        let plain_up = ks.key == "up" && !m.shift && !m.platform && !m.alt && !m.control;
+        if !plain_up {
+            // Another key ends a burst of ↑: any held back are dropped, not sent after it.
+            self.up_burst = None;
+        } else if self.find.is_none() && self.marked.is_none() && self.up_key(cx) {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if self.find.is_none() && self.marked.is_none() && self.list_key(ks) {
             cx.stop_propagation();
             cx.notify();
@@ -1095,11 +1149,16 @@ impl TerminalView {
             return false;
         }
         let (cmd, alt, key) = (m.platform, m.alt, ks.key.as_str());
+        // ⌘A's selection of all of a long input starts out of view, where ⇧ can't move it from:
+        // a ⇧ move starts a new selection at the cursor instead, so ⌫ erases only what's shown.
+        if m.shift && matches!(key, "up" | "down" | "left" | "right") && self.kbd_sel.is_some_and(|k| k.all) {
+            self.kbd_sel = None;
+        }
         // ⌘↑ ⌘↓: to the start or end of an agent's text (⇧ selects). A shell's line is one
         // line, so there ⇧⌘↑ ⇧⌘↓ select to its start or end and plain ⌘↑ ⌘↓ still scroll.
         if cmd && !alt && matches!(key, "up" | "down") && self.line_editing() {
             let Some(c) = self.live_cursor() else { return false };
-            if self.agent_kind() == Some("claude") && term_edit::box_is_full(&self.grid, c) {
+            if matches!(self.agent_kind(), Some("claude" | "codex")) && term_edit::box_is_full(&self.grid, c) {
                 return self.walk_to_edge(key, m.shift, c, cx);
             }
             let line_edge = term_edit::Send::Bytes(if key == "up" { b"\x01" } else { b"\x05" });
@@ -1117,6 +1176,18 @@ impl TerminalView {
         }
         if m.shift && !cmd && !alt && matches!(key, "up" | "down") && self.line_editing() {
             let Some(c) = self.live_cursor() else { return false };
+            if self.agent_kind() == Some("codex")
+                && self.long_sel.as_ref().is_none_or(LongSel::settled)
+                && let Some(moves) = term_edit::codex_vertical_at_edge(key, &self.grid, c)
+            {
+                if !self.selecting() {
+                    self.select_from(c);
+                }
+                for mv in moves {
+                    self.send_move(mv);
+                }
+                return true;
+            }
             if let Some(long) = self.codex_long_sel(c) {
                 if let Some(mv) = long.vertical(key) {
                     self.send_move(mv);
@@ -1159,7 +1230,7 @@ impl TerminalView {
                 self.kbd_sel = None;
                 let target = if key == "left" { lo.0 } else { hi.0 };
                 let row = self.grid.get(c.1 as usize).cloned().unwrap_or_default();
-                let n = term_edit::chars_between(&row, c.0, target);
+                let n = term_edit::chars_between(&row, c.0, target) - term_edit::chip_savings(&self.grid, c, (target, c.1), self.indent());
                 for _ in 0..n {
                     self.arrow(if target < c.0 { "left" } else { "right" });
                 }
@@ -1219,13 +1290,13 @@ impl TerminalView {
         self.cursor.filter(|_| self.ext.at_bottom())
     }
 
-    /// ⌘↑ ⌘↓ in Claude's long input: walk to the text's edge, not the window's ([`term_edit::EdgeWalk`]).
+    /// ⌘↑ ⌘↓ in Claude's or Codex's long input: walk to the text's edge, not the window's ([`term_edit::EdgeWalk`]).
     /// Like ⌘A's walk, it waits for an erase or walk already underway rather than join it.
     fn walk_to_edge(&mut self, key: &str, shift: bool, c: term_edit::Pos, cx: &mut Context<Self>) -> bool {
         if self.erasing.is_some() {
             return true;
         }
-        let Some(walk) = term_edit::EdgeWalk::start(key, &self.grid, c) else { return false };
+        let Some(walk) = term_edit::EdgeWalk::start(key, shift, &self.grid, c) else { return false };
         if !shift {
             self.kbd_sel = None;
         } else if !self.selecting() {
@@ -1249,6 +1320,10 @@ impl TerminalView {
             }
             term_edit::Walk::Edge(bytes) => {
                 self.send_move(term_edit::Send::Bytes(bytes));
+                self.check_erase_later(250, cx);
+            }
+            term_edit::Walk::Jump(bytes) => {
+                self.send(bytes);
                 self.check_erase_later(250, cx);
             }
             term_edit::Walk::Done => match then {
@@ -1320,6 +1395,59 @@ impl TerminalView {
         }
     }
 
+    /// A plain ↑ in Claude's input: sent, held back or dropped by [`up_burst::UpBurst`]. False
+    /// sends it the usual way.
+    fn up_key(&mut self, cx: &mut Context<Self>) -> bool {
+        let c = self.live_cursor().filter(|_| self.agent_kind() == Some("claude") && self.line_editing() && self.erasing.is_none());
+        let Some(c) = c else {
+            self.up_burst = None;
+            return false;
+        };
+        match up_burst::UpBurst::key(&mut self.up_burst, &self.grid, c, Instant::now()) {
+            up_burst::Up::Pass => return false,
+            up_burst::Up::Hold => {}
+            up_burst::Up::Send => self.arrow("up"),
+        }
+        self.kbd_sel = None;
+        self.typed();
+        self.watch_up_burst(cx);
+        true
+    }
+
+    /// A new frame: send the held ↑ the screen now shows room for.
+    fn follow_up_burst(&mut self) {
+        let c = self.live_cursor();
+        let Some(burst) = self.up_burst.as_mut() else { return };
+        for _ in 0..burst.frame(&self.grid, c, Instant::now()) {
+            self.arrow("up");
+        }
+    }
+
+    /// While ↑ are held or on their way, check now and then that the screen still shows them
+    /// landing; when it stops, drop the held ones.
+    fn watch_up_burst(&mut self, cx: &mut Context<Self>) {
+        if self.up_watch {
+            return;
+        }
+        self.up_watch = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(up_burst::WAIT / 3).await;
+                let busy = this.update(cx, |t, _| {
+                    if t.up_burst.as_ref().is_some_and(|b| b.stale(Instant::now())) {
+                        t.up_burst = None;
+                    }
+                    t.up_watch = t.up_burst.as_ref().is_some_and(up_burst::UpBurst::busy);
+                    t.up_watch
+                });
+                if !busy.unwrap_or(false) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     /// The cursor, for deciding on a key that goes by what's on screen: as it will be once the
     /// arrows on their way have shown, so that fast keys can't run past the rows in view.
     fn aimed(&self, c: term_edit::Pos) -> term_edit::Pos {
@@ -1372,6 +1500,7 @@ impl TerminalView {
         }
         let Some((s, e)) = term_edit::replace_range(kbd, &self.ext.selection, c) else { return false };
         let mouse = !kbd.is_some_and(|k| k.anchor != c);
+        let (s, e) = if mouse { term_edit::snap_to_chips(&self.grid, s, e, self.indent()) } else { (s, e) };
         if mouse && !(s.1 == c.1 && e.1 == c.1) {
             return self.start_mouse_erase(s, e, c, cx);
         }
@@ -1379,6 +1508,10 @@ impl TerminalView {
             return self.start_erase_job(s, e, c, cx);
         }
         let Some((moves, n)) = self.grid.get(c.1 as usize).and_then(|row| term_edit::erase_plan(row, c.0, s.0, e.0)) else { return false };
+        // A chip is one press to cross or erase, however many cells it takes.
+        let chips = |a: u16, b: u16| term_edit::chip_savings(&self.grid, (a, c.1), (b, c.1), self.indent());
+        let moves = moves - moves.signum() * chips(c.0, e.0) as i64;
+        let n = n - chips(s.0, e.0);
         for _ in 0..moves.unsigned_abs() {
             self.arrow(if moves < 0 { "left" } else { "right" });
         }
@@ -1400,9 +1533,9 @@ impl TerminalView {
                 self.settle(Some(Pending::Follow { tries: WALK_TRIES, then }), cx);
                 self.check_erase(cx);
             }
-            Some((Some(Pending::Follow { .. }), _)) => {}
+            Some((Some(Pending::Follow { then: ref mut queued, .. }), _)) => *queued = queued.and(then),
             Some((Some(Pending::ToEdge(ref mut walk)), _)) => {
-                walk.then.get_or_insert(then);
+                walk.then = Some(walk.then.map_or(then, |queued| queued.and(then)));
             }
             Some(_) => self.say_lost_sel(then, cx),
         }
@@ -1507,13 +1640,14 @@ impl TerminalView {
     }
 
     fn press_read_keys(&mut self, keys: &term_edit::Read) {
-        let (key, n) = match keys {
-            term_edit::Read::Up(n) => ("up", *n),
-            term_edit::Read::Left => ("left", 1),
-            _ => return,
-        };
-        for _ in 0..n {
-            self.arrow(key);
+        match keys {
+            term_edit::Read::Up(n) => (0..*n).for_each(|_| self.arrow("up")),
+            // Bytes as they are: Codex's ctrl-a goes up a line, where Home wouldn't.
+            term_edit::Read::Keys(keys) => keys.iter().for_each(|k| match *k {
+                term_edit::Send::Bytes(b) => self.send(b),
+                term_edit::Send::Arrow(a) => self.arrow(a),
+            }),
+            _ => {}
         }
     }
 
@@ -1674,7 +1808,7 @@ impl TerminalView {
                 let (read, cut, rows, quiet) = (job.step(&self.grid, self.cursor), job.cut, job.rows(), job.quiet_ms());
                 match read {
                     term_edit::Read::Wait => self.check_erase_later(120, cx),
-                    keys @ (term_edit::Read::Up(_) | term_edit::Read::Left) => {
+                    keys @ (term_edit::Read::Up(_) | term_edit::Read::Keys(_)) => {
                         self.press_read_keys(&keys);
                         self.check_erase_later(quiet, cx);
                     }
@@ -1802,10 +1936,26 @@ impl TerminalView {
         let Some(out) = crate::annotate::take(&self.session_id, cx) else {
             return false;
         };
-        let images = if self.agent_kind() == Some("claude") { out.paths.len() } else { 0 };
+        let mut images = if self.agent_kind() == Some("claude") { out.paths.len() } else { 0 };
         let mut steps = out.steps();
         steps.push(ClientMsg::Key(enter.clone()));
+        // Another Mac's terminal: the images go there first, and that Mac pastes each path (and
+        // waits for its chip) before the notes and the ↩ follow.
+        let there = self.remote_mac().map(|mac| (mac, self.backend.clone(), self.session_id.clone(), out.paths.clone()));
+        if there.is_some() {
+            steps.drain(..out.paths.len());
+            images = 0;
+        }
         cx.spawn(async move |this, cx| {
+            if let Some((mac, backend, id, paths)) = there.filter(|t| !t.3.is_empty()) {
+                let sent = cx.background_executor().spawn(async move { send_image::send_there(&*backend, &id, &paths, &mac) }).await;
+                if let Err(e) = sent {
+                    // Nothing more goes: the text stays in the input, to send again.
+                    let _ = this.update(cx, |t, cx| t.say(e, cx));
+                    return;
+                }
+                cx.background_executor().timer(Duration::from_millis(250)).await;
+            }
             let deadline = Instant::now() + image_chips::WAIT;
             for (i, s) in steps.iter().enumerate() {
                 if i > 0 {
@@ -1938,9 +2088,13 @@ impl TerminalView {
     }
 
     /// Normalize the images (off the UI thread, as the sheet does) and paste each path, spaced
-    /// out so Claude Code turns each one into its own `[Image #N]`.
+    /// out so Claude Code turns each one into its own `[Image #N]`. On another Mac's terminal
+    /// each goes there and that Mac pastes its own path (`send_image`).
     fn paste_images_inline(&mut self, sources: Vec<crate::annotate::Source>, cx: &mut Context<Self>) {
         self.erase_selection(cx);
+        if self.remote_mac().is_some() {
+            return self.send_images(sources, cx);
+        }
         cx.spawn(async move |this, cx| {
             let saved = cx.background_executor().spawn(async move { sources.into_iter().map(crate::annotate::save).collect::<Vec<_>>() }).await;
             let mut first = true;
@@ -1973,7 +2127,11 @@ impl TerminalView {
     /// path, escaped as a shell wants it (Claude Code reads it that way too).
     fn on_drop(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
         let (images, others) = crate::annotate::sort_dropped(paths);
-        if !others.is_empty() {
+        if let Some(mac) = self.remote_mac().filter(|_| !others.is_empty()) {
+            // Another Mac's terminal: a path here means nothing there. Images still go (through
+            // the sheet, or sent there); anything else stays here, and says so.
+            self.say(send_image::refusal(&others, &mac), cx);
+        } else if !others.is_empty() {
             let typed: Vec<String> = others.iter().map(|p| escaped_path(p)).collect();
             self.paste_text(&format!("{} ", typed.join(" ")), window, cx);
             cx.notify();
@@ -2113,6 +2271,32 @@ impl TerminalView {
         });
     }
 
+    /// Share the selection with a nearby Mac: hands its text to the Share picker in the home
+    /// window of this terminal's Mac (`ui/share.rs`), so another Mac's selection is sent from
+    /// that Mac, once this window's update is over. False when nothing is selected.
+    pub fn share_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let mac = crate::backend::mac_id(&*self.backend);
+        let share = move |text: String, cx: &mut Context<Self>| {
+            if !text.is_empty() {
+                let mac = mac.clone();
+                cx.defer(move |cx| crate::ui::share::open_in_home(mac, text, cx));
+            }
+        };
+        if let Some((s, e)) = self.kbd_range() {
+            share(term_edit::selected_text(&self.grid, s, e, self.is_agent()), cx);
+            return true;
+        }
+        if self.ext.selection.is_empty() {
+            return false;
+        }
+        self.call("session.selection", json!({ "id": self.session_id, "agent": self.is_agent() }), window, cx, move |_, r, _, cx| {
+            if let Some(text) = r.ok().and_then(|v| v.get("text").and_then(Value::as_str).map(str::to_string)) {
+                share(text, cx);
+            }
+        });
+        true
+    }
+
     fn to_clipboard(text: String, cx: &mut Context<Self>) {
         if text.is_empty() {
             return;
@@ -2225,7 +2409,7 @@ impl TerminalView {
             return;
         };
         let cmd = ev.modifiers.secondary();
-        if (cmd || link_preview::mode(cx) == link_preview::Mode::Hover) && inside && over_grid && self.pressed == 0 && self.link_menu.menu.is_none() {
+        if (cmd || link_preview::mode(&*self.backend, cx) == link_preview::Mode::Hover) && inside && over_grid && self.pressed == 0 && self.link_menu.menu.is_none() {
             if self.hover_cmd != cmd {
                 self.hover_cmd = cmd;
                 cx.notify();
@@ -2459,6 +2643,11 @@ impl TerminalView {
                 }
             }
             "paste_secret" => return self.paste_as_secret(window, cx),
+            // the picker takes focus
+            "share" => {
+                self.share_selection(window, cx);
+                return cx.notify();
+            }
             "select_all" => self.call("session.select_all", json!({ "id": self.session_id }), window, cx, |_, _, _, _| {}),
             "clear" => self.call("session.clear", json!({ "id": self.session_id }), window, cx, |_, _, _, _| {}),
             _ => {}
@@ -2471,6 +2660,7 @@ impl TerminalView {
         use crate::actions::{pretty, term_keys};
         let pos = self.menu?;
         let has_sel = !self.ext.selection.is_empty();
+        let can_share = has_sel || self.kbd_range().is_some();
         let clear_keys = crate::actions::label(cx, "keys.clear");
         let item = |id: &'static str, label: &'static str, keys: &str, enabled: bool, cx: &mut Context<Self>| {
             div()
@@ -2507,6 +2697,7 @@ impl TerminalView {
             .child(item("copy", "Copy", &pretty(term_keys::COPY), has_sel, cx))
             .child(item("paste", "Paste", &pretty(term_keys::PASTE), true, cx))
             .child(item("paste_secret", "Paste as Secret", &pretty(term_keys::PASTE_SECRET), true, cx))
+            .when(cfg!(target_os = "macos"), |m| m.child(item("share", "Share with a Nearby Mac…", "", can_share, cx)))
             .child(sep())
             .child(item("select_all", "Select All", &pretty(term_keys::SELECT_ALL), true, cx))
             .child(item("clear", "Clear", &clear_keys, true, cx));
@@ -2634,24 +2825,23 @@ impl TerminalView {
 
 /// Open `path` at `line`: `$VISUAL`/`$EDITOR` (from the user's login shell) in a new terminal
 /// next to this one, or the default app (`open`) when no editor is set.
+///
+/// In another Mac's window the path is on that Mac: its own login shell picks its editor, and
+/// with none set it opens in `vi` there. `open` would act on this Mac's screen (or that one's,
+/// locked), never in this window.
 pub(crate) fn open_file(backend: Arc<dyn Backend>, session: String, path: String, line: Option<u32>) {
     std::thread::spawn(move || {
-        let editor = login_editor();
-        let Some(editor) = editor else {
-            #[cfg(target_os = "macos")]
-            let _ = std::process::Command::new("/usr/bin/open").arg(&path).status();
-            #[cfg(not(target_os = "macos"))]
-            crate::opener::open(&path);
-            return;
-        };
-        let q = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
-        let bin = midna_proto::paths::program_name(editor.split_whitespace().next().unwrap_or("")).to_string();
-        let cmd = match (bin.as_str(), line) {
-            ("code" | "cursor" | "zed" | "subl", Some(l)) => {
-                format!("{editor} -g {}", q(&format!("{path}:{l}")))
-            }
-            (_, Some(l)) => format!("{editor} +{l} {}", q(&path)),
-            (_, None) => format!("{editor} {}", q(&path)),
+        let cmd = if backend.mac().is_some() {
+            there_editor_command(&path, line)
+        } else {
+            let Some(editor) = login_editor() else {
+                #[cfg(target_os = "macos")]
+                let _ = std::process::Command::new("/usr/bin/open").arg(&path).status();
+                #[cfg(not(target_os = "macos"))]
+                crate::opener::open(&path);
+                return;
+            };
+            editor_command(&editor, &path, line)
         };
         let s = backend.call("session.get", json!({ "id": session })).unwrap_or(Value::Null);
         let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -2667,6 +2857,36 @@ pub(crate) fn open_file(backend: Arc<dyn Backend>, session: String, path: String
             let _ = backend.call("session.focus", json!({ "id": id }));
         }
     });
+}
+
+/// Single-quoted for a shell.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// `editor` opening `path` at `line`: `-g path:line` for the GUI editors that take it, else
+/// `+line path`.
+fn editor_command(editor: &str, path: &str, line: Option<u32>) -> String {
+    let bin = midna_proto::paths::program_name(editor.split_whitespace().next().unwrap_or(""));
+    match (bin, line) {
+        ("code" | "cursor" | "zed" | "subl", Some(l)) => format!("{editor} -g {}", sh_quote(&format!("{path}:{l}"))),
+        (_, Some(l)) => format!("{editor} +{l} {}", sh_quote(path)),
+        (_, None) => format!("{editor} {}", sh_quote(path)),
+    }
+}
+
+/// [`editor_command`] for another Mac, as a script its login shell (zsh or bash) runs: that
+/// Mac's `$VISUAL`/`$EDITOR`, or `vi` when it has neither, since this Mac's may not be there.
+fn there_editor_command(path: &str, line: Option<u32>) -> String {
+    let pick = r#"e="${VISUAL:-$EDITOR}"; [ -n "$e" ] || e=vi"#;
+    // eval splits the editor's own flags in zsh too; the path stays one word in "$f".
+    let run = match line {
+        Some(l) => format!(
+            r#"case "${{e%% *}}" in code|*/code|cursor|*/cursor|zed|*/zed|subl|*/subl) eval "$e -g \"\${{f}}:{l}\"" ;; *) eval "$e +{l} \"\$f\"" ;; esac"#
+        ),
+        None => r#"eval "$e \"\$f\"""#.to_string(),
+    };
+    format!("f={}; {pick}; {run}", sh_quote(path))
 }
 
 /// `$VISUAL` / `$EDITOR` as the user's login shell sees them (a GUI app's environment usually
@@ -2757,6 +2977,19 @@ struct Palette {
     fg: Hsla,
     cursor: Hsla,
     selection: Hsla,
+    /// (the engine's ANSI colors, the theme's): see `Theme::ansi_from`.
+    ansi: Option<([[u8; 3]; 16], [[u8; 3]; 16])>,
+}
+
+impl Palette {
+    /// A cell color as this window's theme shows it: one of the engine's ANSI colors becomes
+    /// the same slot of the theme's, when they differ.
+    fn swap(&self, c: [u8; 3]) -> [u8; 3] {
+        match &self.ansi {
+            Some((from, to)) => from.iter().position(|x| *x == c).map_or(c, |i| to[i]),
+            None => c,
+        }
+    }
 }
 
 /// Scrollbar thumb geometry and visibility, from the frame's scroll state.
@@ -2780,7 +3013,7 @@ impl Render for TerminalView {
                 *m = FpsMeter { since: Instant::now(), frames: 0, renders: 0, rows: 0 };
             }
         }
-        let theme = cx.global::<Theme>().clone();
+        let theme = crate::theme::of(window, cx).clone();
         if theme.mono_font != self.font_family {
             self.font_family = theme.mono_font.clone();
             GLYPHS.with(|g| g.borrow_mut().clear());
@@ -2789,7 +3022,7 @@ impl Render for TerminalView {
         // Dev runs (MIDNA_DEBUG_TERM) don't activate the window; count it as active.
         let active = crate::windows::in_use(window) || crate::dev::var_os("MIDNA_DEBUG_TERM").is_some();
         self.report_focus(focused && active);
-        let pal = Palette { fg: theme.fg, cursor: theme.fg.opacity(0.55), selection: theme.selection };
+        let pal = Palette { fg: theme.fg, cursor: theme.fg.opacity(0.55), selection: theme.selection, ansi: theme.ansi_from.map(|f| (f, theme.def.ansi)) };
         let term_bg = theme.term;
         let dim = theme.dim;
         let grid = self.grid.clone();
@@ -2836,6 +3069,7 @@ impl Render for TerminalView {
         let below = self.ext.scroll_total.saturating_sub(self.ext.scroll_offset + self.ext.scroll_len);
 
         let overlay = match &self.status {
+            _ if self.frozen => None,
             StreamStatus::Attaching => Some(("Attaching…".to_string(), dim)),
             StreamStatus::Ended => Some(("Stream ended. The session closed or midnad went away.".to_string(), dim)),
             StreamStatus::NotRunning(_) => None,
@@ -2870,7 +3104,7 @@ impl Render for TerminalView {
                     return;
                 }
                 t.hover_cmd = false;
-                if link_preview::mode(cx) == link_preview::Mode::Hover {
+                if link_preview::mode(&*t.backend, cx) == link_preview::Mode::Hover {
                     cx.notify();
                 } else {
                     t.clear_hover(cx);
@@ -3135,7 +3369,7 @@ fn paint_grid(
     };
     // Default fg/bg from the engine map to the theme so light/dark both read right.
     let fg_of = |c: [u8; 3], alpha: f32| {
-        if c == dfg { pal.fg.opacity(alpha) } else { rgb3(c, alpha) }
+        if c == dfg { pal.fg.opacity(alpha) } else { rgb3(pal.swap(c), alpha) }
     };
     for (y, row) in grid.iter().enumerate() {
         let py = oy + lh * y as f32;
@@ -3153,7 +3387,7 @@ fn paint_grid(
             while x < n && cells[x].bg == bg {
                 x += 1;
             }
-            let color = if bg == dfg { pal.fg } else { rgb3(bg, 1.0) };
+            let color = if bg == dfg { pal.fg } else { rgb3(pal.swap(bg), 1.0) };
             window.paint_quad(fill(Bounds::new(point(px(ox + cw * st as f32), px(py)), size(px(cw * (x - st) as f32), px(lh))), color));
         }
         // selection (engine-owned; a range ending on a wide char covers its spacer too)
@@ -3236,8 +3470,59 @@ fn escaped_path(p: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{caps_text, escaped_path, key_msg, link_span, not_running_detail, on_update_notice, other_text};
+    #[cfg(unix)]
+    use super::there_editor_command;
+    use super::{caps_text, editor_command, escaped_path, key_msg, link_span, not_running_detail, on_update_notice, other_text};
     use serde_json::json;
+
+    #[test]
+    fn this_macs_editor_opens_at_the_line() {
+        assert_eq!(editor_command("/usr/local/bin/code -w", "/a b/it's.rs", Some(7)), r"/usr/local/bin/code -w -g '/a b/it'\''s.rs:7'");
+        assert_eq!(editor_command("nvim", "/a b.rs", Some(7)), "nvim +7 '/a b.rs'");
+        assert_eq!(editor_command("nvim", "/a b.rs", None), "nvim '/a b.rs'");
+    }
+
+    /// Runs the script another Mac's login shell would, with fake editors that print their args.
+    /// Unix only: the fake editors are sh scripts, and the shells zsh and bash.
+    #[cfg(unix)]
+    #[test]
+    fn another_macs_file_opens_in_that_macs_editor_or_vi() {
+        let dir = std::env::temp_dir().join(format!("midna-there-editor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for bin in ["vi", "code", "hx"] {
+            let p = dir.join(bin);
+            std::fs::write(&p, format!("#!/bin/sh\nprintf '{bin}'; for a in \"$@\"; do printf ' [%s]' \"$a\"; done\n")).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = "/a b/it's $x.rs";
+        let run = |shell: &str, visual: Option<&str>, editor: Option<&str>, line: Option<u32>| {
+            let mut c = std::process::Command::new(shell);
+            c.args(["-f", "-c", &there_editor_command(path, line)]).env("PATH", format!("{}:/usr/bin:/bin", dir.display()));
+            c.env_remove("VISUAL").env_remove("EDITOR");
+            visual.map(|v| c.env("VISUAL", v));
+            editor.map(|v| c.env("EDITOR", v));
+            String::from_utf8(c.output().unwrap().stdout).unwrap()
+        };
+        for shell in ["/bin/zsh", "/bin/bash"].into_iter().filter(|s| std::path::Path::new(s).exists()) {
+            assert_eq!(run(shell, None, None, Some(3)), "vi [+3] [/a b/it's $x.rs]", "{shell}: no editor there opens vi");
+            assert_eq!(run(shell, None, Some("hx"), None), "hx [/a b/it's $x.rs]", "{shell}");
+            assert_eq!(run(shell, Some("code -w"), Some("hx"), Some(3)), "code [-w] [-g] [/a b/it's $x.rs:3]", "{shell}: $VISUAL first");
+            assert_eq!(run(shell, None, Some(&format!("{}/code", dir.display())), Some(3)), "code [-g] [/a b/it's $x.rs:3]", "{shell}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_picked_theme_repaints_that_macs_ansi_colors() {
+        let (from, to) = (midna_proto::themes::builtin("twilight").unwrap().ansi, midna_proto::themes::builtin("gruvbox").unwrap().ansi);
+        let pal = super::Palette { fg: gpui_kit::white(), cursor: gpui_kit::white(), selection: gpui_kit::white(), ansi: Some((from, to)) };
+        assert_eq!(pal.swap(from[1]), to[1], "that Mac's red is the picked theme's red");
+        assert_eq!(pal.swap(from[12]), to[12]);
+        assert_eq!(pal.swap([1, 2, 3]), [1, 2, 3], "a 24-bit color a program chose stays");
+        let none = super::Palette { ansi: None, ..pal };
+        assert_eq!(none.swap(from[1]), from[1], "no pick: as the engine painted it");
+    }
 
     #[test]
     fn dropped_paths_are_one_shell_word() {
@@ -3249,7 +3534,7 @@ mod tests {
 
     #[test]
     fn not_running_says_why_and_where() {
-        let home = std::env::var("HOME").unwrap();
+        let home = midna_proto::paths::home_var().unwrap();
         let shell = json!({"kind": "shell", "cwd": home, "status": {"state": "exited", "reason": "daemon restarted"}});
         assert_eq!(not_running_detail(&shell), "Its shell ended when midnad restarted. Restart it for a fresh shell in ~.");
         let agent = json!({"kind": "agent", "cwd": "/tmp/x", "status": {"state": "exited", "exit_code": 2}});

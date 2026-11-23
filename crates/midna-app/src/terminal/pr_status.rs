@@ -4,7 +4,8 @@
 //! cells are blank, or as a smaller badge over the link's top-right corner when they aren't. The state comes from the link preview's `gh pr view`, which shares its cache;
 //! merged and closed pull requests are asked again less often, as they rarely change.
 //! GitHub Actions run links get the same, from `gh run view`: asked often while the run is
-//! queued or running, rarely once it's done. `terminal.pr_status` turns both off.
+//! queued or running, rarely once it's done. Issue links too, from `gh issue view`: open or
+//! closed. `terminal.pr_status` turns them all off.
 use super::link_preview;
 use super::{LINE_H, PAD_X, PAD_Y, TerminalView};
 use crate::frame::{F_SPACER, RowData};
@@ -35,6 +36,9 @@ pub(super) enum State {
     Cancelled,
     Skipped,
     Approval,
+    // an issue's
+    IssueOpen,
+    IssueClosed,
 }
 
 impl State {
@@ -51,6 +55,8 @@ impl State {
             "CANCELLED" => State::Cancelled,
             "SKIPPED" => State::Skipped,
             "APPROVAL" => State::Approval,
+            "ISSUE_OPEN" => State::IssueOpen,
+            "ISSUE_CLOSED" => State::IssueClosed,
             _ => return None,
         })
     }
@@ -58,9 +64,9 @@ impl State {
     /// The colors of the preview card's state pill.
     pub(super) fn color(self, t: &Theme) -> Hsla {
         match self {
-            State::Open | State::Passed => t.ok,
+            State::Open | State::Passed | State::IssueOpen => t.ok,
             State::Draft | State::Queued | State::Cancelled | State::Skipped => t.dim,
-            State::Merged => t.accent,
+            State::Merged | State::IssueClosed => t.accent,
             State::Closed | State::Failed => t.err,
             State::Running => t.work,
             State::Approval => t.need,
@@ -70,9 +76,9 @@ impl State {
     /// How long it's trusted before it's asked again.
     fn ttl(self) -> Duration {
         match self {
-            State::Merged | State::Closed | State::Passed | State::Failed | State::Cancelled | State::Skipped => DONE_TTL,
+            State::Merged | State::Closed | State::Passed | State::Failed | State::Cancelled | State::Skipped | State::IssueClosed => DONE_TTL,
             State::Queued | State::Running | State::Approval => RUN_TTL,
-            State::Open | State::Draft => LIVE_TTL,
+            State::Open | State::Draft | State::IssueOpen => LIVE_TTL,
         }
     }
 
@@ -98,15 +104,17 @@ impl State {
             State::Failed => Icon::RunFailed,
             State::Cancelled | State::Skipped => Icon::RunStopped,
             State::Approval => Icon::RunWaiting,
+            State::IssueOpen => Icon::Issue,
+            State::IssueClosed => Icon::IssueClosed,
         }
     }
 }
 
-/// A pull request or workflow run link on screen.
+/// A pull request, issue or workflow run link on screen.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Found {
-    /// `https://github.com/<owner>/<repo>/pull/<n>` or `…/actions/runs/<id>`, whatever page of
-    /// it the link was.
+    /// `https://github.com/<owner>/<repo>/pull/<n>`, `…/issues/<n>` or `…/actions/runs/<id>`,
+    /// whatever page of it the link was.
     pub url: String,
     /// The cells it covers, as (row, first col, last col): more than one when it wraps.
     pub spans: Vec<(u16, u16, u16)>,
@@ -130,7 +138,7 @@ fn blank(row: &RowData, x: usize) -> bool {
     row.cells.get(x).is_some_and(|c| (c.ch == ' ' || c.ch == '\0') && c.flags & F_SPACER == 0)
 }
 
-/// The pull request and workflow run links on screen; a soft-wrapped line is read as one.
+/// The pull request, issue and workflow run links on screen; a soft-wrapped line is read as one.
 pub(super) fn find(grid: &[RowData]) -> Vec<Found> {
     let mut out = vec![];
     let mut y = 0;
@@ -179,68 +187,83 @@ pub(super) fn find(grid: &[RowData]) -> Vec<Found> {
     out
 }
 
+/// A link as read on one Mac: this one (None) or another a window drives (its fingerprint).
+/// Each asks its own `gh`, so the same link can read differently on each.
+type Key = (Option<String>, String);
+
 /// Each link's last known state (`None`: not one `gh` could read), when it was asked,
 /// and whether an ask is out now.
-static STATES: LazyLock<Mutex<HashMap<String, (Instant, Option<State>, bool)>>> = LazyLock::new(Default::default);
+static STATES: LazyLock<Mutex<HashMap<Key, (Instant, Option<State>, bool)>>> = LazyLock::new(Default::default);
 
-fn known(url: &str) -> Option<State> {
-    STATES.lock().ok()?.get(url)?.1
+fn known(mac: &Option<String>, url: &str) -> Option<State> {
+    STATES.lock().ok()?.get(&(mac.clone(), url.to_string()))?.1
 }
 
-/// A link's state changed (`links.stale`): forget the card's copy and make its color due an ask,
-/// keeping the old one on screen until the answer comes. Terminals showing it ask on their next tick.
+/// A link's state changed (`links.stale`): forget the card's copy and make its color due an ask
+/// on every Mac that read it, keeping the old one on screen until the answer comes. Terminals
+/// showing it ask on their next tick.
 pub(crate) fn stale(url: &str) {
     link_preview::forget(url);
     let key = link_preview::github_canonical(url).unwrap_or_else(|| url.to_string());
-    if let Ok(mut m) = STATES.lock()
-        && let Some(e) = m.get_mut(&key)
-    {
+    if let Ok(mut m) = STATES.lock() {
         match Instant::now().checked_sub(DONE_TTL) {
-            Some(past) => e.0 = past,
-            None => {
-                m.remove(&key);
-            }
+            Some(past) => m.iter_mut().filter(|(k, _)| k.1 == key).for_each(|(_, e)| e.0 = past),
+            None => m.retain(|k, _| k.1 != key),
         }
     }
 }
 
-/// Marks the ones due an ask as asked, and returns them.
-fn due(urls: impl Iterator<Item = String>) -> Vec<String> {
+/// Marks the ones due an ask on `mac` as asked, and returns them.
+fn due(mac: &Option<String>, urls: impl Iterator<Item = String>) -> Vec<String> {
     let Ok(mut m) = STATES.lock() else { return vec![] };
     let mut out = vec![];
     for url in urls {
-        let stale = match m.get(&url) {
+        let key = (mac.clone(), url);
+        let stale = match m.get(&key) {
             None => true,
             Some((_, _, true)) => false,
             Some((at, s, _)) => at.elapsed() >= s.map_or(LIVE_TTL, State::ttl),
         };
-        if stale && !out.contains(&url) {
-            let prev = m.get(&url).and_then(|e| e.1);
-            m.insert(url.clone(), (Instant::now(), prev, true));
-            out.push(url);
+        if stale && !out.contains(&key.1) {
+            let prev = m.get(&key).and_then(|e| e.1);
+            m.insert(key.clone(), (Instant::now(), prev, true));
+            out.push(key.1);
         }
     }
     out
 }
 
 impl TerminalView {
-    /// After a frame, and every few seconds while any are on screen: find the pull request and run
-    /// links on screen and ask for states not known yet or gone stale.
+    /// After a frame, and every few seconds while any are on screen: find the pull request, issue
+    /// and run links on screen and ask for states not known yet or gone stale, on the Mac the terminal is
+    /// on (another Mac's window asks that Mac's `gh`, as its hover card does).
     pub(super) fn scan_prs(&mut self, cx: &mut Context<Self>) {
-        self.prs = if link_preview::pr_status_on(cx) { find(&self.grid) } else { vec![] };
+        self.prs = if link_preview::pr_status_on(&*self.backend, cx) { find(&self.grid) } else { vec![] };
+        let there = self.there();
+        let mac = there.as_deref().and_then(crate::backend::mac_id);
         // before `due` stamps them, so only a `stale` mark lands earlier
         let asked = Instant::now();
-        for url in due(self.prs.iter().map(|f| f.url.clone())) {
+        for url in due(&mac, self.prs.iter().map(|f| f.url.clone())) {
+            let there = there.clone();
+            let key = (mac.clone(), url.clone());
             cx.spawn(async move |this, cx| {
-                let u = url.clone();
                 let state = cx
                     .background_executor()
-                    .spawn(async move { if link_preview::github_pr(&u).is_some() { link_preview::pr_state(&u) } else { link_preview::run_link_state(&u).map(str::to_string) } })
+                    .spawn(async move {
+                        let there = there.as_deref();
+                        if link_preview::github_pr(&url).is_some() {
+                            link_preview::pr_state(&url, there)
+                        } else if link_preview::github_issue(&url).is_some() {
+                            link_preview::issue_state(&url, there).map(str::to_string)
+                        } else {
+                            link_preview::run_link_state(&url, there).map(str::to_string)
+                        }
+                    })
                     .await;
                 if let Ok(mut m) = STATES.lock() {
                     // marked stale while out: the answer may be from before the change, so it's due again
-                    let at = m.get(&url).filter(|e| e.0 < asked).map_or_else(Instant::now, |e| e.0);
-                    m.insert(url, (at, state.as_deref().and_then(State::parse), false));
+                    let at = m.get(&key).filter(|e| e.0 < asked).map_or_else(Instant::now, |e| e.0);
+                    m.insert(key, (at, state.as_deref().and_then(State::parse), false));
                 }
                 let _ = this.update(cx, |_, cx| cx.notify());
             })
@@ -250,10 +273,11 @@ impl TerminalView {
 
     /// What to paint: the links whose state is known, with its color.
     pub(super) fn pr_marks(&self, t: &Theme, cx: &App) -> Vec<Mark> {
-        if !link_preview::pr_status_on(cx) {
+        if !link_preview::pr_status_on(&*self.backend, cx) {
             return vec![];
         }
-        self.prs.iter().filter_map(|f| known(&f.url).map(|s| Mark { spans: f.spans.clone(), icon: f.icon, state: s, color: s.color(t), bg: t.term })).collect()
+        let mac = crate::backend::mac_id(&*self.backend);
+        self.prs.iter().filter_map(|f| known(&mac, &f.url).map(|s| Mark { spans: f.spans.clone(), icon: f.icon, state: s, color: s.color(t), bg: t.term })).collect()
     }
 }
 
@@ -355,20 +379,51 @@ mod tests {
         assert_eq!(f[0].url, "https://github.com/a/b/pull/12");
         assert_eq!(f[0].spans, vec![(0, 2, 22), (1, 0, 8)]);
         assert_eq!(f[0].icon, IconAt::After(1, 10));
-        let g = [row("https://github.com/a/b/issues/3 https://github.com/a/b", 80, false)];
-        assert!(find(&g).is_empty());
+        let g = [row("https://github.com/a/b/issues/3#issuecomment-9 https://github.com/a/b", 80, false)];
+        let f = find(&g);
+        assert_eq!(f.len(), 1, "the issue, not the repo");
+        assert_eq!(f[0].url, "https://github.com/a/b/issues/3");
+        assert_eq!(f[0].spans, vec![(0, 0, 45)]);
+    }
+
+    #[test]
+    fn issue_states_read_apart_from_pull_requests() {
+        assert_eq!(State::parse("ISSUE_OPEN"), Some(State::IssueOpen));
+        assert_eq!(State::parse("ISSUE_CLOSED"), Some(State::IssueClosed));
+        // a closed issue is done, not stopped: not struck through like a closed pull request
+        assert!(!State::IssueClosed.struck() && State::Closed.struck());
+        assert_eq!(State::IssueClosed.ttl(), super::DONE_TTL);
     }
 
     #[test]
     fn a_stale_link_is_due_again_and_keeps_its_state() {
         let url = "https://github.com/stale-test/b/pull/41";
-        assert_eq!(due([url.to_string()].into_iter()), vec![url.to_string()]);
-        super::STATES.lock().unwrap().insert(url.into(), (std::time::Instant::now(), Some(State::Open), false));
-        assert!(due([url.to_string()].into_iter()).is_empty());
+        let here = None;
+        assert_eq!(due(&here, [url.to_string()].into_iter()), vec![url.to_string()]);
+        super::STATES.lock().unwrap().insert((None, url.into()), (std::time::Instant::now(), Some(State::Open), false));
+        assert!(due(&here, [url.to_string()].into_iter()).is_empty());
         // any page of it counts
         stale("https://github.com/stale-test/b/pull/41/files");
-        assert_eq!(known(url), Some(State::Open));
-        assert_eq!(due([url.to_string()].into_iter()), vec![url.to_string()]);
+        assert_eq!(known(&here, url), Some(State::Open));
+        assert_eq!(due(&here, [url.to_string()].into_iter()), vec![url.to_string()]);
+    }
+
+    #[test]
+    fn each_mac_reads_a_link_on_its_own() {
+        let url = "https://github.com/each-mac-test/b/pull/9";
+        let (here, there) = (None, Some("fp-bravo".to_string()));
+        assert_eq!(due(&here, [url.to_string()].into_iter()), vec![url.to_string()]);
+        super::STATES.lock().unwrap().insert((None, url.into()), (std::time::Instant::now(), Some(State::Merged), false));
+        // this Mac's answer is never the other Mac's color: it asks its own gh
+        assert_eq!(known(&there, url), None);
+        assert_eq!(due(&there, [url.to_string()].into_iter()), vec![url.to_string()]);
+        super::STATES.lock().unwrap().insert((there.clone(), url.into()), (std::time::Instant::now(), Some(State::Open), false));
+        assert_eq!(known(&here, url), Some(State::Merged));
+        assert_eq!(known(&there, url), Some(State::Open));
+        // a change makes it due again on both
+        stale(url);
+        assert_eq!(due(&here, [url.to_string()].into_iter()), vec![url.to_string()]);
+        assert_eq!(due(&there, [url.to_string()].into_iter()), vec![url.to_string()]);
     }
 
     #[test]

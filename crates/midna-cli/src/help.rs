@@ -32,7 +32,7 @@ pub static VERBS: &[Verb] = &[
         summary: "print the bundled agent guide (SKILL.md) or one of its topics",
         details: "Prints the guide's core: when to use which verb, attention etiquette, what is human only, and\n\
                   never routing around a denial. It lists its topics, and `midna skill <topic>` prints one:\n\
-                  triggers, keep-awake, load, secrets, queue, terminals, links. In a midna terminal the core is\n\
+                  triggers, keep-awake, load, secrets, queue, terminals, links, nearby. In a midna terminal the core is\n\
                   at $MIDNA_SKILL and each topic's file sits beside it.\n\
                   `--path` prints that path instead.",
         methods: &[],
@@ -479,7 +479,8 @@ pub static VERBS: &[Verb] = &[
         usage: "approve <needs-you-id> [--scope once|session|always|<N>m] [--deny]\n       approve <needs-you-id> --done | --restart",
         summary: "answer a needs-you item (usually the human's job)",
         details: "Agents may approve only their own session's requests, and only when the human turned on\n\
-                  approve.from_cli. --done marks a blocked item handled; --restart restarts a failed terminal.\n\
+                  approve.from_cli. --done marks a blocked item handled; an agent clears an item it raised\n\
+                  itself (note, blocked) with --done. --restart restarts a failed terminal.\n\
                   Approvals of human-only actions can only be answered by the human.",
         methods: &["needs_you.resolve"],
     },
@@ -515,18 +516,19 @@ pub static VERBS: &[Verb] = &[
                 [--label L] (--agent claude|codex --prompt TEMPLATE [--permission-mode M] [--allow-tool T]...\n            \
                 | --run CMD [--background | --headless [--timeout 30m]] | --attention MSG)\n            \
                 [--project P] [--hook-id N] [--session-name TEMPLATE]\n       \
-                triggers add --name N --event hook.<Hook>|<midna event kind>|idle|schedule [--source local]\n            \
+                triggers add --name N --event hook.<Hook>|<midna event kind>|stream.<name>.<kind>|idle|schedule [--source local]\n            \
                 [--session ID] [--in-project P] [--for-agent claude|codex] [--idle-for 55m] [--cron '0 9 * * mon-fri']\n            \
                 [--between 13:00-17:00] [--starts '2026-10-06 13:00'] [--ends 2026-10-31] [--max-runs N] [--wake]\n            \
                 [--match path=glob]...\n            \
                 (--send TEXT [--send TEXT | --send-no-enter TEXT]... | --set-status LABEL --color C --base B\n             \
                 [--clear-on prompt|turn|status|never] [--icon I] | --clear-status | --notify TITLE [--notify-body B] [--notify-kind K] [--notify-open URL] [--notify-id ID] [--silent]\n             \
                 | --attention MSG | --run CMD --project P [--background | --headless [--timeout 30m]])\n            \
-                [--cooldown 60s] [--enable]\n       \
+                [--to NAME|ID] [--cooldown 60s|0] [--enable]\n       \
                 triggers add|update … [--action-json '<TriggerAction>'] [--filter-json '<TriggerFilter>']\n       \
                 triggers update <id> [same flags] | enable <id> | disable <id> | remove <id>\n       \
                 triggers set-secret <id>   (human only; reads stdin)\n       \
-                triggers test <id> [--payload FILE|-|JSON] [--event E] [--session ID]",
+                triggers test <id> [--payload FILE|-|JSON] [--event E] [--session ID]\n       \
+                triggers test <id> --stream NAME --kind KIND [--id ID] [--data JSON|@file|-]",
         summary: "triggers: GitHub/Bitbucket webhooks, or local agent hooks / midna events / idle terminals / schedules, that act",
         details: "Webhook triggers: agents draft freely; they start as needs_secret. Only the human pastes the signing\n\
                   secret and enables one (`enable` from an agent asks the human). Anyone may pause.\n\
@@ -542,11 +544,12 @@ pub static VERBS: &[Verb] = &[
                   update, alone they change the current agent; an empty value clears one. --prompt TEMPLATE alone\n\
                   replaces the current agent's prompt and keeps the rest.\n\
                   \n\
-                  Local triggers (source local; inferred for hook.*, agent.*, session.*, needs_you.*, idle, schedule, or any\n\
-                  local-only flag) fire on this Mac and act on the terminal that fired. Agents may add, enable\n\
+                  Local triggers (source local; inferred for hook.*, agent.*, session.*, needs_you.*, stream.*, idle, schedule,\n\
+                  or any local-only flag) fire on this Mac and act on the terminal that fired. Agents may add, enable\n\
                   (--enable) and disable them when the human asked for one. --send steps run in order, each waiting\n\
                   until the agent is ready. --match path=glob (repeatable) matches the hook payload / event data,\n\
-                  case-insensitive; an empty glob removes the key on update; an empty value clears a filter flag.\n\
+                  case-insensitive; the same path twice needs both globs, in any order. An empty glob removes the key\n\
+                  on update; an empty value clears a filter flag.\n\
                   Durations: 90s, 55m, 1h30m; a bare number is minutes for --idle-for, seconds for --cooldown.\n\
                   --cron (implies --event schedule): minute hour day-of-month month day-of-week in local time, or\n\
                   @hourly/@daily/@weekly/@monthly/@yearly, or @every 55m for an interval cron can't say (*/55 is\n\
@@ -557,6 +560,14 @@ pub static VERBS: &[Verb] = &[
                   and --ends (local `2026-10-06 13:00` or a date), --max-runs N (1 = once; a new limit counts again).\n\
                   --wake wakes a sleeping Mac for each run, even outside the keep-awake hours (a nightly restart),\n\
                   and keeps it awake while the work goes on; needs `midna keep-awake wake on` (--no-wake on update).\n\
+                  stream.<name>.<kind> (globs: stream.slack.*) fires on what a program hands midna with `midna stream\n\
+                  publish`; such an event has no terminal, and its envelope is {{stream.name|kind|id}}. `test\n\
+                  --stream slack --kind message --data JSON` dry-runs one without publishing it; `midna stream events\n\
+                  <name> --replay SEQ|ID` runs a recorded one through the triggers again.\n\
+                  --to NAME|ID makes --send, --set-status, --clear-status, --notify and --attention act on that\n\
+                  terminal instead of the one that fired (for stream and schedule events, which have none): an\n\
+                  exact name, else a session id, looked up when it fires (in --in-project's project when set; of\n\
+                  several, the most recently active). No such terminal: nothing happens; the delivery says why.\n\
                   Templates: {{last_prompt}} {{event}} {{session.id|name|project_id|agent|status}} {{data.<path>}} or {{<path>}}.\n\
                   Example: triggers add --name \"Auto-compact\" --event agent.prompt_blocked \\\n\
                   \x20 --match 'message=*Compact first*' --send /compact --send '{{last_prompt}}' --enable\n\
@@ -622,6 +633,47 @@ pub static VERBS: &[Verb] = &[
         details: "--follow streams live events. Kinds: session.*, needs_you.*, rule.*, trigger.*, settings.changed,\n\
                   agent.*, window.command, daemon.*, audit.",
         methods: &["events.list", "events.subscribe"],
+    },
+    Verb {
+        name: "stream",
+        aliases: &["streams"],
+        usage: "stream publish <name> <kind> [--id ID] [--data JSON|@file|-]\n       \
+                stream events <name> [--limit N] [--replay SEQ|ID]\n       \
+                stream add <name> [--project P] [--secret NAME]... [--cwd DIR] -- <command...>\n       \
+                stream update <name> [--project P] [--secret NAME]... [--no-secrets] [--cwd DIR] [-- <command...>]\n       \
+                stream list | pause <name> | resume <name> | restart <name> | remove <name>",
+        summary: "hand midna an event from a program on this Mac, for local triggers",
+        details: "Logs event `stream.<name>.<kind>` with the JSON object as its data (at most 64 KB; --data left out\n\
+                  reads stdin, `{}` from a terminal). Local triggers react to it like any midna event:\n\
+                  `midna triggers add --event 'stream.slack.*' --match text='*failed*' --notify '{{data.text}}'`.\n\
+                  name: a-z 0-9 - (1-32); kind: a-z 0-9 _ . - (1-64); --id: yours for the event ({{stream.id}}).\n\
+                  Local only: it goes over midna's socket; nothing listens on the network.\n\
+                  Per stream: an --id taken in the last 24 hours is a duplicate (not published again); over 60\n\
+                  events a minute (bursts of 20), or with 1000 events waiting, a publish is dropped (exit 1); a\n\
+                  trigger fires on every event unless it sets --cooldown (then at most once per it, per stream).\n\
+                  events  the stream's last 200 publishes, newest first, with what midna did with each:\n\
+                  \x20       accepted, duplicate, rate_limited, too_large, busy or refused.\n\
+                  --replay  run a recorded event (its seq or --id) through the local triggers again, past dedupe\n\
+                  \x20         and cooldown; each firing is a delivery marked replayed. Events a trigger caused\n\
+                  \x20         still fire nothing. Test a trigger first: `midna triggers test <id> --stream …`.\n\
+                  add     midnad runs <command> (in --cwd, else the project's folder, else here) and keeps it\n\
+                  \x20       running: each stdout line {{\"kind\":\"…\",\"id\":\"…\",\"data\":{{…}}}} is published like\n\
+                  \x20       `stream publish`. Other lines and stderr go to $MIDNA_HOME/streams/<name>.log (1 MB, one\n\
+                  \x20       older file kept). On exit it starts again after 1s, doubling to 5 minutes (back to 1s after\n\
+                  \x20       10 minutes up); every stream starts again when midnad starts and after the Mac wakes.\n\
+                  \x20       --secret NAME (repeatable): the stored secret goes in its environment as $NAME, resolved\n\
+                  \x20       like `secret exec` (--project first); only the names are saved, and the values are masked\n\
+                  \x20       in what it prints. An agent's stream waits, paused, for the human's approval: one\n\
+                  \x20       needs-you naming its command, cwd, project and secrets (`midna approve <id>` runs it).\n\
+                  update  change its command (after --), --cwd, --project or secrets (--secret replaces them,\n\
+                  \x20       --no-secrets drops them); a running one starts again with them. An agent's change pauses\n\
+                  \x20       it and asks the human again, even if it was approved before.\n\
+                  list    each stream's state (starting, running, backoff, failing, paused, awaiting_approval), pid,\n\
+                  \x20       restarts, last exit and last event.\n\
+                  pause/resume/restart/remove  stop it and keep it stopped / start it / start it again now / stop\n\
+                  \x20       and forget it. Stopping one stops everything it started. Agents may pause, resume an\n\
+                  \x20       approved stream, restart, and remove a paused one; removing a running one asks the human.",
+        methods: &["streams.publish", "streams.events", "trigger.replay", "streams.add", "streams.update", "streams.list", "streams.set_enabled", "streams.restart", "streams.remove"],
     },
     Verb {
         name: "insights",
@@ -702,6 +754,127 @@ pub static VERBS: &[Verb] = &[
                   midnad removes idle ones by itself after worktrees.auto_clean_hours (24 by default; 0 = never).\n\
                   A Claude Code lock (claude agent … (pid N)) counts only while that pid runs.",
         methods: &["worktrees.list", "worktrees.clean"],
+    },
+    Verb {
+        name: "peers",
+        aliases: &["nearby"],
+        usage: "peers [list] | sessions <name|id> | pair <name|id> | confirm [<pairing>] [--as contact|my-device [--allow-drive]] [--no]\n\
+                \x20     | forget <name|id> | tier <name|id> --as contact|my-device | auto-accept <name|id> <kinds|all> on|off\n\
+                \x20     | agent-send <name|id> <kinds|all> on|off | drive <name|id> on|off\n\
+                \x20     | visibility off|paired|everyone | name [<name>]",
+        summary: "other Midnas on the same network (Nearby), and who can find this Mac",
+        details: "list        this Mac's name, device id and visibility, then the Midnas it can see over Bonjour.\n\
+                  \x20           A device id (SHA-256 of the device's key) is what tells devices apart; names can repeat.\n\
+                  sessions    the agent terminals open on one of your own devices (kept as my-device): id, name,\n\
+                  \x20           agent, project, busy or idle. Names and ids only, never what is on screen. Ask one\n\
+                  \x20           with share send agent-ask.\n\
+                  visibility  setting nearby.visibility (human only; an agent's change waits for the human):\n\
+                  \x20           off = no Bonjour at all; paired (default) = look for others, shown only to paired\n\
+                  \x20           devices; everyone = every Midna nearby sees this Mac, for 10 minutes, then paired.\n\
+                  name        setting nearby.name, the name others see; empty = the Mac's computer name.\n\
+                  pair        ask a nearby Midna (visible to everyone) to pair. Both Macs show the same 6-digit code;\n\
+                  \x20           both people compare it and confirm. A different code means someone is in the middle.\n\
+                  confirm     (human only) accept a pairing whose codes match, keeping the device as a contact\n\
+                  \x20           (default) or --as my-device (add --allow-drive to let it drive this Mac too); --no\n\
+                  \x20           declines. Each pairing also raises a needs-you approval that confirms as a contact.\n\
+                  \x20           Agents can start a pairing but never confirm one.\n\
+                  tier        (human only) peers tier <name or id> --as contact|my-device: change how a paired\n\
+                  \x20           device is kept. Keeping it as a contact turns off its auto-accept, agent-send and driving.\n\
+                  auto-accept (human only) peers auto-accept <name or id> message,file on|off (or all): shares of\n\
+                  \x20           those kinds from one of your own devices are accepted without asking. All are off by\n\
+                  \x20           default, and a contact can't have any. Of Midna's own things only summaries and themes\n\
+                  \x20           are; rules, triggers, settings and queued prompts always ask. Agent sessions always ask;\n\
+                  \x20           agent starts (agent-start) and asks (agent-ask) can be auto-accepted.\n\
+                  agent-send  (human only) peers agent-send <name or id> message,file on|off (or all): agents\n\
+                  \x20           here send one of your own devices those kinds without asking you first (kinds as for\n\
+                  \x20           auto-accept, plus agent and file-request). All are off by default, and a contact can't\n\
+                  \x20           have any. A rule that denies or asks still applies. Agents are refused: they can't ask.\n\
+                  drive       (human only) peers drive <name or id> on|off: let one of your own devices drive\n\
+                  \x20           this Mac (open, use and approve terminals and agents here), or stop it. Off by\n\
+                  \x20           default; a contact can't. Turning it off cuts its drive links at once. Agents are\n\
+                  \x20           refused: they can't even ask.\n\
+                  forget      (human only) unpair: the device can't connect or send anything until paired again.\n\
+                  A device that isn't paired can only ask to pair; a nearby one using a paired device's name with\n\
+                  another key is flagged. Until macOS has Local Network access for Midna (the prompt is up, or\n\
+                  it's off in System Settings), peers shows waiting or denied, and pair and share send keep trying\n\
+                  for up to a minute while it's waiting. Events peers.appeared, peers.left, peers.pairing,\n\
+                  peers.pairing_ended, peers.paired, peers.changed, peers.drive, peers.forgotten and peers.local_network (midna\n\
+                  events --kind peers.) follow all of this.",
+        methods: &["peers.list", "peers.sessions", "peers.pair", "peers.confirm", "peers.set_tier", "peers.set_auto_accept", "peers.set_agent_send", "peers.set_drive", "peers.forget"],
+    },
+    Verb {
+        name: "share",
+        aliases: &[],
+        usage: "share send <name|id> <text…> | share send <name|id> [--title T] < file | share send <name|id> --link <url> [--title T]\n\
+                \x20     | share send <name|id> <path> | share send <name|id> --file <path>   [--snippet | --message]\n\
+                \x20     | share send <name|id> --tab [--session <terminal>] [--project <its name there>] [--title T]\n\
+                \x20     | share send <name|id> --agent [--session <terminal>] [--title T]\n\
+                \x20     | share send <name|id> --object <summary|rules|triggers|theme|settings|queue> [ids…]\n\
+                \x20     | share send agent-start --to <name|id> --prompt <text> [--agent claude|codex] [--project <its name there> | --session <terminal>]\n\
+                \x20         [--title T] [--notes <file>|-] [--wait [--timeout 30m]]\n\
+                \x20     | share send agent-ask --to <name|id> --session <name|id there> --prompt <text> [--wait [--timeout 30m]]\n\
+                \x20     | share answer <id> [--wait] [--timeout 30m]",
+        summary: "offer a paired device a message, a snippet, a link, a file or folder, a terminal tab, an agent session, or midna's own things, or start or ask an agent there",
+        details: "Words are a message (a notification on their Mac); text on stdin is a snippet (kept in their inbox,\n\
+                  pasted into a terminal they choose, never followed by Enter); --link offers an http(s) link they can\n\
+                  open or pin. A single word that names a file or folder (or --file <path>) offers it, with its size;\n\
+                  once they accept, their Mac fetches it from this one in chunks, checks each file's SHA-256, picks up\n\
+                  where it stopped if the connection drops, and saves it into their nearby.downloads folder (default\n\
+                  ~/Downloads/Midna; a folder keeps its tree, links in it are left out). Keep it in place until then.\n\
+                  --snippet / --message override the guess. --tab offers this terminal (or --session): its project,\n\
+                  folder and scrollback; on their Mac it opens as a new shell in their checkout of the same repo, under\n\
+                  your scrollback. Running programs stay here. --project <name> opens it in their project of that name\n\
+                  instead, wherever this terminal is; without --session that's a new, empty shell there. Only your own\n\
+                  devices take --project, and theirs refuses it at once when it has no project of that name.\n\
+                  --agent offers this agent terminal's conversation (or\n\
+                  --session's; Claude Code or Codex): the whole transcript as it is now. On their Mac it is put where\n\
+                  the agent looks, with your checkout and home paths changed to theirs, and resumed in a new agent\n\
+                  terminal in their checkout. The device must be paired and nearby now.\n\
+                  --object sends midna's own things: one summary (sm_…), rules (r_…), triggers (t_…), one custom theme,\n\
+                  settings (keys; none = every changed one that may leave this Mac) or queued prompts (q_…). Projects\n\
+                  travel by name; secrets, paths, trust and anything tied to one terminal never leave. Their Mac shows\n\
+                  what would change before anything applies: rules, triggers and human-only settings take the human's\n\
+                  ok, triggers arrive turned off, and queued prompts wait for `inbox accept <id> --into <terminal>`.\n\
+                  agent-start asks their Mac to start a new agent (Claude by default, or this terminal's agent) in its\n\
+                  checkout of this terminal's project (or --session's, or in its project named --project, from anywhere),\n\
+                  with --prompt (or words, or stdin) as its first\n\
+                  prompt; nothing runs until they accept. --notes <file> (or - for stdin) hands it notes too (your own\n\
+                  devices only): short ones go in the prompt; longer ones (up to 1 MiB) are fetched like a file once\n\
+                  they accept, saved in their Midna home (nearby/notes/<id>.md), and the prompt tells the agent where.\n\
+                  Their approval shows the notes' size and first lines. With --wait it waits for that agent's first turn to end and\n\
+                  prints its last message (cut to 4 KiB; exit 4 if --timeout runs out first; `share answer <id> --wait`\n\
+                  waits again). The answer also arrives in the inbox as a message in reply to it (share.answered).\n\
+                  agent-ask asks an agent terminal already open on one of your own devices (`peers sessions <device>`\n\
+                  lists them; --session takes an id or a name there). Once they accept, the prompt is queued in that\n\
+                  terminal and typed when its agent is idle; with --wait the end of that turn is the answer. A terminal\n\
+                  that isn't there (or isn't an agent) refuses it, or declines it with the reason if it went since.\n\
+                  Nothing a share carries types into, runs in or opens anything until a person on that Mac accepts it.\n\
+                  An agent's share asks the human here first (a needs-you approval showing what would leave) and waits.\n\
+                  Their answer comes back as share.accepted or share.declined (midna events --kind share.).",
+        methods: &["share.send", "share.answer"],
+    },
+    Verb {
+        name: "inbox",
+        aliases: &[],
+        usage: "inbox [list] [--in | --out | --waiting] [--limit N] | show <id> | accept <id> [--into <terminal>] [--pin] [--cwd <dir>]\n\
+                \x20     | decline <id> | reply <id> <text…>",
+        summary: "shares from and to paired devices",
+        details: "list     newest first, both directions; --waiting = offers waiting for you.\n\
+                  accept   (human only) a message is marked read; a snippet is pasted into --into <terminal> (never\n\
+                  \x20        followed by Enter; without --into it stays in the inbox, and accepting again pastes again);\n\
+                  \x20        a link opens in the browser, or --pin pins it to --into <terminal> (default this one);\n\
+                  \x20        a file or folder is fetched into nearby.downloads (accept again to retry one that failed);\n\
+                  \x20        a tab opens as a new shell in your checkout of its repo (or --cwd <dir>, else your home\n\
+                  \x20        folder) with their scrollback shown read-only above it; nothing runs. An agent session\n\
+                  \x20        is fetched and resumed in a new agent terminal there (or --cwd <dir>), idle until prompted.\n\
+                  \x20        An agent start opens a new agent terminal there (or --cwd <dir>) and gives it the prompt;\n\
+                  \x20        if the sender asked for its answer, its first turn's last message goes back to them.\n\
+                  decline  (human only) tell the sender no. Each offer also raises a needs-you approval: approving\n\
+                  \x20        accepts it (a link opens, a snippet stays in the inbox, a tab opens, an agent session resumes) and denying declines it.\n\
+                  reply    answer a message with a message. It leaves the message unread: only the human marks it read.\n\
+                  The inbox keeps the last 500 shares across restarts. Events share.offered, share.sent,\n\
+                  share.accepted, share.declined and share.progress (a file's transfer) follow it.",
+        methods: &["inbox.list", "share.accept", "share.decline"],
     },
     Verb {
         name: "keep-awake",
@@ -935,7 +1108,11 @@ mod tests {
         let call_only = [
             "session.resize", "session.scroll", "session.selection", "session.select_all", "session.link_at", "session.find",
             "stream.attach", "script.run", "script.click", "updates.report", "session.clear", "themes.report", "notify.respond",
-            "clock.sleeps", "session.answer_question", "session.close_hold", "links.served_by", "links.actions.approve",
+            "clock.sleeps", "session.answer_question", "session.close_hold", "links.served_by", "links.preview", "links.actions.approve", "links.patterns.approve",
+            // The app's own: only it may open or close a drive link.
+            "drive.open", "drive.close", "drive.list",
+            // Only the person driving from another Mac, through that Mac's app.
+            "session.send_image",
         ];
         for m in catalog() {
             assert!(covered.contains(m.name) || call_only.contains(&m.name), "no verb covers {}", m.name);

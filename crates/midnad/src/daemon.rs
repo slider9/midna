@@ -42,6 +42,8 @@ pub struct Config {
     pub codex_dir: PathBuf,
     /// Where macOS writes kernel panic reports (`panic.rs`). Tests point it inside their home.
     pub panic_dirs: Vec<PathBuf>,
+    /// Nearby's Bonjour service type and timings (`nearby/mod.rs`). Off in `for_home`.
+    pub nearby: crate::nearby::Setup,
 }
 
 impl Config {
@@ -61,6 +63,7 @@ impl Config {
             claude_dir: agent_dir("CLAUDE_CONFIG_DIR", ".claude"),
             codex_dir: agent_dir("CODEX_HOME", ".codex"),
             panic_dirs: crate::panic::report_dirs(),
+            nearby: crate::nearby::Setup::from_env(),
         }
     }
 
@@ -76,6 +79,7 @@ impl Config {
             claude_dir: home.join("agent-config/claude"),
             codex_dir: home.join("agent-config/codex"),
             panic_dirs: vec![home.join("diagnostic-reports")],
+            nearby: Default::default(),
             home,
         }
     }
@@ -139,6 +143,9 @@ pub struct AgentRt {
     pub hooked: bool,
     /// Cron calls between their `agent.hook` and `policy.request` (`crons.rs`).
     pub crons: Vec<crate::crons::Parked>,
+    /// The plan usage this agent process's status line last reported (`usage.rs`). Cleared when
+    /// the process starts or resumes, so only a drop within one process reads as a reset.
+    pub limits_seen: Option<RateLimits>,
 }
 
 /// What a caller blocked on an approval (`waiters`) is woken with.
@@ -153,6 +160,16 @@ pub struct Core {
     pub state: State,
     pub rt: HashMap<Id, RtHandle>,
     pub agents: HashMap<Id, AgentRt>,
+}
+
+impl Core {
+    /// Register a session's runtime, then let its reaper report the exit (it waits for this, so
+    /// an exit that comes first isn't dropped as one from an unknown runtime).
+    pub fn insert_rt(&mut self, sid: Id, mut rt: RtHandle) {
+        let gate = rt.take_reaper_gate();
+        self.rt.insert(sid, rt);
+        drop(gate);
+    }
 }
 
 pub struct Daemon {
@@ -197,6 +214,11 @@ pub struct Daemon {
     notify: Mutex<crate::notify::State>,
     /// Local triggers' worker and book-keeping (`local.rs`). Lock after `core`, never before it.
     pub local: crate::local::Runtime,
+    /// Stream intake: dedupe, rate limits, the intake queue and each publish's verdict
+    /// (`streams.rs`). Lock before `log`; never held with `core`.
+    pub streams: crate::streams::Intake,
+    /// The producers midnad runs for streams (`producers.rs`). Never held with `core` or `streams`.
+    pub producers: crate::producers::Producers,
     /// The queued-message sender's book-keeping (`queue.rs`). Never held together with `core`.
     pub queue: crate::queue::Runtime,
     /// Agents watched after a wake (`resume.rs`). Lock after `core`, never before it.
@@ -205,10 +227,14 @@ pub struct Daemon {
     pub clock: crate::clock::Clock,
     /// The keep-awake power assertion (`keep_awake.rs`). Lock after `core`, never before it.
     pub keep_awake: crate::keep_awake::Runtime,
+    /// Nearby's device identity and the peers its thread sees (`nearby/`). Lock after `core`.
+    pub nearby: crate::nearby::Runtime,
     /// The wakes midnad has asked macOS for (`wake.rs`). Lock after `core` and `keep_awake`.
     pub wake: crate::wake::Runtime,
     /// Load, CPU per terminal and paused terminals (`guard.rs`). Lock after `core`, never before it.
     pub guard: crate::guard::Runtime,
+    /// Agent terminals waiting for the Mac to calm down (`admit.rs`).
+    pub admit: crate::admit::Runtime,
     /// Worktrees seen in use (`worktrees.rs`). Never held together with `core`.
     pub worktrees: crate::worktrees::Runtime,
     /// What terminals touched, and cleanup runs (`cleanup.rs`). Never held together with `core`.
@@ -269,12 +295,16 @@ impl Daemon {
             summary: Default::default(),
             notify: Mutex::new(Default::default()),
             local: Default::default(),
+            streams: Default::default(),
+            producers: Default::default(),
             queue: Default::default(),
             resume: Default::default(),
             clock: crate::clock::Clock::open(Some(&cfg.home)),
             keep_awake: Default::default(),
+            nearby: Default::default(),
             wake: Default::default(),
             guard: Default::default(),
+            admit: Default::default(),
             worktrees: Default::default(),
             cleanup: Default::default(),
             runs: Default::default(),
@@ -417,8 +447,10 @@ impl Daemon {
             bulk_safe: false,
             approval: None,
             trigger_id: None,
+            stream: None,
             question: None,
             setting: None,
+            local_only: false,
         }
     }
 
@@ -434,6 +466,8 @@ impl Daemon {
         }
         self.answered.lock().unwrap_or_else(|e| e.into_inner()).record(&item.id, &resolution, &by);
         crate::trust::closed(self, &item, &resolution);
+        crate::nearby::pairing::needs_you_closed(self, &item, &resolution);
+        crate::nearby::share::needs_you_closed(self, &item, &resolution);
         self.mark_dirty();
         self.emit(
             kinds::NEEDS_YOU_RESOLVED,

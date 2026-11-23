@@ -44,6 +44,8 @@ pub enum EngineMsg {
 
 #[derive(Clone)]
 pub struct RtHandle {
+    /// Holds the reaper back until the handle is registered (`Core::insert_rt`).
+    reaper_gate: ReaperGate,
     pub tx: SyncSender<EngineMsg>,
     pub fd: Arc<PtyFd>,
     pub pid: i32,
@@ -56,7 +58,24 @@ pub struct RtHandle {
     pub kitty: Arc<AtomicU8>,
 }
 
+/// The reaper waits for this to drop before it reports the exit, so a child that exits at once
+/// isn't reported before its runtime is in `core.rt` (`on_exit` ignores an exit it can't match
+/// to a runtime, and the session would never be marked exited). A clone never holds it.
+pub struct ReaperGate(Option<std::sync::mpsc::Sender<()>>);
+
+impl Clone for ReaperGate {
+    fn clone(&self) -> Self {
+        ReaperGate(None)
+    }
+}
+
 impl RtHandle {
+    /// The gate that holds the reaper back: drop it once the handle is registered. Dropping the
+    /// handle drops it too.
+    pub fn take_reaper_gate(&mut self) -> ReaperGate {
+        ReaperGate(self.reaper_gate.0.take())
+    }
+
     pub fn write(&self, bytes: &[u8]) -> bool {
         self.fd.write_all(bytes)
     }
@@ -214,12 +233,29 @@ pub fn start_on(d: &Arc<Daemon>, mut l: Launch, snap: Option<crate::engine::Term
     (l.cols, l.rows) = clamp_size(l.cols, l.rows);
     let sp = pty::spawn(&l.argv, &l.cwd, &l.env, l.cols, l.rows)?;
     let pid = sp.pid;
-    let (m, cols, rows) = (sp.master.writer(), l.cols, l.rows);
+    let (cols, rows) = (l.cols, l.rows);
     let make: MakeEngine = match snap {
         // The caller launches at the snapshot's size: its VT is laid out for it.
-        Some(s) => Box::new(move || Engine::restored(&s, Some(m))),
-        None => Box::new(move || Engine::new(cols, rows, Some(m))),
+        Some(s) => Box::new(move |replies| Engine::restored(&s, Some(replies))),
+        None => Box::new(move |replies| Engine::new(cols, rows, Some(replies))),
     };
+    Ok(run(d, &l.sid, sp.master, pid, true, make, String::new()))
+}
+
+/// `start`, with `preface` on the screen before anything the new process prints (a tab sent
+/// from another Mac: its scrollback above a fresh shell). The engine takes it as output, so it
+/// must be text and plain SGR only: anything that asks the terminal a question would have its
+/// answer typed into the new process.
+pub fn start_with_preface(d: &Arc<Daemon>, mut l: Launch, preface: Vec<u8>) -> std::io::Result<RtHandle> {
+    (l.cols, l.rows) = clamp_size(l.cols, l.rows);
+    let sp = pty::spawn(&l.argv, &l.cwd, &l.env, l.cols, l.rows)?;
+    let pid = sp.pid;
+    let (cols, rows) = (l.cols, l.rows);
+    let make: MakeEngine = Box::new(move |replies| {
+        let mut e = Engine::new(cols, rows, Some(replies));
+        e.feed(&preface, crate::engine::now_ns());
+        e
+    });
     Ok(run(d, &l.sid, sp.master, pid, true, make, String::new()))
 }
 
@@ -231,12 +267,12 @@ pub fn adopt(d: &Arc<Daemon>, sid: &str, master: RawFd, pid: i32, alive: bool, s
     let snap = snap.clone();
     let title = snap.title.clone();
     let master = pty::Master::from_raw(master);
-    let w = master.writer();
-    run(d, sid, master, pid, alive, Box::new(move || Engine::restored(&snap, Some(w))), title)
+    run(d, sid, master, pid, alive, Box::new(move |replies| Engine::restored(&snap, Some(replies))), title)
 }
 
-/// Builds the engine on its own thread (libghostty's Terminal is !Send).
-type MakeEngine = Box<dyn FnOnce() -> Engine + Send>;
+/// Builds the engine on its own thread (libghostty's Terminal is !Send), given the session's
+/// input queue for its replies to the app.
+type MakeEngine = Box<dyn FnOnce(Sender<Vec<u8>>) -> Engine + Send>;
 
 fn run(d: &Arc<Daemon>, sid: &str, master: pty::Master, pid: i32, reap: bool, eng: MakeEngine, title: String) -> RtHandle {
     let fd = Arc::new(master);
@@ -244,12 +280,14 @@ fn run(d: &Arc<Daemon>, sid: &str, master: pty::Master, pid: i32, reap: bool, en
     let (tx, rx) = sync_channel::<EngineMsg>(64);
     let activity = Arc::new(AtomicI64::new(midna_proto::time::now_unix()));
     let kitty = Arc::new(AtomicU8::new(0));
-    let h = RtHandle { tx: tx.clone(), fd: fd.clone(), pid, generation, activity: activity.clone(), kitty: kitty.clone() };
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    let reaper_gate = ReaperGate(Some(gate_tx));
+    let h = RtHandle { reaper_gate, tx: tx.clone(), fd: fd.clone(), pid, generation, activity: activity.clone(), kitty: kitty.clone() };
     let weak = Arc::downgrade(d);
     engine_thread(sid.to_string(), generation, eng, title, fd.clone(), rx, weak.clone(), kitty);
     let drained = reader_thread(fd.clone(), tx, activity);
     if reap {
-        reaper_thread(sid.to_string(), generation, pid, fd, weak, drained);
+        reaper_thread(sid.to_string(), generation, pid, fd, weak, drained, gate_rx);
     }
     h
 }
@@ -320,7 +358,7 @@ fn reader_thread(fd: Arc<PtyFd>, tx: SyncSender<EngineMsg>, activity: Arc<Atomic
     done_rx
 }
 
-fn reaper_thread(sid: String, generation: u64, pid: i32, fd: Arc<PtyFd>, d: Weak<Daemon>, drained: Receiver<()>) {
+fn reaper_thread(sid: String, generation: u64, pid: i32, fd: Arc<PtyFd>, d: Weak<Daemon>, drained: Receiver<()>, gate: Receiver<()>) {
     let _ = std::thread::Builder::new().name("reaper".into()).spawn(move || {
         let (code, signal) = wait_exit(pid);
         // A pseudoconsole outlives its app: closing it ends the output, so the reader drains.
@@ -329,6 +367,8 @@ fn reaper_thread(sid: String, generation: u64, pid: i32, fd: Arc<PtyFd>, d: Weak
         // Let the last output reach the engine first (the exit handler reads the screen). A
         // background process still holding the PTY open keeps the reader going: don't wait long.
         let _ = drained.recv_timeout(std::time::Duration::from_millis(500));
+        // The caller may not have registered the runtime yet (a command that exits at once).
+        let _ = gate.recv();
         if let Some(d) = d.upgrade() {
             crate::rpc::session::on_exit(&d, &sid, generation, code, signal);
         }
@@ -391,10 +431,61 @@ fn kqueue_wait_exit(pid: i32) {
     }
 }
 
+/// Most frames a stream client may have in flight. Attaching grants one; the GUI asks for one
+/// more each time it applies a frame, and over a drive link it asks for a couple extra at attach
+/// so a frame doesn't wait a whole round trip for the one before it. The stream writer's queue
+/// holds this many (`stream.rs`).
+pub const MAX_CREDIT: u32 = 4;
+
 struct Client {
+    /// Dirty rows not sent yet, merged across frames built while the client had no credit.
     pending: Option<Frame>,
-    credit: bool,
+    /// Frames it asked for and hasn't been sent.
+    credit: u32,
     out: SyncSender<Frame>,
+}
+
+impl Client {
+    fn new(out: SyncSender<Frame>) -> Self {
+        Client { pending: None, credit: 1, out }
+    }
+
+    fn want(&mut self) {
+        self.credit = (self.credit + 1).min(MAX_CREDIT);
+    }
+}
+
+/// Folds a new frame into every client's pending rows, then sends one to each client with
+/// credit, oldest rows first. Drops clients whose stream is gone.
+fn deliver(clients: &mut HashMap<u64, Client>, f: Option<Frame>) {
+    if let Some(f) = f {
+        for c in clients.values_mut() {
+            match c.pending.as_mut() {
+                Some(p) => p.merge(f.clone()),
+                None => c.pending = Some(f.clone()),
+            }
+        }
+    }
+    clients.retain(|_, c| {
+        if c.credit == 0 {
+            return true;
+        }
+        let Some(f) = c.pending.take() else { return true };
+        match c.out.try_send(f) {
+            Ok(()) => {
+                c.credit -= 1;
+                true
+            }
+            // The writer's queue is full (only a client asking past its window gets here):
+            // keep the rows, newer frames merge into them.
+            Err(TrySendError::Full(f)) => {
+                c.pending = Some(f);
+                true
+            }
+            // The stream connection is gone.
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    });
 }
 
 /// Writes keys to the PTY, in order, so the engine thread never waits on them. An app that's
@@ -415,7 +506,7 @@ fn input_thread(sid: &str, fd: Arc<PtyFd>) -> Sender<Vec<u8>> {
 fn engine_thread(sid: String, generation: u64, make: MakeEngine, title: String, fd: Arc<PtyFd>, rx: Receiver<EngineMsg>, d: Weak<Daemon>, kitty: Arc<AtomicU8>) {
     let input = input_thread(&sid, fd.clone());
     let _ = std::thread::Builder::new().name(format!("engine-{sid}")).spawn(move || {
-        let mut eng = make();
+        let mut eng = make(input.clone());
         kitty.store(eng.kitty_flags(), Ordering::Relaxed);
         let mut clients: HashMap<u64, Client> = HashMap::new();
         let mut title = title;
@@ -441,14 +532,14 @@ fn engine_thread(sid: String, generation: u64, make: MakeEngine, title: String, 
                 }
                 EngineMsg::Attach(id, out) => {
                     eng.force_full();
-                    clients.insert(id, Client { pending: None, credit: true, out });
+                    clients.insert(id, Client::new(out));
                 }
                 EngineMsg::Detach(id) => {
                     clients.remove(&id);
                 }
                 EngineMsg::Want(id) => {
                     if let Some(c) = clients.get_mut(&id) {
-                        c.credit = true;
+                        c.want();
                     }
                 }
                 EngineMsg::Read { screen, reply } => {
@@ -524,27 +615,98 @@ fn engine_thread(sid: String, generation: u64, make: MakeEngine, title: String, 
             }
             // Only build a frame when someone can take it; every client's pending gets the
             // dirty rows so clients without credit don't miss them.
-            if clients.values().any(|c| c.credit) {
-                if let Some(f) = eng.frame() {
-                    for c in clients.values_mut() {
-                        match c.pending.as_mut() {
-                            Some(p) => p.merge(f.clone()),
-                            None => c.pending = Some(f.clone()),
-                        }
-                    }
-                }
-                clients.retain(|_, c| {
-                    if c.credit
-                        && let Some(f) = c.pending.take() {
-                            c.credit = false;
-                            // Full = the writer still holds a frame (can't happen with credit);
-                            // Disconnected = the stream connection is gone.
-                            return !matches!(c.out.try_send(f), Err(TrySendError::Disconnected(_)));
-                        }
-                    true
-                });
+            if clients.values().any(|c| c.credit > 0) {
+                let f = eng.frame();
+                deliver(&mut clients, f);
             }
         }
         // Dropping `clients` closes every stream writer; dropping `fd` may close the PTY.
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use midna_proto::frame::RowData;
+
+    fn rows(ys: &[u16]) -> Frame {
+        Frame { cols: 10, rows: 5, changed: ys.iter().map(|&y| (y, RowData::default())).collect(), ..Default::default() }
+    }
+
+    fn changed(f: &Frame) -> Vec<u16> {
+        f.changed.iter().map(|(y, _)| *y).collect()
+    }
+
+    #[test]
+    fn one_credit_sends_one_frame_and_merges_the_rest() {
+        let (tx, rx) = sync_channel(MAX_CREDIT as usize);
+        let mut clients = HashMap::from([(1, Client::new(tx))]);
+        deliver(&mut clients, Some(rows(&[0])));
+        deliver(&mut clients, Some(rows(&[1])));
+        deliver(&mut clients, Some(rows(&[2])));
+        assert_eq!(changed(&rx.try_recv().unwrap()), [0]);
+        assert!(rx.try_recv().is_err());
+        clients.get_mut(&1).unwrap().want();
+        deliver(&mut clients, None);
+        assert_eq!(changed(&rx.try_recv().unwrap()), [1, 2]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_wider_window_keeps_frames_in_order() {
+        let (tx, rx) = sync_channel(MAX_CREDIT as usize);
+        let mut clients = HashMap::from([(1, Client::new(tx))]);
+        clients.get_mut(&1).unwrap().want();
+        clients.get_mut(&1).unwrap().want();
+        for y in 0..5 {
+            deliver(&mut clients, Some(rows(&[y])));
+        }
+        let got: Vec<_> = rx.try_iter().map(|f| changed(&f)).collect();
+        assert_eq!(got, [vec![0], vec![1], vec![2]]);
+        // The rows built without credit wait, merged, for the next want.
+        clients.get_mut(&1).unwrap().want();
+        deliver(&mut clients, None);
+        assert_eq!(changed(&rx.try_recv().unwrap()), [3, 4]);
+    }
+
+    #[test]
+    fn a_full_frame_replaces_older_pending_rows() {
+        let (tx, rx) = sync_channel(MAX_CREDIT as usize);
+        let mut clients = HashMap::from([(1, Client::new(tx))]);
+        clients.get_mut(&1).unwrap().credit = 0;
+        deliver(&mut clients, Some(rows(&[3])));
+        deliver(&mut clients, Some(Frame { full: true, ..rows(&[0, 1, 2, 3, 4]) }));
+        deliver(&mut clients, Some(rows(&[1])));
+        clients.get_mut(&1).unwrap().want();
+        deliver(&mut clients, None);
+        let f = rx.try_recv().unwrap();
+        assert!(f.full);
+        assert_eq!(changed(&f), [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn credit_is_capped_and_a_full_writer_keeps_the_rows() {
+        let (tx, rx) = sync_channel(1);
+        let mut clients = HashMap::from([(1, Client::new(tx))]);
+        for _ in 0..10 {
+            clients.get_mut(&1).unwrap().want();
+        }
+        assert_eq!(clients[&1].credit, MAX_CREDIT);
+        deliver(&mut clients, Some(rows(&[0])));
+        deliver(&mut clients, Some(rows(&[1])));
+        deliver(&mut clients, Some(rows(&[2])));
+        assert_eq!(clients[&1].credit, MAX_CREDIT - 1);
+        assert_eq!(changed(&rx.try_recv().unwrap()), [0]);
+        deliver(&mut clients, None);
+        assert_eq!(changed(&rx.try_recv().unwrap()), [1, 2]);
+    }
+
+    #[test]
+    fn a_closed_stream_drops_the_client() {
+        let (tx, rx) = sync_channel(MAX_CREDIT as usize);
+        let mut clients = HashMap::from([(1, Client::new(tx))]);
+        drop(rx);
+        deliver(&mut clients, Some(rows(&[0])));
+        assert!(clients.is_empty());
+    }
 }

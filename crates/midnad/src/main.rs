@@ -123,6 +123,13 @@ fn main() {
     }
     #[cfg(windows)]
     let cfg = work_in_home(cfg);
+    // launchd's soft limit is 256: ~50 agents with their connections run out of it.
+    #[cfg(unix)]
+    match midnad::fd_limit::raise() {
+        Ok((before, after)) if after > before => eprintln!("midnad: open-file limit {before} -> {after}"),
+        Ok(_) => {}
+        Err(e) => eprintln!("midnad: could not raise the open-file limit: {e}"),
+    }
     match midnad::start_with(cfg.clone(), resume) {
         Ok(h) => {
             let c = &h.daemon.cfg;
@@ -132,6 +139,10 @@ fn main() {
                 Some(dll) => eprintln!("midnad: terminals run in {}", dll.display()),
                 None => eprintln!("midnad: terminals run in Windows' own ConPTY"),
             }
+            // Children nothing waits for, such as ones still running when an upgrade exec'd.
+            // (Windows keeps no zombies.)
+            #[cfg(unix)]
+            midnad::reaper::start();
             install_signals(h.daemon.clone());
             h.wait();
         }

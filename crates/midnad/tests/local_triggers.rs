@@ -480,6 +480,51 @@ fn run_command_in_background_or_with_no_terminal() {
 }
 
 #[test]
+fn run_command_gets_the_payload_in_midna_payload() {
+    let d = TestDaemon::start();
+    let mut h = d.human();
+    let dir = d.home.join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = call(&mut h, "project.add", json!({ "path": dir.canonicalize().unwrap() }));
+    let pid = p["id"].as_str().unwrap().to_string();
+    let out = d.home.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let sid = open_sh(&mut h);
+    let mut a = d.agent(Some(&sid));
+    // Each run writes what it got to out/<tag>.{stdin,file,env}.
+    let cmd = |tag: &str, stdin: bool| {
+        let read = if stdin { format!("cat > {tag}.stdin; ") } else { String::new() };
+        format!("cd {} && {read}cp \"$MIDNA_PAYLOAD\" {tag}.file; printf '%s %s %s' \"$MIDNA_EVENT\" \"$MIDNA_DELIVERY_GUID\" \"$MIDNA_DELIVERY\" > {tag}.env", sh_word(&out))
+    };
+    let add = |h: &mut Client, name: &str, action: Value| {
+        let t = call(h, "trigger.add", json!({ "name": name, "source": "local", "event": "hook.Stop", "filter": { "match": { "note": "*done*" } }, "action": action, "enabled": true }));
+        t["id"].as_str().unwrap().to_string()
+    };
+    let headless = add(&mut h, "Relay", json!({ "kind": "run_command", "project_id": pid, "command": cmd("headless", true), "headless": true, "timeout_secs": 30 }));
+    let term = add(&mut h, "Relay in a tab", json!({ "kind": "run_command", "project_id": pid, "command": cmd("term", false) }));
+
+    let payload = json!({ "note": "it's done", "nested": { "n": 2 } });
+    let dry = call(&mut h, "trigger.test", json!({ "trigger_id": headless, "session": sid, "payload": payload }));
+    let size = payload.to_string().len();
+    assert!(dry["summary"].as_str().unwrap().ends_with(&format!(" · with the {size}-byte payload on stdin and in $MIDNA_PAYLOAD")), "{dry}");
+    let dry = call(&mut h, "trigger.test", json!({ "trigger_id": term, "session": sid, "payload": payload }));
+    assert!(dry["summary"].as_str().unwrap().ends_with(&format!(" · with the {size}-byte payload in $MIDNA_PAYLOAD")), "{dry}");
+
+    hook(&mut a, "Stop", payload.clone());
+    let read = |name: &str| wait_for(15, name, || std::fs::read_to_string(out.join(name)).ok().filter(|s| !s.is_empty()));
+    let delivery = |h: &mut Client, tid: &str| wait_for(5, "delivery", || call(h, "trigger.deliveries", json!({ "trigger_id": tid })).as_array().and_then(|a| a.first().cloned()));
+    for (tag, tid) in [("headless", &headless), ("term", &term)] {
+        let del = delivery(&mut h, tid);
+        let (id, guid) = (del["id"].as_str().unwrap(), del["delivery_guid"].as_str().unwrap());
+        assert_eq!(serde_json::from_str::<Value>(&read(&format!("{tag}.file"))).unwrap(), payload, "{tag}");
+        assert_eq!(read(&format!("{tag}.env")), format!("hook.Stop {guid} {id}"), "{tag}");
+        // Kept with the delivery, as a webhook's body is.
+        assert!(d.home.join("deliveries").join(format!("{id}.body.json")).is_file(), "{tag}");
+    }
+    assert_eq!(read("headless.stdin"), payload.to_string(), "headless also gets it on stdin");
+}
+
+#[test]
 fn a_script_sets_and_clears_a_status_without_a_trigger() {
     let d = TestDaemon::start();
     let mut h = d.human();
@@ -673,4 +718,60 @@ fn claude_crons_become_schedules_that_follow_the_terminal() {
     let r = pre_tool(&mut a, "CronCreate", json!({ "cron": "@hourly", "prompt": "echo claudes" }));
     assert_eq!(r["source"], "default", "{r}");
     assert!(cron_trigger(&mut h).is_none());
+}
+
+#[test]
+fn stream_and_schedule_triggers_act_on_a_named_terminal() {
+    let d = TestDaemon::start();
+    let mut h = d.human();
+    let sid = open_sh(&mut h);
+    call(&mut h, "session.rename", json!({ "id": sid, "name": "build" }));
+    let mut a = d.agent(Some(&sid));
+    let deliveries = |h: &mut Client, t: &Value| call(h, "trigger.deliveries", json!({ "trigger_id": t["id"] })).as_array().cloned().unwrap_or_default();
+    let send = |to: &str| json!({ "kind": "send_to_session", "steps": [{ "text": "echo rebuilt-{{data.n}}" }], "to": to });
+
+    let e = call_err(&mut a, "trigger.add", json!({ "name": "x", "source": "local", "event": "stream.ci.*", "action": send(" ") })).message;
+    assert!(e.contains("to must name a terminal"), "{e}");
+    let e = call_err(&mut a, "trigger.add", json!({ "name": "x", "source": "local", "event": "schedule", "filter": { "cron": "@daily", "session": sid }, "action": send("build") }))
+        .message;
+    assert!(e.contains("leave out filter.session"), "{e}");
+
+    // A stream event has no terminal: `to` names the one to type into, looked up when it fires.
+    // No cooldown: the stream is published to again below, within the minute.
+    let t = call(&mut a, "trigger.add", json!({ "name": "Rebuild", "source": "local", "event": "stream.ci.*", "action": send("build"), "enabled": true, "cooldown_secs": 0 }));
+    let r = call(&mut h, "trigger.test", json!({ "trigger_id": t["id"], "event": "stream.ci.done", "payload": { "n": 1 } }));
+    assert_eq!(r["summary"].as_str(), Some(format!("Matches · would send on build ({sid}): “echo rebuilt-1”").as_str()), "{r}");
+    call(&mut h, "streams.publish", json!({ "stream": "ci", "kind": "done", "data": { "n": 7 } }));
+    wait_for(10, "sent to the named terminal", || Some(read(&mut h, &sid)).filter(|t| t.contains("rebuilt-7")));
+    let del = wait_for(5, "delivery", || Some(deliveries(&mut h, &t)).filter(|d| !d.is_empty()));
+    assert_eq!(del[0]["subject"], "build", "{del:?}");
+
+    // No terminal by that name: nothing is sent, and the delivery says why.
+    let none = call(&mut a, "trigger.add", json!({ "name": "Nope", "source": "local", "event": "stream.nope.*", "action": send("nope"), "enabled": true }));
+    let r = call(&mut h, "trigger.test", json!({ "trigger_id": none["id"], "event": "stream.nope.done", "payload": {} }));
+    assert!(r["summary"].as_str().unwrap().contains("on nope (but there's no terminal named nope right now"), "{r}");
+    call(&mut h, "streams.publish", json!({ "stream": "nope", "kind": "done", "data": { "n": 8 } }));
+    let del = wait_for(5, "delivery", || Some(deliveries(&mut h, &none)).filter(|d| !d.is_empty()));
+    assert_eq!(del[0]["summary"], "Could not send to session: no terminal named nope", "{del:?}");
+    assert!(!read(&mut h, &sid).contains("rebuilt-8"));
+
+    // Two terminals with that name: the most recently active, and the delivery says so.
+    let other = open_sh(&mut h);
+    call(&mut h, "session.rename", json!({ "id": other, "name": "build" }));
+    call(&mut h, "streams.publish", json!({ "stream": "ci", "kind": "done", "data": { "n": 9 } }));
+    let del = wait_for(5, "second delivery", || Some(deliveries(&mut h, &t)).filter(|d| d.len() == 2));
+    let said = del.iter().filter_map(|d| d["summary"].as_str()).collect::<Vec<_>>().join(" | ");
+    assert!(said.contains("2 terminals named build; picked the most recently active"), "{said}");
+
+    // A schedule with `to` fires once, about that terminal: the attention points at it.
+    let n = call(
+        &mut a,
+        "trigger.add",
+        json!({ "name": "Check", "source": "local", "event": "schedule", "filter": { "cron": "@daily" }, "action": { "kind": "attention", "message": "Look at {{session.name}}", "to": sid }, "enabled": true }),
+    );
+    let at = midna_proto::cron::Cron::parse("@daily").unwrap().next_after(midna_proto::time::now_unix()).unwrap();
+    midnad::local::fire_schedule_now(&d.daemon(), n["id"].as_str().unwrap(), at);
+    let items = call(&mut h, "needs_you.list", json!({}));
+    let item = items.as_array().unwrap().iter().find(|i| i["title"] == "Look at build").unwrap_or_else(|| panic!("{items}"));
+    assert_eq!(item["session_id"], sid, "{item}");
 }

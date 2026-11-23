@@ -45,7 +45,7 @@ watches the GUI. You can drive almost all of it: CLI `midna <verb>`, MCP tools (
 `midna call <method> <json>`. Everything you do is logged (`midna events`).
 
 WHAT YOU CAN DO
-  see        midna list | get <id> | projects | needs [get <n_id>] | read <id> | explain <id> | events | insights | usage | keep-awake
+  see        midna list | get <id> | projects | needs [get <n_id>] | read <id> | explain <id> | events | insights | usage | keep-awake | peers | inbox
   terminals  midna open [--agent claude|codex --prompt T --resume ID -- agent-args | --monitor CMD | -- argv] [--background] · background · send · key · rename · restart · close
   queue      midna queue add <text> [--after <id> | --idle 10m | --at 18:00] (typed once the agent is ready) · list · rm
   attention  midna attention \"<one line>\" (blocked) | --note (FYI)      [MCP needs_you_raise]
@@ -66,7 +66,8 @@ HUMAN ONLY (calling these makes a request the human sees; nothing happens until 
   settings   {}
   also       removing rules (use `midna rules request-removal <id> --reason …`), webhook secrets, enabling
              webhook triggers, approving approvals (unless the human enabled approve.from_cli, own session only),
-             dismissing needs-you items, macOS permission grants (ask with `midna attention`).
+             answering needs-you items you didn't raise, macOS permission grants (ask with `midna attention`).
+             An item you raised and no longer need: clear it yourself with `midna approve <id> --done`.
 
 RULES OF THE ROAD
   - Agents add, humans remove. A refusal tells you the next step; follow it, don't retry another way.
@@ -78,6 +79,42 @@ Guide: `midna skill` (also $MIDNA_SKILL) has the core rules and lists its topics
         human_only.join(", "),
         human_settings.join(", "),
     )
+}
+
+/// The capabilities' streams section, from `daemon.info`'s `streams` (`None` when midnad
+/// couldn't be asked: capabilities work offline).
+pub fn streams_section(info: Option<&Value>) -> Option<String> {
+    let h = &info?["streams"];
+    let total = h["total"].as_u64()?;
+    if total == 0 {
+        return Some("STREAMS    none; `midna stream add <name> -- <cmd>` runs a producer whose stdout lines become stream.<name>.<kind> events".into());
+    }
+    let bad = h["unhealthy"].as_array().cloned().unwrap_or_default();
+    let mut out = format!("STREAMS    {total} ({} healthy) · midna stream list · midna explain <stream name>", h["healthy"].as_u64().unwrap_or(0));
+    for b in &bad {
+        let name = b["name"].as_str().unwrap_or("");
+        let mut line = format!("\n  {name:<9}{}", b["state"].as_str().unwrap_or(""));
+        if let Some(why) = b["why"].as_str() {
+            line.push_str(&format!(": {}", clip(why, 100)));
+        }
+        if let Some(at) = b["retry_at"].as_str() {
+            line.push_str(&format!(" (next try {at})"));
+        }
+        out.push_str(&line);
+    }
+    Some(out)
+}
+
+fn clip(s: &str, n: usize) -> String {
+    if s.chars().count() > n { format!("{}…", s.chars().take(n).collect::<String>()) } else { s.to_string() }
+}
+
+/// `capabilities()` with the streams section when midnad answered `daemon.info`.
+pub fn capabilities_with(info: Option<&Value>) -> String {
+    match streams_section(info) {
+        Some(st) => format!("{}\n\n{st}", capabilities()),
+        None => capabilities(),
+    }
 }
 
 /// `midna capabilities --json` / the MCP `capabilities` tool's structured content.
@@ -123,8 +160,10 @@ pub fn next_step(method: &str, params: &Value, e: &RpcError, surface: Surface) -
              the one you sent. Never put secrets in commands or prompts; tell the human what the secret is for."
             .into(),
         (HUMAN_ONLY, "needs_you.resolve") => format!(
-            "Only the human answers this item. Leave it; if you are blocked meanwhile, say so once with {}.",
-            cmd(surface, "attention \"…\"", "needs_you_raise")
+            "Only the human answers this item. Leave it; if you are blocked meanwhile, say so once with {}. (Items you \
+             raised from this terminal you clear yourself with {}.)",
+            cmd(surface, "attention \"…\"", "needs_you_raise"),
+            cmd(surface, &format!("approve {id} --done"), "needs_you_resolve")
         ),
         (HUMAN_ONLY, _) if needs_you.is_some() => wait(needs_you.as_deref().unwrap_or("")),
         (HUMAN_ONLY, _) => format!(
@@ -152,6 +191,12 @@ pub fn next_step(method: &str, params: &Value, e: &RpcError, surface: Surface) -
             "Nothing was done: the approval was withdrawn before the human answered, because what it was about (or the asker) \
              is gone. Check with {} before asking again.",
             cmd(surface, "list", "session_list")
+        ),
+        (REFUSED, "streams.publish") => format!(
+            "This stream is one midna runs: only its own producer (or the human) can publish to it, so yours was dropped and \
+             fired nothing. No rule or approval changes that. To try a trigger on it, use {} (nothing is published); for \
+             events of your own, publish to a stream name midna doesn't run.",
+            cmd(surface, "triggers test <trigger-id> --stream <name> --kind <kind>", "trigger_test")
         ),
         (REFUSED, _) if needs_you.is_some() => format!(
             "The human denied it (or didn't answer in time). Don't retry another way. If it matters, explain why in one line \
@@ -255,7 +300,8 @@ const TOPICS: &[(&str, &str)] = &[
         clear_on: prompt|turn|status|never} (shown instead of the built-in status, which still drives sorting and \
         Needs You), clear_status, notify {title, body?, sound, category?} (a macOS notification, category from_trigger or a kind the human added); also attention, run_command, start_agent. Templates: {{last_prompt}} (the terminal's \
         latest full prompt), {{event}}, {{session.id|name|project_id|agent|status}}, {{data.<path>}} or bare {{<path>}} \
-        like {{message}}; run_command shell-quotes values. cooldown_secs (default 60) per terminal. Events caused by a trigger never fire triggers. Agents may \
+        like {{message}}; run_command shell-quotes values and gets the hook payload or event data in the file $MIDNA_PAYLOAD \
+        (headless: also on stdin) with MIDNA_EVENT, MIDNA_DELIVERY_GUID and MIDNA_DELIVERY set. cooldown_secs per terminal (default 60), or per stream for stream.* (default 0: every event fires). Events caused by a trigger never fire triggers. Agents may \
         add, enable and pause local triggers directly (no approval) when the human asked for one (`--enable` on add). Built in: \
         prompt_blocked_status shows “Prompt blocked” when a hook refuses a prompt; edit, pause or remove it like any other."),
     ("secrets", "When the human pastes a secret into an agent terminal, the midna app stores it (Keychain) and the \
@@ -267,9 +313,12 @@ const TOPICS: &[(&str, &str)] = &[
         a value an agent passes itself is marked exposed. Replacing a secret the human stored asks the human; only \
         the human removes secrets. Never ask for a value in chat."),
     ("needs-you", "Needs-you items are what the human must look at: approval, permission_prompt, blocked, note, failed, \
-        trigger_waiting, rule_removal, secret_needed. Agents raise blocked/note with `midna attention`. The human \
-        resolves: approve{scope}, deny, dismiss, done, restart. An agent's \"trust this folder?\" startup dialog is a \
-        permission_prompt too (approve = Yes, deny = No; any Yes, here or in the terminal, adds the folder to agents.trust_folders); \
+        trigger_waiting, rule_removal, secret_needed. Agents raise blocked/note with `midna attention`, and clear one \
+        they raised once they no longer need the human with `midna approve <id> --done` (a new prompt to the agent \
+        clears its blocked items by itself). The human resolves the rest: approve{scope}, deny, dismiss, done, restart. \
+        An agent's \"trust this folder?\" startup dialog is a \
+        permission_prompt too (approve = Yes, deny = No; approving one answers Yes on the same project's other open trust items; \
+        any Yes, here or in the terminal, adds the folder to agents.trust_folders); \
         a folder agents.trust_folders covers is answered Yes without one. `midna needs get <id>` says where one item stands."),
     ("settings", "Settings live in the daemon; `midna settings list` shows every key with its value, default and \
         description. Agents may change any key not marked human only; setting a human-only key asks the human. The GUI \
@@ -319,6 +368,62 @@ const TOPICS: &[(&str, &str)] = &[
         usage.limit_reached {agent, window, used_percentage, resets_at} fires once per window when it hits 100%: \
         subscribe to it (or a local trigger on it) instead of polling. usage.sampled {agent, five_hour?, seven_day?} logs \
         the numbers each time they move; `midna insights detail` (and the Insights widget Plan usage) charts them."),
+    ("nearby", "Nearby: Midnas on the same network find each other over Bonjour (`midna peers`, peers.list). Each \
+        midna home has its own Ed25519 device key; its fingerprint (SHA-256 of the public key, hex) is the device's real id, \
+        and the name (setting nearby.name, else the Mac's computer name) is display only, so never trust a name alone. \
+        Setting nearby.visibility (human only; an agent's change waits for the human) says who can find this Mac: off (no \
+        Bonjour at all), paired (default: it looks for others but only paired devices can find it) or everyone (every Midna \
+        nearby sees it for 10 minutes, then it goes back to paired by itself; me.everyone_until says when). peers.list has \
+        me (fingerprint, name, visibility, service, advertising, browsing, protocol, error, local_network: ok | waiting | \
+        denied, from macOS Local Network privacy; peers.pair and share.send wait up to a minute while it's waiting; event \
+        peers.local_network) and peers (fingerprint, name, \
+        protocol, host, port, seen_since, tier, claims_name_of). Events peers.appeared and peers.left fire as peers come and \
+        go: subscribe to them instead of polling. Pairing: peers.pair {fingerprint} (`midna peers pair <name|id>`) asks a \
+        device visible to everyone; both Macs then show the same 6-digit code (peers.pairing event, peers.list pairings) and \
+        raise a needs-you approval. peers.confirm {pairing, accept, as: contact|my_device} is human only: agents never \
+        confirm, and never tell the human the codes match; the human compares the two screens. Once both sides confirm, \
+        each keeps the other (peers.paired; peers.list paired) and paired devices find each other even while visibility is \
+        paired. peers.set_tier {fingerprint, as} (human only) changes its tier (peers.changed); a contact auto-accepts nothing, agents ask before sending it anything, and it can't drive this Mac. \
+        peers.set_drive {peer, on} lets one of my own devices drive this Mac (paired list drive; event peers.drive {peer, name, on}), off by default; \
+        it is human only and an agent's call is refused outright, never turned into an approval, so never ask for it (peers.confirm allow_drive sets it while pairing). \
+        Turning it off, keeping the device as a contact or forgetting it cuts its drive links at once. peers.forget {fingerprint} (human only) unpairs (peers.forgotten). Connections are Noise bound to the device \
+        keys; a device that isn't paired can only ask to pair, and one that uses a paired device's name with another key \
+        is listed with claims_name_of set and is never trusted. The installed Midna uses _midna._tcp; Midna Dev and other homes use _midna-dev._tcp, so \
+        they never see each other. Shares: share.send {peer, kind: message|snippet|link|file|tab|agent|file_request, text|url|path|session, title?, reply_to?} \
+        (`midna share send <name|id> <text>`, stdin = snippet, --link <url>, a file or folder's path, --tab or --agent [--session <terminal>], \
+        or `midna share pull --from <name|id> --file <remote-path>` to request a file from that Mac) offers a \
+        paired device something; if the peer isn't visible right now, the share is queued (state queued) and delivered when they appear. From an agent it first asks the human on this Mac (a needs-you approval showing what would \
+        leave; a rule the human gave can allow `share send <kind> <device id>`, an agent's own allow rule never does, and \
+        where no rule decides, peers.set_agent_send {fingerprint, kinds, on} (human only, refused outright; `midna peers agent-send \
+        <name|id> <kinds|all> on|off`, Settings › Nearby) lets agents send one of the human's own devices those kinds without asking) and \
+        waits; denied or unanswered, nothing is sent. It lands in that Mac's inbox (inbox.list, `midna inbox`) as an offer (share.offered) with a \
+        needs-you approval. Nothing a share carries types into, runs in or opens anything until a person there accepts: \
+        share.accept {id, session?, action?: open|pin, cwd?} and share.decline {id} are human only, so agents never accept or \
+        decline shares, and never paste a snippet or open a link for the human. The one exception is the human's own: \
+        peers.set_auto_accept {fingerprint, kind, on} (human only, `midna peers auto-accept <name|id> <kinds|all> on|off`) has \
+        shares of a kind from one of their own devices accepted without asking (the item's auto is true; contacts never \
+        can). Of Midna's own things only summaries and themes are; rules, triggers, settings and queued prompts always ask. The sender sees the answer as \
+        share.accepted or share.declined (direction outgoing). An accepted file or folder is fetched in checksummed \
+        chunks that resume after a drop, with share.progress events (the item's transfer: state, done, total), and \
+        saved into the receiver's nearby.downloads (human only; default ~/Downloads/Midna). An accepted agent session (kind agent: \
+        the whole conversation as it is now) is fetched the same way, its paths changed to the receiver's, and resumed in a new agent \
+        terminal there, idle until prompted. An agent start (kind agent_start: share.send {peer, kind: agent_start, prompt, agent?, \
+        session?, project?, title?, want_reply?, notes?}, `midna share send agent-start --to <name|id> --prompt <text> [--project <name>] [--notes <file>|-] [--wait]`) \
+        asks the other Mac to open a new agent terminal in its checkout of the sending terminal's project with that prompt; with notes \
+        (handoff notes, own devices only) short ones ride in the prompt and longer ones are fetched like a file after accept, saved as \
+        <home>/nearby/notes/<id>.md, and the prompt points the agent at them; it runs only once a person \
+        there accepts (or their device auto-accepts agent starts from this Mac, off by default). With want_reply its first turn's \
+        last message comes back as a message whose reply_to is the agent start, read at once (share.answered); share.answer {id, \
+        wait_secs?} returns it, waiting up to 600 s per call. An agent ask (kind agent_ask: share.send {peer, kind: agent_ask, \
+        session, prompt, want_reply?}, `midna share send agent-ask --to <name|id> --session <name|id> --prompt <text> [--wait]`) asks an \
+        agent terminal already open on one of the human's own devices instead: peers.sessions {peer} (`midna peers sessions <name|id>`) \
+        lists that Mac's agent terminals (id, name, agent, project, busy), names and ids only, for my-device peers only. session is \
+        one of their ids or names. Once a person there accepts (or auto-accept for agent asks, off by default), the prompt is queued \
+        in that terminal and typed when its agent is idle, never into a busy prompt; with want_reply the end of that turn comes back \
+        the same way. A session that isn't there or isn't an agent refuses the offer, or declines it with the reason (the item's \
+        result) if it went before it was accepted. A file request (kind file_request: share.send {peer, kind: file_request, path}, \
+        `midna share pull --from <name|id> --file <remote-path>`) asks a paired device to send this Mac the file at that absolute \
+        path on their Mac; the human there must approve it and the file arrives as an incoming file share when they do. `midna skill nearby` has the how-to."),
     ("keep-awake", "Keep-awake stops the Mac from idle-sleeping during the human's work hours so agents, queued messages, \
         schedule triggers and resumes keep going while they're away (`midna keep-awake`, keep_awake.status / keep_awake.set, \
         settings keep_awake.*; off until keep_awake.enabled). midnad holds a PreventUserIdleSystemSleep assertion \
@@ -343,7 +448,8 @@ const TOPICS: &[(&str, &str)] = &[
         are policy-checked as `window` actions, so a rule can still deny one."),
     ("human-only", "Human only: removing rules, setting webhook secrets, removing stored secrets (or replacing the human's), enabling webhook triggers, human-only settings, \
         project.remove, daemon.stop/upgrade, webhooks.configure, answering approvals (unless approve.from_cli), \
-        dismissing items, macOS permissions. Calling one never does it: it becomes a needs-you request (or tells you \
+        answering or dismissing items you didn't raise (your own you clear with --done), macOS permissions. \
+        Calling one never does it: it becomes a needs-you request (or tells you \
         the request path) and the human decides. Never route around a refusal."),
     ("mcp", "`midna mcp` is a stdio MCP server; agents midna launches get it automatically (setting agents.mcp). Tool \
         names are method names with `.` → `_` (session_open, rule_add, …) plus capabilities, explain and guide. A \
@@ -577,7 +683,10 @@ fn action_text(a: &Value) -> String {
         }
         Some("run_command") => format!("runs `{}` in a monitor terminal in project {}", s(a, "command"), s(a, "project_id")),
         Some("attention") => format!("raises a note for the human: “{}”", s(a, "message")),
-        Some("send_to_session" | "set_status" | "clear_status") => format!("acts on the terminal that fired: {}", crate::triggers::action_text(a)),
+        Some("send_to_session" | "set_status" | "clear_status") => match a["to"].as_str() {
+            Some(_) => format!("acts on a named terminal: {}", crate::triggers::action_text(a)),
+            None => format!("acts on the terminal that fired: {}", crate::triggers::action_text(a)),
+        },
         _ => a.to_string(),
     }
 }
@@ -587,7 +696,14 @@ fn explain_trigger(call: Caller, id: &str, surface: Surface) -> Result<String, R
     let t = find_in(&list, id).ok_or_else(|| RpcError::not_found(format!("no trigger {id}")))?;
     let local = t["source"] == "local";
     let filters = crate::triggers::filter_text(&t["filter"]);
-    let mut out = if local {
+    let event = s(&t, "event");
+    let stream = event.strip_prefix("stream.").filter(|_| local);
+    let mut out = if let Some(rest) = stream {
+        let (name, kind) = rest.split_once('.').unwrap_or((rest, "*"));
+        let what = if kind == "*" { "anything".to_string() } else { format!("`{kind}`") };
+        let who = if name == "*" { "any stream".to_string() } else { format!("stream `{name}`") };
+        format!("{id} “{}”: when {who} publishes {what} (`{event}`, from `midna stream publish` or streams.publish)", s(&t, "name"))
+    } else if local {
         format!("{id} “{}”: when `{}` happens on this Mac", s(&t, "name"), s(&t, "event"))
     } else {
         format!("{id} “{}”: when {} sends `{}`", s(&t, "name"), s(&t, "source"), s(&t, "event"))
@@ -596,8 +712,16 @@ fn explain_trigger(call: Caller, id: &str, surface: Surface) -> Result<String, R
         out.push_str(&format!(" ({filters})"));
     }
     out.push_str(&format!(", it {}.\n", action_text(&t["action"])));
+    if let Some(to) = t["action"]["to"].as_str() {
+        out.push_str(&format!("{}\n", to_text(call, to, t["filter"]["project"].as_str())));
+    }
+    if stream.is_some() {
+        out.push_str("stream events belong to no terminal; templates: {{stream.name|kind|id}} and {{data.<path>}} (the payload)\n");
+    }
     if local {
-        out.push_str(&format!("cooldown: {}s per terminal\n", t["cooldown_secs"].as_u64().unwrap_or(60)));
+        let event = t["event"].as_str().unwrap_or("");
+        let secs = t["cooldown_secs"].as_u64().unwrap_or_else(|| midna_proto::types::default_cooldown_secs(event));
+        out.push_str(&format!("cooldown: {secs}s {}\n", midna_proto::types::cooldown_scope(event)));
     }
     if let Some(b) = t["builtin"].as_str() {
         out.push_str(&format!("built in ({b}): ships with midna; edit, pause or remove it like any other\n"));
@@ -626,9 +750,32 @@ fn explain_trigger(call: Caller, id: &str, surface: Surface) -> Result<String, R
             out.push_str(&format!("  {} {} {}: {}\n", s(x, "id"), ago(&s(x, "received_at")), s(x, "verdict"), s(x, "summary")));
         }
     }
-    let sample = if local { format!("triggers test {id} --session <terminal-id> --payload '{{\"message\":\"…\"}}'") } else { format!("triggers test {id} --payload sample.json") };
+    let sample = if let Some(rest) = stream {
+        let ev = if rest.contains('*') || !rest.contains('.') { "stream.<name>.<kind>".to_string() } else { event.clone() };
+        format!("triggers test {id} --event {ev} --payload '{{\"text\":\"…\"}}'")
+    } else if local { format!("triggers test {id} --session <terminal-id> --payload '{{\"message\":\"…\"}}'") } else { format!("triggers test {id} --payload sample.json") };
     out.push_str(&format!("try it: {}", cmd(surface, &sample, "trigger_test")));
     Ok(out)
+}
+
+/// Which running terminal a trigger's `to` names right now, resolved as midnad does when it fires.
+fn to_text(call: Caller, to: &str, project: Option<&str>) -> String {
+    let Ok(list) = call("session.list", json!({})) else { return format!("to: {to} (looked up when it fires)") };
+    let running: Vec<&Value> = list.as_array().into_iter().flatten().filter(|x| x["status"]["state"] != "exited").collect();
+    let found: Vec<midna_proto::ToCandidate> = running
+        .iter()
+        .map(|x| midna_proto::ToCandidate {
+            id: x["id"].as_str().unwrap_or(""),
+            name: x["name"].as_str().unwrap_or(""),
+            project_id: x["project_id"].as_str().unwrap_or(""),
+            active_at: x["last_activity_at"].as_str().and_then(time::parse_rfc3339).unwrap_or(0),
+        })
+        .collect();
+    match midna_proto::pick_to(to, project, &found) {
+        Ok(p) if p.matches > 1 => format!("to: {to} → {} now ({} terminals have that name; it picks the most recently active when it fires)", found[p.index].id, p.matches),
+        Ok(p) => format!("to: {to} → {} now (looked up again each time it fires)", found[p.index].id),
+        Err(e) => format!("to: {to} → {e} right now, so firing would do nothing until one is running"),
+    }
 }
 
 fn kind_meaning(kind: &str) -> &'static str {
@@ -641,8 +788,103 @@ fn kind_meaning(kind: &str) -> &'static str {
         "trigger_waiting" => "a trigger wants to start something and waits for the human",
         "rule_removal" => "an agent asked the human to remove a rule",
         "secret_needed" => "a trigger needs its webhook secret pasted by the human",
+        "stream_failing" => "a stream's producer keeps exiting (5 times in 10 minutes); it resolves itself once the stream runs 10 minutes or is paused",
         _ => "",
     }
+}
+
+/// Whether a trigger's event glob can match `stream.<name>.<some kind>`.
+fn listens_to(event: &str, name: &str) -> bool {
+    match event.strip_prefix("stream.") {
+        Some(rest) => {
+            let name_glob = rest.split_once('.').map_or(rest, |(n, _)| n);
+            glob(name_glob, name)
+        }
+        None => event == "*",
+    }
+}
+
+/// `*` any run, `?` one char.
+fn glob(p: &str, t: &str) -> bool {
+    match p.chars().next() {
+        None => t.is_empty(),
+        Some('*') => (0..=t.len()).filter(|i| t.is_char_boundary(*i)).any(|i| glob(&p[1..], &t[i..])),
+        Some(c) => t.chars().next().is_some_and(|tc| (c == '?' || c == tc) && glob(&p[c.len_utf8()..], &t[tc.len_utf8()..])),
+    }
+}
+
+/// A stream midnad runs: its state and why, its last log lines and the triggers that react to it.
+fn explain_stream(call: Caller, st: &Value, surface: Surface) -> Result<String, RpcError> {
+    let name = s(st, "name");
+    let state = s(st, "state");
+    let mut out = format!("stream {name}: its producer's stdout lines are events stream.{name}.<kind>\n");
+    let words: Vec<&str> = st["command"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    out.push_str(&format!("  $ {}\n", words.join(" ")));
+    let meaning = match state.as_str() {
+        "running" => format!("running (pid {}) since {}", s(st, "pid"), ago(&s(st, "started_at"))),
+        "starting" => "starting".into(),
+        "backoff" => format!("not running: its producer stopped; midna starts it again at {}", s(st, "retry_at")),
+        "failing" => format!(
+            "FAILING since {}: {} exits in 10 minutes. midna keeps starting it again (backoff up to 5 minutes; next try {}); it's healthy again once a run lasts 10 minutes",
+            ago(&s(st, "failing_since")),
+            s(st, "exits_recent"),
+            st["retry_at"].as_str().unwrap_or("now")
+        ),
+        "paused" => format!("paused: its producer is stopped until {}", cmd(surface, &format!("stream resume {name}"), "streams_set_enabled")),
+        other => other.to_string(),
+    };
+    out.push_str(&format!("state: {meaning}\n"));
+    if let Some(why) = st["why"].as_str() {
+        out.push_str(&format!("why: {why}\n"));
+    }
+    if let Some(id) = st["needs_you"].as_str() {
+        out.push_str(&format!("needs you: {id} (stream_failing; resolves itself once healthy, or when paused or removed)\n"));
+    }
+    let mut facts = vec![format!("{} restart(s)", s(st, "restarts"))];
+    let e = &st["last_exit"];
+    if e.is_object() {
+        let how = match (e["code"].as_i64(), e["signal"].as_i64()) {
+            (Some(c), _) => format!("code {c}"),
+            (_, Some(sig)) => format!("signal {sig}"),
+            _ => "unknown".into(),
+        };
+        facts.push(format!("last exit {how} {} after {}s", ago(&s(e, "at")), s(e, "ran_secs")));
+    }
+    let c = &st["counts"];
+    let n = |k: &str| c[k].as_u64().unwrap_or(0);
+    facts.push(format!(
+        "events {} accepted, {} dropped (duplicate {}, rate limited {}, too large {}, busy {}, refused {})",
+        n("accepted"),
+        n("duplicate") + n("rate_limited") + n("too_large") + n("busy") + n("refused"),
+        n("duplicate"),
+        n("rate_limited"),
+        n("too_large"),
+        n("busy"),
+        n("refused")
+    ));
+    if let Some(at) = st["last_event"]["at"].as_str() {
+        facts.push(format!("last event {} {}", st["last_event"]["kind"].as_str().unwrap_or(""), ago(at)));
+    }
+    out.push_str(&format!("{}\n", facts.join("; ")));
+    let tail: Vec<&str> = st["log_tail"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    if !tail.is_empty() {
+        out.push_str(&format!("last log lines ({}):\n", s(st, "log")));
+        for l in tail {
+            out.push_str(&format!("  {l}\n"));
+        }
+    }
+    let triggers = call("trigger.list", json!({})).unwrap_or(Value::Null);
+    let listening: Vec<&Value> =
+        triggers.as_array().into_iter().flatten().filter(|t| t["source"] == "local" && listens_to(t["event"].as_str().unwrap_or(""), &name)).collect();
+    if listening.is_empty() {
+        out.push_str(&format!("no trigger listens to stream.{name}.*; add one with `midna triggers add --event stream.{name}.<kind> …`"));
+    } else {
+        out.push_str(&format!("triggers on stream.{name}.*:\n"));
+        let lines: Vec<String> =
+            listening.iter().map(|t| format!("  {} “{}” on {} ({}): {}", s(t, "id"), s(t, "name"), s(t, "event"), s(t, "state"), action_text(&t["action"]))).collect();
+        out.push_str(&lines.join("\n"));
+    }
+    Ok(out)
 }
 
 fn explain_needs_you(call: Caller, id: &str) -> Result<String, RpcError> {
@@ -674,6 +916,7 @@ fn explain_needs_you(call: Caller, id: &str) -> Result<String, RpcError> {
     let who = match kind.as_str() {
         "approval" if s(&n, "detail").starts_with("Human-only") => "only the human (it confirms a human-only action)",
         "approval" | "permission_prompt" => "the human; an agent only for its own session when approve.from_cli is on",
+        "blocked" | "note" if n["asked_by"]["kind"] == "agent" => "the human, or the agent that raised it (`midna approve <id> --done`)",
         "blocked" | "failed" => "the human (done / restart / dismiss)",
         _ => "the human",
     };
@@ -766,12 +1009,22 @@ fn explain_setting(call: Caller, key: &str) -> Option<String> {
 pub fn explain(call: Caller, args: &[String], surface: Surface) -> Result<String, RpcError> {
     let Some(target) = args.first().map(String::as_str) else {
         return Err(RpcError::bad_params(
-            "explain what? pass an id (terminal, r_…, t_…, n_…, p_…, d_…), a method, a setting key, a topic \
+            "explain what? pass an id (terminal, r_…, t_…, n_…, p_…, d_…), a method, a setting key, a stream name, a topic \
              (status, rules, approvals, triggers, needs-you, settings, scripts, themes, keep-awake, windows, human-only, mcp), or <kind> <value>",
         ));
     };
     if matches!(target, "command" | "tool" | "path" | "cli" | "window") && args.len() > 1 {
         return explain_action(call, target, &args[1..].join(" "));
+    }
+    // `explain stream <name>` (or `stream.<name>`): a stream even when its name is also a topic.
+    let stream_name = match (target, args.get(1)) {
+        ("stream", Some(n)) => Some(n.as_str()),
+        _ => target.strip_prefix("stream.").filter(|n| !n.is_empty() && !n.contains('.')),
+    };
+    if let Some(n) = stream_name {
+        let list = call("streams.list", json!({}))?;
+        let st = list.as_array().into_iter().flatten().find(|x| x["name"] == n).ok_or_else(|| RpcError::not_found(format!("no stream {n} (`midna stream list` lists them)")))?;
+        return explain_stream(call, &st.clone(), surface);
     }
     let hexish = target.len() == 8 && target.chars().all(|c| c.is_ascii_hexdigit());
     match target.split_once('_').map(|(p, _)| p) {
@@ -795,8 +1048,13 @@ pub fn explain(call: Caller, args: &[String], surface: Surface) -> Result<String
     if let Some(sv) = explain_setting(call, target) {
         return Ok(sv);
     }
+    if let Ok(list) = call("streams.list", json!({}))
+        && let Some(st) = list.as_array().into_iter().flatten().find(|x| x["name"] == target)
+    {
+        return explain_stream(call, &st.clone(), surface);
+    }
     Err(RpcError::not_found(format!(
-        "nothing called `{target}`: not an id, method, setting or topic. Topics: {}",
+        "nothing called `{target}`: not an id, method, setting, stream or topic. Topics: {}",
         TOPICS.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(", ")
     )))
 }
@@ -828,6 +1086,60 @@ pub fn skill_resource(uri: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_triggers_are_found_by_their_event_glob() {
+        assert!(listens_to("stream.slack.message", "slack"));
+        assert!(listens_to("stream.slack.*", "slack"));
+        assert!(listens_to("stream.*", "slack"));
+        assert!(listens_to("stream.*.message", "slack"));
+        assert!(listens_to("stream.sl?ck.*", "slack"));
+        assert!(!listens_to("stream.ci.*", "slack"));
+        assert!(!listens_to("hook.Stop", "slack"));
+    }
+
+    #[test]
+    fn capabilities_list_unhealthy_streams_when_midnad_answers() {
+        assert_eq!(capabilities_with(None), capabilities());
+        let info = json!({ "streams": { "total": 3, "healthy": 2, "unhealthy": [
+            { "name": "slack", "state": "failing", "why": "invalid_auth", "retry_at": "2026-11-20T10:00:00Z" }
+        ] } });
+        let st = streams_section(Some(&info)).unwrap();
+        assert!(st.starts_with("STREAMS    3 (2 healthy)"), "{st}");
+        assert!(st.contains("\n  slack    failing: invalid_auth (next try 2026-11-20T10:00:00Z)"), "{st}");
+        assert!(capabilities_with(Some(&info)).ends_with(&st));
+        let none = streams_section(Some(&json!({ "streams": { "total": 0, "healthy": 0, "unhealthy": [] } }))).unwrap();
+        assert!(none.contains("none"), "{none}");
+    }
+
+    #[test]
+    fn explain_stream_shows_state_why_log_and_listening_triggers() {
+        let stream = json!({
+            "name": "slack", "state": "failing", "command": ["slack-tail"], "restarts": 6, "exits_recent": 5,
+            "failing_since": "2026-11-20T10:00:00Z", "why": "invalid_auth", "needs_you": "n_7", "log": "/x/slack.log",
+            "counts": { "accepted": 4, "refused": 1 }, "log_tail": ["t1 started: pid 3", "t2 stderr: invalid_auth"],
+            "last_exit": { "at": "2026-11-20T10:00:00Z", "code": 1, "ran_secs": 0 }
+        });
+        let mut call = |m: &str, _: Value| -> Result<Value, RpcError> {
+            match m {
+                "streams.list" => Ok(json!([stream.clone()])),
+                "trigger.list" => Ok(json!([
+                    { "id": "t_1", "name": "ping", "source": "local", "event": "stream.slack.message", "state": "active", "action": { "kind": "notify" } },
+                    { "id": "t_2", "name": "ci", "source": "local", "event": "stream.ci.*", "state": "active", "action": { "kind": "notify" } }
+                ])),
+                _ => Err(RpcError::not_found("no")),
+            }
+        };
+        let out = explain(&mut call, &["slack".into()], Surface::Cli).unwrap();
+        assert!(out.contains("state: FAILING since "), "{out}");
+        assert!(out.contains("why: invalid_auth\nneeds you: n_7"), "{out}");
+        assert!(out.contains("events 4 accepted, 1 dropped"), "{out}");
+        assert!(out.contains("last log lines (/x/slack.log):\n  t1 started: pid 3\n  t2 stderr: invalid_auth"), "{out}");
+        assert!(out.contains("t_1 “ping” on stream.slack.message") && !out.contains("t_2"), "{out}");
+        assert_eq!(explain(&mut call, &["stream".into(), "slack".into()], Surface::Cli).unwrap(), out);
+        assert!(explain(&mut call, &["stream".into(), "nope".into()], Surface::Cli).is_err());
+        assert!(explain(&mut call, &["nope".into()], Surface::Cli).unwrap_err().message.contains("stream"));
+    }
 
     #[test]
     fn hints_name_the_request_path() {
@@ -874,6 +1186,18 @@ mod tests {
         let e = RpcError::refused("denied by rule r_1");
         let h = next_step("window.command", &params, &e, Surface::Cli).unwrap_or_default();
         assert!(!h.contains("agents.may_move_windows"), "{h}");
+    }
+
+    #[test]
+    fn a_refused_stream_publish_points_at_trigger_tests_not_deny_rules() {
+        let e = RpcError::refused("stream `ci` is one midna runs: only its producer (with its MIDNA_STREAM_TOKEN) or the human can publish to it; dropped");
+        let params = json!({"stream": "ci", "kind": "done"});
+        let h = next_step("streams.publish", &params, &e, Surface::Cli).unwrap();
+        assert!(h.contains("midna triggers test") && !h.contains("deny rule") && !h.contains("request-removal"), "{h}");
+        let h = next_step("streams.publish", &params, &e, Surface::Mcp).unwrap();
+        assert!(h.contains("trigger_test") && !h.contains("rule_request_removal"), "{h}");
+        let h = next_step("rule.add", &json!({}), &RpcError::refused("denied by rule r_1"), Surface::Cli).unwrap();
+        assert!(h.contains("deny rule"), "{h}");
     }
 
     #[test]

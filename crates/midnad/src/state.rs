@@ -31,6 +31,18 @@ pub struct AppActions {
     pub asked: Option<(String, Id)>,
 }
 
+/// What the human approved of an app's link pattern preview commands (`rpc::links::preview_fingerprint`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PreviewApproval {
+    /// The fingerprint of the commands the human approved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved: Option<String>,
+    /// The last approval asked for (fingerprint, needs-you). Denied or not, it isn't asked again
+    /// until the commands change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked: Option<(String, Id)>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
@@ -48,6 +60,9 @@ pub struct State {
     /// The human's stored secrets (metadata; values are in the Keychain).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<Secret>,
+    /// Streams midnad runs (`streams.add`): their commands, folders, projects and secret names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streams: Vec<midna_proto::StreamSpec>,
     #[serde(default)]
     pub needs_you: Vec<NeedsYou>,
     /// Only values that differ from the catalog default are stored.
@@ -73,6 +88,10 @@ pub struct State {
     /// the human's `terminal.link_patterns`; each register replaces that owner's set.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub app_link_patterns: BTreeMap<String, Vec<String>>,
+    /// What the human approved of those patterns' preview commands, by owner. An owner whose
+    /// commands aren't approved still gets its links, without the preview.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub app_link_previews: BTreeMap<String, PreviewApproval>,
     /// Link menus apps registered (`links.actions.register`), by owner, with what the human
     /// approved of their commands.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -84,6 +103,9 @@ pub struct State {
     /// Today's keep-awake override (`keep_awake.set` today); dropped once its date is past.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_awake_today: Option<midna_proto::keep_awake::Today>,
+    /// While `nearby.visibility` is `everyone`: when it goes back to `paired` (unix seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nearby_everyone_until: Option<i64>,
     /// The last kernel panic report midnad handled (its file name), so it's reported once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panic_seen: Option<String>,
@@ -91,6 +113,10 @@ pub struct State {
     /// (`guard.panic_hold`, `panic.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panic_hold: Option<Id>,
+    /// Agent terminals waiting for the Mac to calm down before their agent starts, first in
+    /// line first (`guard.hold_agents_at`, `admit.rs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admit_line: Vec<Id>,
 }
 
 impl State {

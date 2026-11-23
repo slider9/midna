@@ -65,10 +65,16 @@ pub enum Menu {
     Footer,
     /// The Summary's ⋯ menu on the record on screen (`ui/summary.rs`).
     Summary,
+    /// A row's menu in the sidebar's Summaries section (its ⋯ or a right-click; `ui/shelf.rs`).
+    ShelfRow(String),
+    /// The Summaries heading's menu (its ⋯ or a right-click).
+    Shelf,
     /// The stat picker for one of the footer card's slots while customizing.
     FooterStat(usize),
     /// The footer's "Add a button" menu while customizing.
     FooterAdd,
+    /// The Mac switcher under the sidebar's name plate (`ui/mac_switcher.rs`, ⌃⌘M).
+    Macs,
 }
 
 /// What to re-fetch after an event. Coalesced and run together.
@@ -85,7 +91,8 @@ pub mod refresh {
     pub const HOOKS: u32 = 512;
     pub const KEEP_AWAKE: u32 = 1024;
     pub const USAGE: u32 = 2048;
-    pub const ALL: u32 = 0xfff;
+    pub const STREAMS: u32 = 4096;
+    pub const ALL: u32 = 0x1fff;
 }
 
 pub struct MainWindow {
@@ -113,6 +120,8 @@ pub struct MainWindow {
     /// A Resume or Stop from the paused card in flight, for this terminal.
     pub pause_busy: Option<String>,
     pub hooks_sheet: Option<crate::ui::hooks::HooksSheet>,
+    /// Nearby sharing: the Share picker and the inbox (`ui::share`).
+    pub share: crate::ui::share::Share,
     /// The Accessibility card Kass's first dictation raises (`ui/ax_prompt.rs`).
     pub ax_prompt: bool,
     pub onboarding: crate::ui::onboarding::Onboarding,
@@ -132,7 +141,13 @@ pub struct MainWindow {
     pub twilight_lights: bool,
     /// The opening hasn't revealed the whole window yet (see-through, masked, no chrome).
     pub twilight_masked: bool,
+    /// Another Mac's window: that Mac's themes (`themes.list`), its custom ones too. None until
+    /// they arrive, or when that Mac can't send them; its theme then comes from this Mac's copy.
+    pub mac_themes: Option<Vec<midna_proto::themes::ThemeDef>>,
     pub triggers_count: usize,
+    /// `streams.list`: the producers midnad runs and how they're doing (the Triggers screen and
+    /// the footer's Triggers button, `ui::triggers::streams`).
+    pub streams: Vec<midna_proto::StreamStatus>,
     /// Inline rename in progress (double-click a terminal's name).
     pub renaming: Option<crate::ui::rename::Rename>,
     /// A busy terminal ⌘W was pressed on; a second ⌘W within 2 s closes it.
@@ -173,6 +188,8 @@ pub struct MainWindow {
     pub need_anim: crate::ui::need_anim::NeedAnim,
     /// Closed rows folding away and the pane sliding to the next terminal (`ui::close_anim`).
     pub close_anim: crate::ui::close_anim::CloseAnim,
+    /// The sidebar's project list, whose scroll position says which groups it lays out (`ui::sidebar`).
+    pub sidebar_scroll: ScrollHandle,
     /// A sidebar row's ✕ and the confirm line it opens (`ui::row_close`).
     pub row_close: crate::ui::row_close::RowClose,
     /// Natural height of each foldable run of sidebar rows, measured at prepaint.
@@ -243,6 +260,7 @@ pub struct MainWindow {
     pub queue: Entity<crate::ui::queue::QueueView>,
     /// Installed IDEs and the header's Open in IDE menu.
     pub ide: crate::ide::IdePanel,
+    pub mac_menu: crate::ui::mac_switcher::MacMenu,
     /// Native composer for Kass dictation and long prompts (`composer.rs`).
     pub composer: crate::composer::Composer,
     /// The image sheet (`annotate.rs`); drafts are in the `Drafts` global.
@@ -255,6 +273,10 @@ pub struct MainWindow {
     pub dropped_at: Option<Instant>,
     pub restart_expected: bool,
     pending_refresh: u32,
+    /// Terminals whose row script runs in the next refresh, for events about them alone.
+    /// `refresh::ROWS` runs every terminal's. Each run reads git, so one per terminal on every
+    /// session event kept the sidebar's new status waiting most of a second.
+    pending_rows: std::collections::HashSet<String>,
     refresh_scheduled: bool,
     /// Refreshes started so far. Each one's `session.list` is only taken if it started at or
     /// after `sessions_floor`: refreshes overlap (header and row scripts can take a second),
@@ -263,13 +285,49 @@ pub struct MainWindow {
     sessions_floor: u64,
     /// A `front` command's terminal that `sessions` doesn't list yet (see `front_terminal`).
     front_waiting: Option<String>,
+    /// A project to open once `session.list` next answers (`open_at`).
+    open_waiting: Option<String>,
+    /// Another Mac's item to show once this window onto it has its terminals and items: its
+    /// terminal (if any) and needs-you id ("Open on <Mac>" before the window had connected).
+    pub reveal_waiting: Option<(Option<String>, Option<String>)>,
     loaded: bool,
+    /// The first terminal list has arrived (empty or not): another Mac's window shows its
+    /// connecting card and placeholder rows until then.
+    pub listed: bool,
+    /// When another Mac's window lost its link after showing its terminals (unix seconds; None
+    /// while it's up): the "as of" and "last seen" times (`remote_down`).
+    pub lost_at: Option<i64>,
     _tasks: Vec<Task<()>>,
+}
+
+/// Another Mac's window whose link dropped after it showed its terminals (design 3, option A):
+/// the last screen stays up, dimmed, typing is off, and a strip under the header says which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Down {
+    /// Trying again every few seconds: the amber strip.
+    Reconnecting,
+    /// A minute of failed tries: the red strip, tries every 30 s (midnad's drive link).
+    Offline,
+}
+
+/// Whether a window is down, and how: only another Mac's, once its list came, while its link
+/// is being tried again. A link that closed (NotRunning) shows its card saying why instead.
+pub fn down(remote: bool, listed: bool, conn: &ConnState) -> Option<Down> {
+    use midna_proto::nearby::DriveState;
+    if !remote || !listed {
+        return None;
+    }
+    match conn {
+        ConnState::Connected | ConnState::NotRunning { .. } => None,
+        ConnState::Link(p) if p.state == DriveState::Offline => Some(Down::Offline),
+        ConnState::Link(_) | ConnState::Connecting => Some(Down::Reconnecting),
+    }
 }
 
 impl MainWindow {
     pub fn new(backend: Arc<dyn Backend>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let summary_closed = crate::ui::statusbar::load_state(&backend, "summary_closed");
+        let summaries_folded = crate::ui::statusbar::load_state(&backend, "summaries_folded");
         let seen = crate::ui::statusbar::load_state(&backend, "seen");
         let mut collapsed: std::collections::HashSet<String> = crate::ui::statusbar::load_state(&backend, "collapsed");
         collapsed.extend(crate::ui::fold_peek::debug_folded());
@@ -283,11 +341,22 @@ impl MainWindow {
         let intro = crate::ui::twilight::wanted();
         if !intro {
             window.set_background_appearance(WindowBackgroundAppearance::Opaque);
-            crate::ui::twilight::native_bg(window, cx.global::<Theme>().bg);
+            crate::ui::twilight::native_bg(window, crate::theme::of(window, cx).bg);
         }
         let id = cx.entity_id();
-        let windows = crate::windows::register(cx.weak_entity(), id, window, cx);
-        cx.on_release(|m: &mut MainWindow, cx| crate::windows::closed(m.id, cx)).detach();
+        let windows = crate::windows::register(cx.weak_entity(), id, crate::backend::mac_id(&*backend), window, cx);
+        crate::theme::window_shows(window, backend.mac().map(|m| m.peer.as_str()), cx);
+        let window_id = window.window_handle().window_id();
+        cx.on_release(move |m: &mut MainWindow, cx| {
+            crate::windows::closed(m.id, cx);
+            crate::theme::window_closed(window_id, cx);
+            // Deferred until its events stop with the window, so they don't open the link again.
+            if let Some(peer) = crate::backend::mac_id(&*m.backend) {
+                let local = crate::backend::local(&m.backend);
+                cx.defer(move |cx| crate::mac_feed::window_closed(local, &peer, cx));
+            }
+        })
+        .detach();
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| weak.update(cx, |m, cx| crate::ui::close_window::should_close(m, window, cx)).unwrap_or(true));
         cx.observe_window_bounds(window, |_, _, cx| crate::windows::save_soon(cx)).detach();
@@ -321,11 +390,17 @@ impl MainWindow {
         }));
         cx.observe_window_appearance(window, |m, window, cx| m.apply_theme(window, cx)).detach();
         // Custom theme files ($MIDNA_HOME/themes) are edited by hand or by agents: follow them live.
+        // Another Mac's window asks that Mac for its themes now and then instead.
         tasks.push(cx.spawn_in(window, async move |this, cx| {
+            let mut tick = 0u32;
             loop {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
+                tick += 1;
+                if tick % 5 == 0 && this.update_in(cx, |m, window, cx| m.fetch_mac_themes(window, cx)).is_err() {
+                    break;
+                }
                 let gone = this.update_in(cx, |m, window, cx| {
-                    if crate::theme::themes_changed(&m.home()) {
+                    if !m.remote() && crate::theme::themes_changed(&m.home()) {
                         m.apply_theme(window, cx);
                     }
                 });
@@ -362,9 +437,11 @@ impl MainWindow {
         let sidebar_view = cx.new(|cx| crate::ui::sidebar::SidebarView::new(&main, window, cx));
         crate::ui::links::wire(&links, cx);
         crate::ide::detect(cx);
+        // Another Mac's window starts on its connecting card's first step.
+        let conn = if backend.mac().is_some() { ConnState::Link(crate::backend::LinkProgress::starting()) } else { ConnState::Connecting };
         let mut this = MainWindow {
             backend,
-            conn: ConnState::Connecting,
+            conn,
             projects: vec![],
             discovered: vec![],
             sessions: vec![],
@@ -373,6 +450,7 @@ impl MainWindow {
             today: Today::default(),
             rules_count: 0,
             triggers_count: 0,
+            streams: vec![],
             renaming: None,
             close_armed: None,
             quit_hold: None,
@@ -392,6 +470,7 @@ impl MainWindow {
             fold_shown: Default::default(),
             need_anim: Default::default(),
             close_anim: Default::default(),
+            sidebar_scroll: ScrollHandle::new(),
             row_close: Default::default(),
             fold_heights: Default::default(),
             webhooks: Value::Null,
@@ -402,6 +481,7 @@ impl MainWindow {
             pause_confirm: None,
             pause_busy: None,
             hooks_sheet: None,
+            share: Default::default(),
             ax_prompt: false,
             onboarding,
             twilight_seq: 0,
@@ -414,6 +494,7 @@ impl MainWindow {
             twilight_overlay: None,
             twilight_lights: true,
             twilight_masked: false,
+            mac_themes: None,
             selected: crate::dev::var("MIDNA_SELECT").ok(),
             history: Default::default(),
             navigating: false,
@@ -447,7 +528,7 @@ impl MainWindow {
             overlay_focus: cx.focus_handle(),
             toast: None,
             inbox: Default::default(),
-            summary: crate::ui::summary::SummaryPage::new(summary_closed),
+            summary: crate::ui::summary::SummaryPage::new(summary_closed, summaries_folded),
             cards: Default::default(),
             rules_view: None,
             triggers_view: None,
@@ -462,13 +543,19 @@ impl MainWindow {
             sidebar_view,
             dropped_at: None,
             ide: crate::ide::IdePanel::new(cx),
+            mac_menu: crate::ui::mac_switcher::MacMenu::new(cx),
             restart_expected: false,
             pending_refresh: 0,
+            pending_rows: Default::default(),
             refresh_scheduled: false,
             refresh_seq: 0,
             sessions_floor: 0,
             front_waiting: None,
+            open_waiting: None,
+            reveal_waiting: None,
             loaded: false,
+            listed: false,
+            lost_at: None,
             _tasks: tasks,
         };
         if intro {
@@ -520,10 +607,68 @@ impl MainWindow {
     }
 
     pub fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.remote() {
+            return self.apply_mac_theme(window, cx);
+        }
         // Re-reads custom theme files when they changed (`theme_def` then uses the cache).
         crate::theme::all_themes(&self.home());
         let def = self.resolve_theme(window);
         self.show_theme(&def, window, cx);
+    }
+
+    /// Another Mac's window shows that Mac's theme and look settings (its `settings.get` and
+    /// `themes.list`), in this window only. A theme neither Mac has keeps this Mac's.
+    fn apply_mac_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mac) = self.backend.mac().map(|m| m.peer.clone()) else { return };
+        if self.settings.is_empty() {
+            return;
+        }
+        let system_dark = matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
+        let s = |k: &str| self.setting_str(k).unwrap_or_default();
+        let id = midna_proto::themes::choose(&s("theme"), &s("theme.dark"), &s("theme.light"), system_dark);
+        let rules: Vec<String> = match self.settings.get("theme.colors") {
+            Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+            _ => vec![],
+        };
+        let mine = cx.global::<Theme>().clone();
+        let own = crate::theme::resolve_mac(self.mac_themes.as_deref(), &id, &rules);
+        // a theme this Mac picked for that Mac (Settings → Nearby), else that Mac's own
+        let picked = crate::theme::picked_for(&mac, cx);
+        let def = picked.clone().or_else(|| own.clone()).unwrap_or_else(|| mine.def.clone());
+        let mut t = Theme::from_def(&def, mine.ui_font.clone(), mine.mono_font.clone());
+        t.compact = self.compact();
+        // that Mac's engines paint in its own theme's ANSI colors; the terminal swaps them
+        t.ansi_from = picked.and(own).map(|o| o.ansi).filter(|a| *a != def.ansi);
+        let bg = t.bg;
+        crate::theme::set_mac(&mac, t, cx);
+        if !self.twilight_masked {
+            crate::ui::twilight::native_bg(window, bg);
+        }
+        window.refresh();
+        cx.notify();
+    }
+
+    /// Fetch another Mac's themes (`themes.list`), then show its theme again when they changed.
+    /// This Mac's picks for other Macs' windows are read again too (`theme::refresh_picks`).
+    pub fn fetch_mac_themes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.remote() {
+            return;
+        }
+        crate::theme::refresh_picks(crate::backend::local(&self.backend), cx);
+        let backend = self.backend.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let res = cx.background_executor().spawn(async move { backend.call("themes.list", serde_json::json!({})) }).await;
+            let Ok(v) = res else { return };
+            let Ok(list) = serde_json::from_value::<midna_proto::ThemesListResult>(v) else { return };
+            let defs: Vec<_> = list.themes.iter().filter_map(crate::theme::from_info).collect();
+            let _ = this.update_in(cx, |m, window, cx| {
+                if m.mac_themes.as_ref() != Some(&defs) {
+                    m.mac_themes = Some(defs);
+                    m.apply_theme(window, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     fn show_theme(&mut self, def: &midna_proto::themes::ThemeDef, window: &mut Window, cx: &mut Context<Self>) {
@@ -542,6 +687,10 @@ impl MainWindow {
     }
 
     fn rebind(&self, cx: &mut Context<Self>) {
+        // Shortcuts are this Mac's settings, not another Mac's.
+        if self.remote() {
+            return;
+        }
         let settings = self.settings.clone();
         let when: Vec<String> = match settings.get("keys.when") {
             Some(Value::Array(rules)) => rules.iter().filter_map(|r| r.as_str().map(str::to_string)).collect(),
@@ -557,6 +706,23 @@ impl MainWindow {
             },
             &when,
         );
+    }
+
+    /// Settings that hold for every window, not just this one: sounds, the keyboard, paste,
+    /// the Finder Quick Action, haptics and the prompt bar. They're this Mac's, so another
+    /// Mac's window leaves them alone (as with shortcuts, [`Self::rebind`]).
+    fn apply_app_wide(&self, cx: &mut Context<Self>) {
+        if self.remote() {
+            return;
+        }
+        let s = &self.settings;
+        crate::sounds::sync(s, self.backend.socket_path().parent());
+        crate::terminal::set_option_as_meta(s.get("terminal.option_as_meta").and_then(Value::as_bool).unwrap_or(true));
+        crate::terminal::set_image_paste_inline(s.get("terminal.image_paste").and_then(Value::as_str) == Some("inline"));
+        crate::terminal::set_cmd_enter_sends(s.get("terminal.cmd_enter_sends").and_then(Value::as_bool).unwrap_or(false));
+        crate::finder::sync(s.get("finder.quick_action").and_then(Value::as_bool).unwrap_or(true));
+        crate::haptics::sync(s.get("ui.haptics").and_then(Value::as_bool).unwrap_or(true));
+        crate::terminal::share_prompt_bar(s.get("terminal.prompt_bar").and_then(Value::as_str) == Some("always"), cx);
     }
 
     // ------------------------------------------------------------------ backend
@@ -578,19 +744,64 @@ impl MainWindow {
                         self.restart_expected = false;
                         crate::ui::command_bar::reload_user_commands(self, cx);
                         crate::ui::notifications::fetch(self, cx);
+                        crate::ui::share::fetch(self, cx);
                         crate::ui::summary::fetch(self, cx);
-                        if !was_connected {
+                        self.fetch_mac_themes(window, cx);
+                        let back = self.lost_at.take().is_some();
+                        if back {
+                            crate::ui::split::freeze(self, false, cx);
+                        }
+                        if back && self.terminal.is_some() {
+                            // Another Mac back: its last screen stays until the fresh one has drawn.
+                            self.pending_terminal = None;
+                            self.reattach_terminal(window, cx);
+                        } else if !was_connected {
                             // re-attach after a reconnect (the split pane and pop-outs
                             // re-attach themselves, see TerminalView::watch_stream)
                             self.terminal = None;
                             self.pending_terminal = None;
                             self.ensure_terminal(window, cx);
-                            if self.backend.label() == "midnad" && self.is_home() {
+                        }
+                        if !was_connected {
+                            if self.backend.label() == "midnad" && self.is_local_home() {
                                 crate::lifecycle::report_updates(self.backend.clone());
+                            }
+                            if self.is_local_home() {
+                                crate::macs::refresh(self.backend.clone(), cx);
                             }
                         }
                     }
-                    ConnState::NotRunning { .. } => {
+                    _ if down(self.remote(), self.listed, &st).is_some() => {
+                        // Another Mac's link is being tried again: keep its last screen, typing off.
+                        if self.lost_at.is_none() {
+                            self.lost_at = Some(crate::ui::screen_kit::now_unix());
+                            self.pending_terminal = None;
+                            if let Some(t) = &self.terminal {
+                                t.update(cx, |v, cx| v.freeze(true, cx));
+                            }
+                            crate::ui::split::freeze(self, true, cx);
+                            // "14 min ago" and the sidebar's "as of" keep up while it's down.
+                            cx.spawn(async move |this, cx| {
+                                loop {
+                                    cx.background_executor().timer(Duration::from_secs(30)).await;
+                                    let Ok(up) = this.update(cx, |m, cx| {
+                                        cx.notify();
+                                        m.lost_at.is_none()
+                                    }) else {
+                                        break;
+                                    };
+                                    if up {
+                                        break;
+                                    }
+                                }
+                            })
+                            .detach();
+                        }
+                    }
+                    ConnState::NotRunning { .. } | ConnState::Link(_) => {
+                        if self.lost_at.take().is_some() {
+                            crate::ui::split::freeze(self, false, cx);
+                        }
                         self.terminal = None;
                         self.pending_terminal = None;
                         if was_connected || self.dropped_at.is_none() {
@@ -623,7 +834,11 @@ impl MainWindow {
                     sess.custom_status = e.data.get("custom_status").cloned().and_then(|v| serde_json::from_value(v).ok());
                 }
                 if k.starts_with("session.") {
-                    what |= refresh::SESSIONS | refresh::ROWS;
+                    what |= refresh::SESSIONS;
+                    match &e.session_id {
+                        Some(id) => _ = self.pending_rows.insert(id.clone()),
+                        None => what |= refresh::ROWS,
+                    }
                     if e.session_id.is_some() && e.session_id == self.selected {
                         what |= refresh::HEADER;
                     }
@@ -643,6 +858,14 @@ impl MainWindow {
                     if key.starts_with("policy.") {
                         what |= refresh::RULES;
                     }
+                    // This Mac's name, shown beside another Mac's window.
+                    if key == "nearby.name" && self.is_local_home() {
+                        crate::macs::refresh(self.backend.clone(), cx);
+                    }
+                    // How this Mac shows its other Macs' windows (Settings → Nearby).
+                    if (key == "nearby.mac_themes" || key == "theme.colors") && self.is_local_home() {
+                        crate::theme::refresh_picks(self.backend.clone(), cx);
+                    }
                     // Which kinds count on the bell: count again.
                     if key.starts_with("notify.bell.") {
                         crate::ui::notifications::fetch(self, cx);
@@ -661,6 +884,10 @@ impl MainWindow {
                 if k.starts_with("rule.") {
                     what |= refresh::RULES;
                 }
+                // stream.health, and a stream's own events (its last event's age).
+                if k.starts_with("stream.") {
+                    what |= refresh::STREAMS;
+                }
                 if k == midna_proto::kinds::HOOKS_CHANGED {
                     self.hooks = e.data.clone();
                 }
@@ -672,7 +899,11 @@ impl MainWindow {
                 }
                 if k == midna_proto::kinds::SESSION_QUEUE {
                     crate::ui::queue::on_event(self, &e, cx);
-                    if self.is_home() && e.data.get("action").and_then(|a| a.as_str()) == Some("sent") {
+                    // Only for a message you queued: trigger, resume and agent sends stay quiet.
+                    if self.is_local_home()
+                        && e.actor.kind == "human"
+                        && e.data.get("action").and_then(|a| a.as_str()) == Some("sent")
+                    {
                         crate::sounds::play("queue_sent");
                     }
                 }
@@ -681,21 +912,24 @@ impl MainWindow {
                 {
                     crate::ui::links::fetch(self, sid, cx);
                 }
+                if k.starts_with("share.") {
+                    crate::ui::share::on_event(self, &e, cx);
+                }
                 if k == midna_proto::kinds::SUMMARY_CHANGED {
                     crate::ui::summary::fetch(self, cx);
                 }
                 if k == midna_proto::kinds::NOTIFY_POSTED || k == midna_proto::kinds::NOTIFY_READ || k == midna_proto::kinds::NOTIFY_WITHDRAWN {
                     crate::ui::notifications::on_event(self, &e, cx);
                 }
-                if k == midna_proto::kinds::NOTIFY_POSTED && self.is_home() {
+                if k == midna_proto::kinds::NOTIFY_POSTED && self.is_local_home() {
                     self.on_notification(&e, window, cx);
                 }
                 if k == midna_proto::kinds::NOTIFY_WITHDRAWN
                     && let Some(id) = e.data["id"].as_str()
                 {
-                    // Every window drops its card; the home one also clears the banner and badge.
+                    // Every window drops its card; this Mac's home one also clears the banner and badge.
                     crate::ui::toast::withdraw(self, id, cx);
-                    if self.is_home() {
+                    if self.is_local_home() {
                         crate::notify::withdraw(id);
                         crate::ui::badge::withdraw(id, cx);
                     }
@@ -705,13 +939,13 @@ impl MainWindow {
                 {
                     crate::terminal::link_stale(url);
                 }
-                if k == midna_proto::kinds::NOTIFY_CLEARED && self.is_home() {
+                if k == midna_proto::kinds::NOTIFY_CLEARED && self.is_local_home() {
                     match e.session_id.as_deref() {
                         Some(s) => crate::notify::clear(s),
                         None => crate::notify::clear_all(),
                     }
                 }
-                if k == midna_proto::kinds::NOTIFY_SOUND && self.is_home() {
+                if k == midna_proto::kinds::NOTIFY_SOUND && self.is_local_home() {
                     let fresh = midna_proto::time::parse_rfc3339(&e.at).is_some_and(|t| midna_proto::time::now_unix() - t < 30);
                     if let Ok(p) = serde_json::from_value::<midna_proto::notify::Played>(e.data.clone())
                         && fresh
@@ -725,7 +959,7 @@ impl MainWindow {
                     crate::ui::paused::on_load_event(self, k, &e.data, cx);
                 }
                 // The Mac stayed busy: offer to pause or stop the terminals behind it (once per spell).
-                if self.is_home() {
+                if self.is_local_home() {
                     use crate::ui::system_window::{self as sw, Kind};
                     let fresh = midna_proto::time::parse_rfc3339(&e.at).is_some_and(|t| midna_proto::time::now_unix() - t < 120);
                     if k == midna_proto::kinds::SYSTEM_OVERLOADED
@@ -738,6 +972,21 @@ impl MainWindow {
                     if k == midna_proto::kinds::SYSTEM_CALM {
                         sw::close(Kind::Overloaded, cx);
                     }
+                }
+                // Paired, forgotten, renamed, on or off the network, or a drive link changed: the
+                // Macs in the Window menu and the switcher follow.
+                if self.is_local_home()
+                    && matches!(
+                        k,
+                        midna_proto::kinds::PEERS_PAIRED
+                            | midna_proto::kinds::PEERS_CHANGED
+                            | midna_proto::kinds::PEERS_FORGOTTEN
+                            | midna_proto::kinds::PEERS_APPEARED
+                            | midna_proto::kinds::PEERS_LEFT
+                            | midna_proto::kinds::DRIVE_STATE
+                    )
+                {
+                    crate::macs::refresh(self.backend.clone(), cx);
                 }
                 if k == "ui.commands_changed" {
                     crate::ui::command_bar::reload_user_commands(self, cx);
@@ -755,7 +1004,8 @@ impl MainWindow {
             }
             BackendEvent::WindowCommand(v) if self.is_home() => {
                 // A command about one terminal goes to the window it shows in.
-                let target = v.get("target").and_then(|t| t.as_str()).and_then(|t| self.windows.borrow().place(t)).filter(|w| *w != self.id);
+                let mac = self.mac_id();
+                let target = v.get("target").and_then(|t| t.as_str()).and_then(|t| self.windows.borrow().place(&mac, t)).filter(|w| *w != self.id);
                 match target {
                     Some(w) => cx.defer(move |cx| crate::windows::command(w, v, cx)),
                     None => self.on_window_command(v, window, cx),
@@ -763,10 +1013,15 @@ impl MainWindow {
             }
             BackendEvent::WindowCommand(_) => {}
             BackendEvent::Notification { method, params } => {
-                if method == "updates.command" && self.is_home() {
+                if method == "updates.command" && self.is_local_home() {
                     let action = params.get("action").and_then(|a| a.as_str()).unwrap_or("").to_string();
                     if let Some(msg) = crate::lifecycle::on_daemon_command(&action, cx) {
-                        self.toast(msg, cx);
+                        // Hidden (this Mac's last window closed beside another Mac's): a banner.
+                        if self.hidden() {
+                            crate::notify::post_note("Updates", &msg);
+                        } else {
+                            self.toast(msg, cx);
+                        }
                     }
                 }
                 if method == "session.closing" && self.is_home() {
@@ -776,9 +1031,62 @@ impl MainWindow {
         }
     }
 
-    /// The main window focused last (see `windows`).
+    /// Its Mac's main window focused last (see `windows`).
     fn is_home(&self) -> bool {
         self.windows.borrow().is_home(self.id)
+    }
+
+    /// This Mac's main window focused last: it posts this Mac's banners, plays its sounds and
+    /// takes its update commands.
+    fn is_local_home(&self) -> bool {
+        !self.remote() && self.is_home()
+    }
+
+    /// This Mac's last window, closed beside another Mac's: hidden, not gone, so nothing drawn in
+    /// it is seen (see `windows`).
+    pub fn hidden(&self) -> bool {
+        self.windows.borrow().is_hidden(self.id)
+    }
+
+    /// The Mac this window shows (see `windows`).
+    pub fn mac_id(&self) -> crate::windows::MacId {
+        crate::backend::mac_id(&*self.backend)
+    }
+
+    /// This window shows another of my Macs (see `windows`).
+    /// Another Mac's window that hasn't shown its terminals yet: its link is on the way, or up
+    /// with the first list still to come (the connecting card's steps).
+    pub fn remote_loading(&self) -> bool {
+        use midna_proto::nearby::DriveState;
+        let on_the_way = matches!(&self.conn, ConnState::Link(p) if matches!(p.state, DriveState::Connecting | DriveState::Connected));
+        self.remote() && !self.listed && (on_the_way || matches!(self.conn, ConnState::Connected | ConnState::Connecting))
+    }
+
+    pub fn remote(&self) -> bool {
+        self.backend.mac().is_some()
+    }
+
+    /// Another Mac's window with its link down after it showed its terminals (see [`down`]).
+    pub fn remote_down(&self) -> Option<Down> {
+        down(self.remote(), self.listed, &self.conn)
+    }
+
+    /// Try another Mac's link again now, instead of at its next try: opening it again from this
+    /// app wakes the link's wait (midnad's `drive.open`).
+    pub fn retry_link(&self) {
+        let Some(peer) = self.backend.mac().map(|m| m.peer.clone()) else {
+            return;
+        };
+        let local = crate::backend::local(&self.backend);
+        std::thread::spawn(move || {
+            let _ = local.call("drive.open", json!({ "peer": peer }));
+        });
+    }
+
+    /// The Mac's name this window shows in its sidebar's plate and its status bar: another
+    /// Mac's always, this Mac's only while another Mac's window is open (`windows::shown_name`).
+    pub fn shown_name(&self) -> Option<String> {
+        self.windows.borrow().shown_name(self.backend.mac())
     }
 
     /// Whether `session` shows in this window (not another main window).
@@ -829,7 +1137,8 @@ impl MainWindow {
             }
             crate::notify::Show::Nothing => return,
         }
-        if !p.test && crate::sounds::app_active() {
+        // Hidden (this Mac's last window closed beside another Mac's): a banner, not its card.
+        if !p.test && crate::sounds::app_active() && !self.hidden() {
             if let (true, Some(file), true) = (p.sound, p.sound_file.as_deref(), crate::sounds::allowed_now()) {
                 crate::sounds::play_file(file, p.volume.unwrap_or(100));
             }
@@ -871,7 +1180,7 @@ impl MainWindow {
                     "triggers" => Screen::Triggers,
                     "insights" => Screen::Insights,
                     "notifications" => Screen::Notifications,
-                    "summary" => match self.current_project_id().filter(|p| p != ROOT_PROJECT_ID) {
+                    "summary" => match self.current_project_id() {
                         Some(p) => {
                             self.summary.project = Some(p);
                             Screen::Summary
@@ -938,13 +1247,14 @@ impl MainWindow {
             let _ = this.update(cx, |m, cx| {
                 m.refresh_scheduled = false;
                 let what = std::mem::take(&mut m.pending_refresh);
-                m.run_refresh(what, cx);
+                let rows = std::mem::take(&mut m.pending_rows);
+                m.run_refresh(what, rows, cx);
             });
         })
         .detach();
     }
 
-    fn run_refresh(&mut self, what: u32, cx: &mut Context<Self>) {
+    fn run_refresh(&mut self, what: u32, some_rows: std::collections::HashSet<String>, cx: &mut Context<Self>) {
         if self.conn != ConnState::Connected {
             return;
         }
@@ -1003,6 +1313,9 @@ impl MainWindow {
                         r.webhooks = call("webhooks.status", json!({}));
                         r.triggers = call("trigger.list", json!({})).map(|v| parse_list::<Value>(&v).len());
                     }
+                    if what & refresh::STREAMS != 0 {
+                        r.streams = call("streams.list", json!({})).map(|v| parse_list(&v));
+                    }
                     if what & refresh::HOOKS != 0 {
                         r.hooks = call("hooks.status", json!({}));
                     }
@@ -1036,8 +1349,10 @@ impl MainWindow {
                         }
                         r.buttons = Some((sid.clone(), looks));
                     }
-                    if what & refresh::ROWS != 0 {
-                        let ids = r.sessions.as_ref().map(|s| s.iter().map(|s| s.id.clone()).collect()).unwrap_or(row_ids);
+                    r.rows_all = what & refresh::ROWS != 0;
+                    if r.rows_all || !some_rows.is_empty() {
+                        let live: Vec<String> = r.sessions.as_ref().map(|s| s.iter().map(|s| s.id.clone()).collect()).unwrap_or(row_ids);
+                        let ids = rows_to_run(live, r.rows_all, &some_rows);
                         let on = r
                             .settings
                             .as_ref()
@@ -1074,14 +1389,9 @@ impl MainWindow {
                 if footer_changed {
                     self.request_refresh(refresh::INSIGHTS, cx);
                 }
-                crate::sounds::sync(&self.settings, self.backend.socket_path().parent());
                 self.apply_theme(window, cx);
                 self.rebind(cx);
-                crate::terminal::set_option_as_meta(self.settings.get("terminal.option_as_meta").and_then(Value::as_bool).unwrap_or(true));
-                crate::terminal::set_image_paste_inline(self.settings.get("terminal.image_paste").and_then(Value::as_str) == Some("inline"));
-                crate::terminal::set_cmd_enter_sends(self.settings.get("terminal.cmd_enter_sends").and_then(Value::as_bool).unwrap_or(false));
-                crate::finder::sync(self.settings.get("finder.quick_action").and_then(Value::as_bool).unwrap_or(true));
-                crate::haptics::sync(self.settings.get("ui.haptics").and_then(Value::as_bool).unwrap_or(true));
+                self.apply_app_wide(cx);
             }
         }
         if let Some(mut p) = r.projects {
@@ -1092,15 +1402,16 @@ impl MainWindow {
             self.discovered = d;
         }
         crate::terminal::share_preview_env(self, cx);
-        crate::terminal::share_prompt_bar(self.settings.get("terminal.prompt_bar").and_then(Value::as_str) == Some("always"), cx);
         // The selected terminal closing (⌘K, the header menu, its shell exiting): its neighbour
         // in the sidebar we had, so focus stays in its project.
         let mut closed_neighbour = None;
         let mut fronted = None;
+        let mut open_at = None;
         // An older list than the one we have (or than a terminal we just opened or closed) would
         // drop the new tab, or move the selection off it, until the next session event.
         if let Some(s) = r.sessions.filter(|_| r.seq >= self.sessions_floor) {
             self.sessions_floor = r.seq + 1;
+            self.listed = true;
             if let Some(sel) = self.selected.clone().filter(|id| self.sessions.iter().any(|x| &x.id == id) && !s.iter().any(|x| &x.id == id)) {
                 let rows = self.sidebar_rows(Some(&sel), cx);
                 closed_neighbour = neighbour(&rows, &sel, |id| s.iter().any(|x| x.id == id));
@@ -1116,7 +1427,7 @@ impl MainWindow {
             // New terminals (from an agent, a trigger, the CLI) land in the home window.
             if self.is_home() {
                 let mut w = self.windows.borrow_mut();
-                let new: Vec<&Session> = self.sessions.iter().filter(|s| !w.owned(&s.id)).collect();
+                let new: Vec<&Session> = self.sessions.iter().filter(|s| !w.owned(&s.id, self.id)).collect();
                 for s in &new {
                     w.claim(&s.id, self.id);
                 }
@@ -1126,6 +1437,7 @@ impl MainWindow {
                 }
             }
             fronted = listed(self.front_waiting.take(), &self.sessions);
+            open_at = self.open_waiting.take();
             let live = &self.sessions;
             self.marked.retain(|id| live.iter().any(|s| &s.id == id));
             if self.marked.len() < 2 {
@@ -1140,12 +1452,22 @@ impl MainWindow {
         if let Some(before) = before {
             crate::ui::close_anim::arrive(self, &before, cx);
         }
+        let needs_in = r.needs.is_some();
         if let Some(n) = r.needs {
             self.needs = n;
         }
+        // "Open on <Mac>" waited for this window's terminals and items: show them now.
+        if self.listed
+            && let Some((_, need)) = &self.reveal_waiting
+            && (needs_in || need.as_ref().is_none_or(|id| self.needs.iter().any(|n| n.id == *id)))
+            && let Some((session, need)) = self.reveal_waiting.take()
+        {
+            let mac = self.mac_id();
+            cx.defer(move |cx| crate::windows::reveal_there(mac, session, need, cx));
+        }
         crate::ui::need_anim::sync(self, cx);
         crate::ui::toast::sync(self, cx);
-        if badge && self.is_home() {
+        if badge && self.is_local_home() {
             crate::ui::badge::sync(self, cx);
         }
         if let Some(t) = r.today {
@@ -1156,6 +1478,9 @@ impl MainWindow {
         }
         if let Some(n) = r.triggers {
             self.triggers_count = n;
+        }
+        if let Some(s) = r.streams {
+            self.streams = s;
         }
         if let Some(w) = r.webhooks {
             self.webhooks = w;
@@ -1182,10 +1507,13 @@ impl MainWindow {
             self.header_buttons.insert(sid, looks);
         }
         if let Some(rows) = r.rows {
-            self.row_segments = rows;
+            merge_rows(&mut self.row_segments, rows, r.rows_all, &self.sessions);
         }
         if let Some(id) = fronted {
             self.front_terminal(id, window, cx);
+        }
+        if let Some(path) = open_at {
+            self.add_project(path, false, window, cx);
         }
         // keep a valid selection
         // (a popped-out terminal lives in its own window, never in the main pane)
@@ -1240,6 +1568,13 @@ impl MainWindow {
                     "triggers" => self.screen = Screen::Triggers,
                     "insights" => self.screen = Screen::Insights,
                     "notifications" => self.set_screen(Screen::Notifications, window, cx),
+                    // dev: Notifications › Nearby on a share (`nearby:sh_snip0001`)
+                    s if s.starts_with("nearby:") => {
+                        self.set_screen(Screen::Notifications, window, cx);
+                        crate::ui::notifications::debug_nearby(self, &s["nearby:".len()..]);
+                    }
+                    // dev: the Share picker on a snippet
+                    "share" => crate::ui::share::open(self, "cargo build --release".into(), window, cx),
                     // dev: a project's Summary (`summary:p_taskboard1`), its ⋯ menu open with `+menu`
                     s if s.starts_with("summary:") => {
                         let (pid, menu) = s["summary:".len()..].split_once('+').map_or((&s["summary:".len()..], false), |(p, _)| (p, true));
@@ -1251,14 +1586,31 @@ impl MainWindow {
                     // dev: a project's … menu open (`project-menu:p_taskboard1`)
                     s if s.starts_with("project-menu:") => self.menu = Menu::Project(s["project-menu:".len()..].to_string()),
                     "commands" => self.set_overlay(Overlay::CommandBar, window, cx),
+                    // dev: ⌘K open on a typed query (`commands:Agent on Studio: `), once the other Macs are listed
+                    s if s.starts_with("commands:") => {
+                        let q = s["commands:".len()..].to_string();
+                        cx.spawn_in(window, async move |this, cx| {
+                            cx.background_executor().timer(Duration::from_millis(1200)).await;
+                            let _ = this.update_in(cx, |m, window, cx| crate::ui::command_bar::open_with(m, q, window, cx));
+                        })
+                        .detach();
+                    }
                     "needs" => self.set_overlay(Overlay::NeedsYou, window, cx),
                     // dev: a needs-you item by id (`needs:n_settng`)
-                    s if s.starts_with("needs:") => crate::ui::needs_you::show(self, s["needs:".len()..].to_string(), window, cx),
+                    // (`needs:n_pair01+drive`: with a pairing card's drive box ticked)
+                    s if s.starts_with("needs:") => {
+                        let (id, drive) = s["needs:".len()..].split_once('+').map_or((&s["needs:".len()..], false), |(id, f)| (id, f == "drive"));
+                        crate::ui::needs_you::show(self, id.to_string(), window, cx);
+                        if drive {
+                            crate::ui::needs_you::debug_tick_drive(self, id, cx);
+                        }
+                    }
                     "toast" | "toast-long" => crate::ui::toast::debug(self, &s, cx),
                     "close-hold" | "close-hold-wait" => crate::ui::close_hold::debug(self, &s, cx),
                     "annotate" | "annotate-tray" => crate::annotate::debug(self, &s, window, cx),
                     "queue" | "queue-sent" => crate::ui::queue::debug(self, &s, window, cx),
                     "background-menu" => self.menu = Menu::Background,
+                    "more-menu" => self.menu = Menu::More,
                     "close-window" => {
                         self.close_ask = Some(Default::default());
                     }
@@ -1328,18 +1680,11 @@ impl MainWindow {
             }
         }
         // A project with no terminals is closed: it leaves the sidebar but keeps its rules
-        // and commands, and ⌘O / ⌘K "Go to project" reopen it. A pinned one stays, and so does
-        // one that keeps its Summary row (`ui::summary`).
-        // A project going with its Summary row folds away first (`ui::close_anim::summary`), and
-        // one whose last terminal just closed waits for its Summary row (`ui::close_anim::start`).
+        // and commands, and ⌘O / ⌘K "Go to project" reopen it. A pinned one stays; one that keeps
+        // its Summary has a row in the Summaries section instead (`ui::shelf`).
+        // A project whose last terminal just closed folds away first (`ui::close_anim::start`).
         groups.retain(|g| {
-            !g.sessions.is_empty()
-                || g.project.is_some_and(|p| {
-                    p.pinned
-                        || crate::ui::summary::row_wanted(self, &p.id, true)
-                        || self.close_anim.summary_leaving(&p.id).is_some_and(|l| l.whole)
-                        || self.close_anim.summary_arriving(&p.id)
-                })
+            !g.sessions.is_empty() || g.project.is_some_and(|p| p.pinned || self.close_anim.summary_leaving(&p.id).is_some_and(|l| l.whole))
         });
         let rank = |s: &Session| self.order.iter().position(|id| id == &s.id).unwrap_or(usize::MAX);
         for g in groups.iter_mut().chain(std::iter::once(&mut root)) {
@@ -1417,9 +1762,10 @@ impl MainWindow {
             return;
         }
         // Another main window has it: show it there. Nobody has it yet: it's this window's.
-        if self.windows.borrow().owned(&id) {
+        if self.windows.borrow().owned(&id, self.id) {
             if !self.shows(&id) {
-                cx.defer(move |cx| crate::windows::reveal(id, cx));
+                let mac = self.mac_id();
+                cx.defer(move |cx| crate::windows::reveal(mac, id, cx));
                 return;
             }
         } else {
@@ -1594,6 +1940,23 @@ impl MainWindow {
         .detach();
     }
 
+    /// A fresh view of the terminal on screen, shown once it has drawn (another Mac back).
+    fn reattach_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected.clone() else {
+            self.terminal = None;
+            return;
+        };
+        let size = self.terminal.as_ref().map(|t| t.read(cx).size()).unwrap_or((0, 0));
+        let view = cx.new(|cx| TerminalView::new_sized(id, self.backend.clone(), size, window, cx));
+        let sub = cx.observe_in(&view, window, |m, v, window, cx| m.promote_terminal(&v, false, window, cx));
+        self.pending_terminal = Some((view.clone(), sub));
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(1500)).await;
+            let _ = this.update_in(cx, |m, window, cx| m.promote_terminal(&view, true, window, cx));
+        })
+        .detach();
+    }
+
     fn promote_terminal(&mut self, view: &Entity<TerminalView>, force: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !self.pending_terminal.as_ref().is_some_and(|(p, _)| p == view) || !(force || view.read(cx).has_frame()) {
             return;
@@ -1755,20 +2118,49 @@ impl MainWindow {
         }
     }
 
-    /// ⌘J / the sidebar "N need you" button: open the needs-you card stack (NeedsYou-C).
+    /// ⌘J: the newest needs-you item on the Mac this window shows, as its sidebar's "N need you
+    /// ⌘J" counts, so it never takes you to another Mac (⌥⌘J does: `next_needs_you_anywhere`).
     /// Inside the stack ⌘J skips to the next card (handled by the stack).
     pub fn next_needs_you(&mut self, _: &NextNeedsYou, window: &mut Window, cx: &mut Context<Self>) {
-        // The badge's newest capsule showing (docked in this window): ⌘J goes to its terminal.
-        // A banner card showing (badge off): ⌘J is its "Go to terminal".
-        if self.overlay == Overlay::None && crate::ui::badge::newest(cx) {
-            cx.defer(crate::ui::badge::go_newest);
+        let mac = self.mac_id();
+        // The badge's newest capsule showing (docked in this window) from this window's Mac:
+        // ⌘J goes to its terminal. A banner card showing (badge off): its "Go to terminal".
+        if self.overlay == Overlay::None && crate::ui::badge::newest(&mac, cx) {
+            cx.defer(move |cx| crate::ui::badge::go_newest(mac, cx));
         } else if self.overlay == Overlay::None && crate::ui::toast::can_go(self) {
             crate::ui::toast::go(self, window, cx);
         } else if self.overlay == Overlay::NeedsYou {
             crate::ui::needs_you::skip(self, cx);
         } else {
-            self.set_overlay(Overlay::NeedsYou, window, cx);
+            crate::ui::needs_you::open_newest(self, window, cx);
         }
+    }
+
+    /// ⌥⌘J: the newest needs-you item on any of my Macs. On this Mac, its terminal with its
+    /// card (or the card in this Mac's home window); on another, that Mac's window comes forward
+    /// on it as its pill card's "Open on <Mac>" does, opening one if none is. Nothing waiting
+    /// anywhere: as ⌘J.
+    pub fn next_needs_you_anywhere(&mut self, _: &NextNeedsYouAnywhere, window: &mut Window, cx: &mut Context<Self>) {
+        let here = self.mac_id();
+        // This window's own Mac from its own list (the freshest); the others as followed.
+        let local = if here.is_none() { self.needs.clone() } else { crate::windows::local_needs(cx) };
+        let feeds = crate::mac_feed::list(cx);
+        let mut macs: Vec<(Option<&str>, &[NeedsYou])> = vec![(None, &local)];
+        if let Some(peer) = here.as_deref() {
+            macs.push((Some(peer), &self.needs));
+        }
+        macs.extend(feeds.iter().filter(|f| Some(&f.mac.peer) != here.as_ref()).map(|f| (Some(f.mac.peer.as_str()), &f.needs[..])));
+        let Some((mac, n)) = crate::ui::mac_tab::newest(macs) else {
+            return self.next_needs_you(&NextNeedsYou, window, cx);
+        };
+        let (session, need) = (n.session_id.clone(), Some(n.id.clone()));
+        crate::lifecycle::log(&format!("⌥⌘J: newest is {} on {}", n.id, mac.as_deref().unwrap_or("this Mac")));
+        let name = mac.as_ref().and_then(|p| feeds.iter().find(|f| f.mac.peer == *p)).map(|f| f.mac.name.clone());
+        let local_backend = crate::backend::local(&self.backend);
+        cx.defer(move |cx| match (mac, name) {
+            (Some(peer), Some(name)) => crate::windows::reveal_on_mac(&local_backend, crate::backend::Mac { peer, name }, session, need, cx),
+            (mac, _) => crate::windows::reveal_there(mac, session, need, cx),
+        });
     }
 
     pub fn open_session(&mut self, project: Option<String>, agent: Option<AgentKind>, cx: &mut Context<Self>) {
@@ -1899,6 +2291,13 @@ impl MainWindow {
     /// Add `path` as a project (a no-op if it already is one), then go to it: its first
     /// terminal outside the Background group, or what `projects.empty_opens` asks for when it
     /// has none. `other` (⌥) always opens a new one of the kind the setting doesn't pick.
+    /// Open the project at `path`, as ⌘K's project rows do, once this window has its terminals
+    /// (a window that just opened has none yet, and would open a second terminal there).
+    pub fn open_at(&mut self, path: String, cx: &mut Context<Self>) {
+        self.open_waiting = Some(path);
+        self.request_refresh(refresh::SESSIONS, cx);
+    }
+
     pub fn add_project(&mut self, path: String, other: bool, _window: &mut Window, cx: &mut Context<Self>) {
         self.rpc("project.add", json!({ "path": path }), cx, move |m, v, window, cx| {
             let Some(pid) = v.get("id").and_then(|x| x.as_str()).map(str::to_string) else {
@@ -2262,6 +2661,10 @@ impl MainWindow {
             return;
         }
         let order: Vec<String> = self.ordered_sessions().iter().map(|s| s.id.clone()).filter(|s| !crate::ui::popout::is_popped(s, cx)).collect();
+        // With rows in the Summaries section, they come after the terminals (`ui::shelf`).
+        if crate::ui::shelf::step(self, &order, step, window, cx) {
+            return;
+        }
         if order.is_empty() {
             return;
         }
@@ -2301,6 +2704,7 @@ impl MainWindow {
         el.on_action(cx.listener(Self::approve_once))
             .on_action(cx.listener(Self::deny))
             .on_action(cx.listener(Self::next_needs_you))
+            .on_action(cx.listener(Self::next_needs_you_anywhere))
             .on_action(cx.listener(Self::new_terminal))
             .on_action(cx.listener(Self::new_agent))
             .on_action(cx.listener(Self::new_terminal_root))
@@ -2342,7 +2746,7 @@ impl MainWindow {
             .on_action(cx.listener(|m, _: &OpenSettings, _w, cx| crate::ui::settings::open(m.backend.clone(), cx)))
             .on_action(cx.listener(|m, _: &Dismiss, w, cx| {
                 if m.menu != Menu::None {
-                    if matches!(m.menu, Menu::Links | Menu::Subagents | Menu::Ide) {
+                    if matches!(m.menu, Menu::Links | Menu::Subagents | Menu::Ide | Menu::Macs) {
                         m.focus_terminal(w, cx);
                     }
                     m.menu = Menu::None;
@@ -2415,11 +2819,12 @@ impl MainWindow {
                 // On the Summary already: back to the terminal, as the screens' own keys do.
                 if m.screen == Screen::Summary {
                     m.set_screen(Screen::Terminal, w, cx);
-                } else if let Some(p) = m.current_project_id().filter(|p| p != ROOT_PROJECT_ID) {
+                } else if let Some(p) = m.current_project_id() {
                     crate::ui::summary::open(m, p, w, cx);
                 }
             }))
             .on_action(cx.listener(|m, _: &ToggleSidebar, _w, cx| crate::ui::sidebar::toggle_collapsed(m, cx)))
+            .on_action(cx.listener(|m, _: &ToggleMacSwitcher, w, cx| crate::ui::mac_switcher::toggle(m, w, cx)))
             .on_action(cx.listener(|m, _: &CopySessionId, _w, cx| m.copy_session_id(cx)))
             .on_action(cx.listener(|m, _: &ToggleMute, _w, cx| m.toggle_mute(cx)))
             .on_action(cx.listener(|m, _: &ToggleSplitOrientation, _w, cx| crate::ui::split::flip(m, cx)))
@@ -2444,10 +2849,13 @@ struct RefreshResult {
     keep_awake: Option<Value>,
     usage: Option<midna_proto::UsageGetResult>,
     triggers: Option<usize>,
+    streams: Option<Vec<midna_proto::StreamStatus>>,
     header: Option<(String, Vec<Segment>)>,
     status: Option<(String, HashMap<String, Vec<Segment>>)>,
     buttons: Option<(String, HashMap<String, Vec<Segment>>)>,
     rows: Option<HashMap<String, Vec<Segment>>>,
+    /// `rows` holds every terminal's, not just those `pending_rows` named.
+    rows_all: bool,
 }
 
 pub struct Group<'a> {
@@ -2553,9 +2961,27 @@ fn listed(id: Option<String>, sessions: &[Session]) -> Option<String> {
     id.filter(|id| sessions.iter().any(|s| &s.id == id))
 }
 
+/// The terminals a refresh runs the row script for: every live one, or only the live ones
+/// an event named.
+fn rows_to_run(live: Vec<String>, all: bool, named: &std::collections::HashSet<String>) -> Vec<String> {
+    live.into_iter().filter(|id| all || named.contains(id)).collect()
+}
+
+/// A full run replaces every row's segments; a run for some terminals replaces only theirs,
+/// and drops terminals that are gone.
+fn merge_rows(rows: &mut HashMap<String, Vec<Segment>>, new: HashMap<String, Vec<Segment>>, all: bool, sessions: &[Session]) {
+    if all {
+        *rows = new;
+        return;
+    }
+    rows.extend(new);
+    rows.retain(|id, _| sessions.iter().any(|s| &s.id == id));
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{background_note, busy_count_phrase, busy_phrase, listed, neighbour, RowGroup};
+    use super::{background_note, busy_count_phrase, busy_phrase, listed, merge_rows, neighbour, rows_to_run, RowGroup};
+    use crate::model::Segment;
     use crate::model::{Session, StatusState};
     use midna_proto::{AgentInfo, BackgroundTask};
 
@@ -2565,6 +2991,28 @@ mod tests {
         assert_eq!(listed(Some("s1".into()), &sessions).as_deref(), Some("s1"));
         assert_eq!(listed(Some("closed".into()), &sessions), None);
         assert_eq!(listed(None, &sessions), None);
+    }
+
+    #[test]
+    fn an_event_runs_only_its_terminals_row_script() {
+        let live = || vec!["s1".to_string(), "s2".into(), "s3".into()];
+        let named: std::collections::HashSet<String> = ["s2".to_string(), "closed".into()].into();
+        assert_eq!(rows_to_run(live(), false, &named), ["s2"], "only live terminals an event named");
+        assert_eq!(rows_to_run(live(), true, &named), ["s1", "s2", "s3"]);
+        assert!(rows_to_run(live(), false, &Default::default()).is_empty());
+    }
+
+    #[test]
+    fn rows_from_some_terminals_keep_the_others() {
+        let seg = |t: &str| vec![Segment { text: t.into(), ..Default::default() }];
+        let sessions: Vec<Session> = ["s1", "s2"].iter().map(|id| Session { id: (*id).into(), ..Default::default() }).collect();
+        let old = || -> std::collections::HashMap<String, Vec<Segment>> { [("s1".to_string(), seg("a")), ("s2".into(), seg("b")), ("gone".into(), seg("c"))].into() };
+        let mut rows = old();
+        merge_rows(&mut rows, [("s2".to_string(), seg("b2"))].into(), false, &sessions);
+        assert_eq!(rows, [("s1".to_string(), seg("a")), ("s2".into(), seg("b2"))].into(), "s1 kept, s2 replaced, a closed terminal dropped");
+        let mut rows = old();
+        merge_rows(&mut rows, [("s2".to_string(), seg("b2"))].into(), true, &sessions);
+        assert_eq!(rows, [("s2".to_string(), seg("b2"))].into(), "a full run replaces them all");
     }
 
     #[test]
@@ -2618,5 +3066,73 @@ mod tests {
         let r = rows(&[("a1", Some("a")), ("b1", Some("b")), ("g1", Some("bg"))]);
         assert_eq!(neighbour(&r, "g1", |_| true).as_deref(), Some("b1"));
         assert_eq!(neighbour(&r, "missing", |_| true), None);
+    }
+
+    /// "Open on <Mac>" from the pill with no window onto that Mac: one opens and connects, and
+    /// once it has that Mac's terminals it shows the item's card.
+    #[gpui_kit::test]
+    fn open_on_a_mac_waits_for_its_window_to_list_then_shows_the_card(cx: &mut gpui_kit::TestAppContext) {
+        use crate::backend::{Backend, Mac};
+        use crate::model::{NeedsYou, parse_list};
+        use std::sync::Arc;
+        cx.update(|cx| cx.set_global(crate::theme::Theme::from_def(&midna_proto::themes::builtin("twilight").unwrap(), "ui".into(), "mono".into())));
+        let here: Arc<dyn Backend> = Arc::new(crate::backend::fake::FakeBackend::new());
+        let mac = Mac { peer: "7".repeat(64), name: "Morgan's Mac mini".into() };
+        let mini = crate::backend::for_mac(&here, mac.clone());
+        let needs: Vec<NeedsYou> = parse_list(&mini.call("needs_you.list", serde_json::json!({})).unwrap());
+        let need = needs.into_iter().find(|n| n.is_approval() && n.session_id.is_some()).unwrap();
+        cx.update(|cx| crate::windows::reveal_on_mac(&here, mac.clone(), need.session_id.clone(), Some(need.id.clone()), cx));
+        let w = cx.windows().into_iter().find_map(|w| w.downcast::<super::MainWindow>()).expect("a window onto the Mac mini");
+        w.read_with(cx, |m, _| {
+            assert_eq!(m.mac_id(), Some(mac.peer.clone()));
+            assert_eq!(m.reveal_waiting, Some((need.session_id.clone(), Some(need.id.clone()))), "held until it's connected");
+        })
+        .unwrap();
+        // Its first list comes in (the terminal itself isn't attached here: its card shows).
+        w.update(cx, |m, window, cx| {
+            let r = super::RefreshResult { seq: m.refresh_seq, sessions: Some(vec![]), needs: Some(vec![need.clone()]), ..Default::default() };
+            m.apply_refresh(r, window, cx);
+        })
+        .unwrap();
+        w.read_with(cx, |m, _| {
+            assert_eq!(m.reveal_waiting, None);
+            assert_eq!(m.overlay, super::Overlay::NeedsYou);
+            assert_eq!(m.stack.clicked.as_deref(), Some(need.id.as_str()));
+        })
+        .unwrap();
+        // This Mac got no window from it.
+        assert_eq!(cx.windows().len(), 1);
+    }
+
+    /// Sounds, the keyboard and the prompt bar hold for every window, so they follow this Mac's
+    /// settings: a window onto another Mac gets that Mac's settings but leaves them alone.
+    #[gpui_kit::test]
+    fn another_macs_settings_leave_this_macs_app_wide_ones_alone(cx: &mut gpui_kit::TestAppContext) {
+        use crate::backend::{Backend, Mac};
+        use serde_json::{Value, json};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        cx.update(|cx| cx.set_global(crate::theme::Theme::from_def(&midna_proto::themes::builtin("twilight").unwrap(), "ui".into(), "mono".into())));
+        // This Mac's (no window of its own here: its theme would be cached to the cwd).
+        let mine: HashMap<String, Value> = [("notify.sounds".to_string(), json!(true))].into();
+        crate::sounds::sync(&mine, None);
+        cx.update(|cx| crate::terminal::share_prompt_bar(true, cx));
+        let app_wide = |cx: &mut gpui_kit::TestAppContext| (crate::sounds::synced("notify.sounds"), cx.update(|cx| crate::terminal::prompt_bar_shared(cx)));
+        let mut theirs = crate::backend::fake::settings_catalog();
+        theirs.retain(|e| !["notify.sounds", "terminal.prompt_bar"].contains(&e.key.as_str()));
+        for (key, value) in [("notify.sounds", json!(false)), ("terminal.prompt_bar", json!("scrolled"))] {
+            theirs.push(crate::model::SettingEntry { key: key.into(), value, default: Value::Null, description: String::new(), human_only: false, cli: String::new() });
+        }
+        // Never parked: its terminals would attach, and their threads would wake the test's.
+        let here: Arc<dyn Backend> = Arc::new(crate::backend::fake::FakeBackend::new());
+        let mini = crate::backend::for_mac(&here, Mac { peer: "7".repeat(64), name: "Morgan's Mac mini".into() });
+        let w = cx.update(|cx| crate::windows::open(mini, None, cx)).unwrap();
+        w.update(cx, |m, window, cx| {
+            let r = super::RefreshResult { seq: m.refresh_seq, settings: Some(theirs), ..Default::default() };
+            m.apply_refresh(r, window, cx);
+        })
+        .unwrap();
+        w.read_with(cx, |m, _| assert_eq!(m.settings.get("notify.sounds"), Some(&json!(false)), "its window has that Mac's settings")).unwrap();
+        assert_eq!(app_wide(cx), (json!(true), true), "still this Mac's");
     }
 }

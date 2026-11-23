@@ -38,8 +38,10 @@
 //! window's top right and follows it there (laid out as top right, whatever its corner; it can't
 //! be dragged), a band of the need color sweeping across it when something comes in and every
 //! `REMIND` while anything waits. Leaving midna, it springs back to its corner. ⌘J goes to the
-//! newest capsule's terminal while one shows (`newest`, `go_newest`). While the screen is
-//! shared (`notify.badge.sharing`), it hides, or shows only its number, or carries on.
+//! newest capsule's terminal while one shows from the Mac whose window is in front (`newest`,
+//! `go_newest`); ⌥⌘J goes to the newest item on any Mac (`MainWindow::next_needs_you_anywhere`).
+//! While the screen is shared (`notify.badge.sharing`), it hides, or shows only its number, or
+//! carries on.
 //! A `notify.send` notification (`Sent`) replaces the one with its id, may open a URL instead of
 //! a terminal and have buttons on its card, and reports what you did with it (`notify.respond`).
 //!
@@ -58,6 +60,7 @@ use crate::icons::Icon;
 use crate::model::*;
 use crate::theme::Theme;
 use super::button_slots::Slot;
+use super::mac_tab;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use midna_proto::notify::Posted;
@@ -329,17 +332,25 @@ fn prevent_activation(ns: &objc2_app_kit::NSWindow, on: bool) {
     }
 }
 
+/// Whether `url` opens the same from any Mac (a web link, not a file or an app's own).
+fn web_url(url: &str) -> bool {
+    let u = url.trim_start().to_ascii_lowercase();
+    u.starts_with("https://") || u.starts_with("http://")
+}
+
 /// A `notify.send` notification's id, URL and buttons.
 #[derive(Clone)]
 struct Sent {
     id: String,
     open: Option<String>,
     actions: Vec<String>,
+    /// Another Mac's (its peer): what you do with it goes back over that Mac's link.
+    mac: Option<String>,
 }
 
 impl Sent {
     fn of(p: &Posted) -> Option<Sent> {
-        Some(Sent { id: p.id.clone()?, open: p.open.clone(), actions: p.actions.clone() })
+        Some(Sent { id: p.id.clone()?, open: p.open.clone(), actions: p.actions.clone(), mac: None })
     }
 }
 
@@ -360,12 +371,10 @@ struct Waiting {
     detail: Option<String>,
     command: Option<String>,
     approval: bool,
-    /// A question's options (label, description), numbered as in the terminal, and whether
-    /// any number of them can be picked. Clicking one answers it (`session.answer_question`).
-    options: Vec<(String, String)>,
-    multi: bool,
-    /// The question's text: the picker must still show it for a click to answer.
-    question: Option<String>,
+    /// A question (and the picker's others, in its `more`). Its card shows one at a time,
+    /// numbered as in the terminal; once each has an answer they all go together
+    /// (`session.answer_question`). The picker must still show them for that to work.
+    ask: Option<NeedsYouQuestion>,
     /// Its kind's image (`notify.image[.<kind>]`): the list row's thumbnail and the card's.
     image: Option<PathBuf>,
     /// When it came in (RFC 3339): the list shows the newest first.
@@ -373,6 +382,18 @@ struct Waiting {
     /// A passing notification held in the list for a while (`BUMPED`): when it goes, and the
     /// whole time its tint drains over.
     timer: Option<(Instant, Duration)>,
+    /// Another Mac's (its peer): it shows in that Mac's list, and its card acts on it over that
+    /// Mac's link (`need` is its id there).
+    mac: Option<String>,
+    /// Approving it can only be done at its Mac: its card says "Decide at <Mac>" instead.
+    local_only: bool,
+    /// Another Mac's: where it is there ("project › terminal"), after the Mac's name on the
+    /// card's top line.
+    on: Option<String>,
+    /// Another Mac's, while that Mac can't be reached (`Reach::Asleep`): its row greys out and
+    /// its card can't act on it until it wakes. `since`: when its link dropped (unix seconds).
+    asleep: bool,
+    since: Option<i64>,
 }
 
 /// A capsule beside the badge.
@@ -408,6 +429,11 @@ struct Line {
     /// The notification it came from, and whether `tick` has logged it as out too long.
     seq: u64,
     stale_logged: bool,
+    /// Another Mac's item (its name): a bar of that Mac's colour on its edge, and it says which
+    /// Mac. Clicking it opens that Mac's list, as its tab does, and it flies into its row there.
+    mac: Option<String>,
+    /// That Mac's peer.
+    peer: Option<String>,
 }
 
 impl Line {
@@ -447,6 +473,9 @@ impl Landing {
 #[derive(Clone, Default)]
 struct Zones {
     badge: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The Mac tabs on the badge's corner, by peer: they're the badge's (a press on one is a press
+    /// on it), each opening its own Mac's list.
+    tabs: Rc<RefCell<Vec<(String, Bounds<Pixels>)>>>,
     line: Rc<Cell<Option<Bounds<Pixels>>>>,
     panel: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// In the list: its rows on screen, the part they scroll in, and Clear.
@@ -458,6 +487,7 @@ struct Zones {
 impl Zones {
     fn clear(&self) {
         self.badge.set(None);
+        self.tabs.borrow_mut().clear();
         self.line.set(None);
         self.panel.set(None);
         self.rows.borrow_mut().clear();
@@ -466,7 +496,27 @@ impl Zones {
     }
 
     fn hit(&self, p: Point<Pixels>) -> Option<&'static str> {
+        if self.tabs.borrow().iter().any(|(_, b)| b.contains(&p)) {
+            return Some("badge");
+        }
         [("badge", &self.badge), ("line", &self.line), ("panel", &self.panel)].into_iter().find(|(_, z)| z.get().is_some_and(|b| b.contains(&p))).map(|(n, _)| n)
+    }
+
+    /// The part of the pill at `p`: a Mac's tab (its peer), or the pill (this Mac's, `Some(None)`).
+    fn part(&self, p: Point<Pixels>) -> Option<Option<String>> {
+        if let Some((peer, _)) = self.tabs.borrow().iter().find(|(_, b)| b.contains(&p)) {
+            return Some(Some(peer.clone()));
+        }
+        self.badge.get().is_some_and(|b| b.contains(&p)).then_some(None)
+    }
+
+    /// The middle (window x) of a part of the pill, as it last painted.
+    fn middle(&self, part: &Option<String>) -> Option<f32> {
+        let b = match part {
+            Some(peer) => self.tabs.borrow().iter().find(|(p, _)| p == peer).map(|(_, b)| *b),
+            None => self.badge.get(),
+        }?;
+        Some(f32::from(b.center().x))
     }
 
     /// The pointer keeps the open list up: on a row (or within `KEEP` of one) where it shows, or
@@ -477,9 +527,34 @@ impl Zones {
     }
 }
 
+/// The open list switching to another Mac's (clicking the other part of the pill): the old
+/// list's rows slide out toward the part you left as the new one's slide in from the part you
+/// clicked; the notch glides across and the list's height follows.
+struct Switch {
+    at: Instant,
+    /// `mac_tab::slide_dir`: +1, the new rows come in from the right.
+    dir: f32,
+    /// The old list: its rows, how far it was scrolled and how tall it stood.
+    rows: Vec<Waiting>,
+    scroll: f32,
+    height: f32,
+    /// The middle of the part you left (window x): where the notch glides from.
+    from_x: Option<f32>,
+    /// Dev (`MIDNA_DEBUG_BADGE=switch:<ms>`): held this far in.
+    held: Option<Duration>,
+}
+
+impl Switch {
+    fn since(&self, now: Instant) -> Duration {
+        self.held.unwrap_or_else(|| now.duration_since(self.at))
+    }
+}
+
 /// A press on the badge (Cocoa screen coordinates).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Press {
+    /// Which part: None the pill, or a Mac's tab (its peer).
+    part: Option<String>,
     /// The pointer and the window's origin when it went down.
     mouse: (f64, f64),
     origin: (f64, f64),
@@ -524,6 +599,9 @@ pub struct Badge {
     answered: Vec<(String, Instant)>,
     /// A multi-select question's options picked so far on its card, by needs-you id.
     picks: HashMap<String, Vec<usize>>,
+    /// The answers so far to a picker of several questions, by needs-you id: the card shows
+    /// the next one.
+    steps: HashMap<String, Vec<Vec<usize>>>,
     lines: VecDeque<Line>,
     serial: u64,
     /// The count shown, the one it rolled from and the roll's id.
@@ -620,8 +698,30 @@ pub struct Badge {
     /// Midna came forward with the badge as its key window, and focus went to a main window.
     handed_off: bool,
     /// `MIDNA_DEBUG_BADGE`: open the list (`list`), the list with its first card (`card`) or
-    /// the menu (`menu`) once there's something.
+    /// the menu (`menu`) once there's something; another Mac's list (`mac`), or this Mac's
+    /// switching to another's, held `<ms>` in (`switch:<ms>`).
     debug: Option<String>,
+    /// My other Macs (`mac_feed`): a tab on the badge's corner for each with something waiting.
+    macs: Vec<mac_tab::Tab>,
+    arrivals: u64,
+    /// Another Mac's capsule, springing out a moment after its tab pops on.
+    mac_line: Option<(Instant, Line)>,
+    /// What waits on my other Macs, as their lists' rows (ids `mac_tab::row_id`).
+    remote: Vec<Waiting>,
+    /// Whose list is open (or was last): None this Mac's (the pill), or another Mac's peer (its
+    /// tab). Each list shows only its own Mac's.
+    list_mac: Option<String>,
+    switch: Option<Switch>,
+    /// The part of the pill the pointer's on: a Mac's tab (its peer), or None.
+    hover_part: Option<String>,
+    /// Where each part of the pill stood last frame (window x of its middle): the zones are
+    /// measured again as a frame paints, after the list's header points its notch.
+    middles: Vec<(Option<String>, f32)>,
+    /// What VoiceOver last got told the badge says.
+    spoken: String,
+    /// The tooltip's keys line (`mac_tab::keys`), as `keys.next_needs_you` and
+    /// `keys.next_needs_you_anywhere` are bound.
+    keys: String,
     _ticker: Task<()>,
 }
 
@@ -707,19 +807,28 @@ pub fn seen(session: &str, cx: &mut App) {
     });
 }
 
-/// Docked in midna's window with a capsule showing beside it: ⌘J goes to it (`go_newest`).
-pub fn newest(cx: &App) -> bool {
+/// Docked in midna's window with a capsule showing beside it from `mac` (the front window's
+/// Mac: None this one, or another's peer): ⌘J goes to it (`go_newest`). A capsule from another
+/// Mac than the window's isn't ⌘J's, so ⌘J never takes you across Macs.
+pub fn newest(mac: &crate::windows::MacId, cx: &App) -> bool {
     let Some(h) = handle(cx) else { return false };
-    h.read(cx).is_ok_and(|b| b.shown && b.within && b.lines.front().is_some_and(|l| l.leaving.is_none() && (l.session.is_some() || l.need.is_some())))
+    h.read(cx).is_ok_and(|b| b.shown && b.within && b.front_line(mac).is_some())
 }
 
-/// Go to the newest capsule's terminal (or its needs-you card), as clicking it does.
-pub fn go_newest(cx: &mut App) {
+/// Go to the newest capsule's terminal (or its needs-you card) on `mac`, as clicking it does on
+/// this Mac. Another Mac's goes there the way its card's "Open on <Mac>" does.
+pub fn go_newest(mac: crate::windows::MacId, cx: &mut App) {
     let Some(h) = handle(cx) else { return };
     let _ = h.update(cx, |b, _, cx| {
-        let Some(l) = b.lines.front().filter(|l| l.leaving.is_none()) else { return };
-        let held = l.need.is_none().then(|| l.waiting.clone()).flatten();
+        let Some(l) = b.front_line(&mac) else { return };
+        if l.peer.is_some() {
+            if let Some(w) = b.line_row(l).cloned() {
+                b.open_row_on(&w, cx);
+            }
+            return;
+        }
         let (session, need, sent) = (l.session.clone(), l.need.clone(), l.sent.clone());
+        let held = l.need.is_none().then(|| l.waiting.clone()).flatten();
         b.open(session, need, held, sent, false, cx);
     });
 }
@@ -736,6 +845,108 @@ pub fn push(m: &crate::app::MainWindow, seq: u64, session: Option<String>, p: Po
 pub fn withdraw(id: &str, cx: &mut App) {
     let Some(h) = handle(cx) else { return };
     let _ = h.update(cx, |b, _, cx| b.withdraw(id, cx));
+}
+
+/// A needs-you item's row words: its title, detail and command.
+fn words(n: &NeedsYou) -> (String, Option<String>, Option<String>) {
+    // a setting change reads as the setting, not the call
+    let change = n.setting.is_some();
+    let command = n.approval.as_ref().map(|a| a.action.value.clone()).filter(|v| !v.is_empty() && !change);
+    let title = match n.question.as_ref().filter(|q| !q.text.trim().is_empty()) {
+        Some(q) if !q.header.trim().is_empty() => q.header.trim().to_string(),
+        Some(_) => "Asked a question".to_string(),
+        None => super::setting_change::title(n).unwrap_or_else(|| capitalize(n.title.trim())),
+    };
+    let detail = n.question.as_ref().map(|q| q.text.trim().to_string()).or_else(|| super::setting_change::summary(n)).or_else(|| Some(n.detail.trim().to_string())).filter(|d| !d.is_empty() && Some(d) != command.as_ref());
+    (title, detail, command)
+}
+
+/// Another Mac's row its card opens there ("Open on <Mac>"): an item, or a post from a terminal
+/// there with no web link (that one opens here).
+fn opens_on_mac(w: &Waiting) -> bool {
+    let web = w.sent.as_ref().and_then(|s| s.open.as_deref()).is_some_and(web_url);
+    w.mac.is_some() && (w.need.is_some() || (w.session.is_some() && !web))
+}
+
+/// What waits on my other Macs, as their lists' rows. Their cards act on them over that Mac's
+/// link: `need` and `session` are its ids there.
+fn remote_rows(feeds: &[crate::mac_feed::Feed], colors: &HashMap<String, String>) -> Vec<Waiting> {
+    let mut rows = vec![];
+    for f in feeds {
+        for n in &f.needs {
+            let category = category_of(n.kind).to_string();
+            let (title, detail, command) = words(n);
+            let place = f.place(n);
+            let on = place.map(|p| format!("{}{}", p.project.as_ref().map(|p| format!("{p} › ")).unwrap_or_default(), p.terminal));
+            let since = match f.reach {
+                crate::mac_feed::Reach::Asleep { since } => Some(since),
+                _ => None,
+            };
+            rows.push(Waiting {
+                id: mac_tab::row_id(&f.mac.peer, &n.id),
+                sent: None,
+                need: Some(n.id.clone()),
+                session: n.session_id.clone(),
+                name: place.map_or_else(|| f.mac.name.clone(), |p| p.terminal.clone()),
+                label: midna_proto::notify::category(&category).map(|c| c.label.to_string()).unwrap_or_default(),
+                color: colors.get(&category).cloned().unwrap_or_else(|| default_color(&category).into()),
+                category,
+                title,
+                detail,
+                command,
+                approval: n.is_approval(),
+                ask: n.question.clone(),
+                image: None,
+                at: n.created_at.clone(),
+                timer: None,
+                mac: Some(f.mac.peer.clone()),
+                local_only: n.local_only,
+                on,
+                asleep: since.is_some(),
+                since: since.flatten(),
+            });
+        }
+        for p in f.held() {
+            rows.push(remote_post(f, p, colors));
+        }
+    }
+    rows
+}
+
+/// Another Mac's post that stays, as its list's row. Its buttons, Dismiss and Open go back
+/// over that Mac's link (`Sent::mac`). Its image is a file over there: none here.
+fn remote_post(f: &crate::mac_feed::Feed, post: &crate::mac_feed::Post, colors: &HashMap<String, String>) -> Waiting {
+    let p = &post.posted;
+    let body = midna_proto::notify::plain_body(&p.body);
+    let mut lines = body.lines().map(str::trim).filter(|l| !l.is_empty());
+    let place = f.place_of(post.session.as_deref());
+    let since = match f.reach {
+        crate::mac_feed::Reach::Asleep { since } => Some(since),
+        _ => None,
+    };
+    Waiting {
+        id: mac_tab::row_id(&f.mac.peer, &post.id()),
+        sent: Sent::of(p).map(|s| Sent { mac: Some(f.mac.peer.clone()), ..s }),
+        need: None,
+        session: post.session.clone(),
+        name: place.map_or_else(|| f.mac.name.clone(), |p| p.terminal.clone()),
+        label: p.label.clone().or_else(|| midna_proto::notify::category(&p.category).map(|c| c.label.to_string())).unwrap_or_default(),
+        color: p.color.clone().or_else(|| colors.get(&p.category).cloned()).unwrap_or_else(|| default_color(&p.category).into()),
+        category: p.category.clone(),
+        title: lines.next().unwrap_or(&p.title).to_string(),
+        detail: Some(lines.collect::<Vec<_>>().join("\n")).filter(|d| !d.is_empty()),
+        command: None,
+        approval: false,
+        ask: None,
+        image: None,
+        at: post.at.clone(),
+        timer: None,
+        mac: Some(f.mac.peer.clone()),
+        local_only: false,
+        on: place.map(|p| format!("{}{}", p.project.as_ref().map(|p| format!("{p} › ")).unwrap_or_default(), p.terminal)),
+        asleep: since.is_some(),
+        since: since.flatten(),
+    }
 }
 
 /// The home window's needs-you items and settings changed.
@@ -767,6 +978,7 @@ pub fn sync(m: &crate::app::MainWindow, cx: &mut App) {
     };
     let colors: HashMap<String, String> =
         m.settings.iter().filter_map(|(k, v)| Some((k.strip_prefix("notify.color.")?.to_string(), v.as_str()?.to_string()))).collect();
+    let keys = mac_tab::keys(&m.key_label("keys.next_needs_you"), &m.key_label("keys.next_needs_you_anywhere"));
     let home = midna_proto::paths::midna_home();
     let image = |kind: &str| midna_proto::notify::kind_image(&home, kind, |k| setting(k).unwrap_or_default());
     let needs: Vec<Waiting> = m
@@ -775,15 +987,7 @@ pub fn sync(m: &crate::app::MainWindow, cx: &mut App) {
         .map(|n| {
             let category = category_of(n.kind).to_string();
             let image = image(&category);
-            // a setting change reads as the setting, not the call
-            let change = n.setting.is_some();
-            let command = n.approval.as_ref().map(|a| a.action.value.clone()).filter(|v| !v.is_empty() && !change);
-            let title = match n.question.as_ref().filter(|q| !q.text.trim().is_empty()) {
-                Some(q) if !q.header.trim().is_empty() => q.header.trim().to_string(),
-                Some(_) => "Asked a question".to_string(),
-                None => super::setting_change::title(n).unwrap_or_else(|| capitalize(n.title.trim())),
-            };
-            let detail = n.question.as_ref().map(|q| q.text.trim().to_string()).or_else(|| super::setting_change::summary(n)).or_else(|| Some(n.detail.trim().to_string())).filter(|d| !d.is_empty() && Some(d) != command.as_ref());
+            let (title, detail, command) = words(n);
             Waiting {
                 id: n.id.clone(),
                 sent: None,
@@ -797,12 +1001,15 @@ pub fn sync(m: &crate::app::MainWindow, cx: &mut App) {
                 detail,
                 command,
                 approval: n.is_approval(),
-                options: options_of(n),
-                multi: n.question.as_ref().is_some_and(|q| q.multi_select),
-                question: n.question.as_ref().map(|q| q.text.clone()),
+                ask: n.question.clone(),
                 image,
                 at: n.created_at.clone(),
                 timer: None,
+                mac: None,
+                local_only: false,
+                on: None,
+                asleep: false,
+                since: None,
             }
         })
         .collect();
@@ -817,6 +1024,7 @@ pub fn sync(m: &crate::app::MainWindow, cx: &mut App) {
         b.sharing = sharing;
         b.idle = idle;
         b.colors = colors;
+        b.keys = keys;
         // A list fetched just before an item came in doesn't drop it (it'd count down, then up).
         let fresh: Vec<Waiting> = b.needs.iter().filter(|w| b.pending.iter().any(|(id, at)| *id == w.id && at.elapsed() < PENDING) && !needs.iter().any(|n| n.id == w.id)).cloned().collect();
         b.pending.retain(|(_, at)| at.elapsed() < PENDING);
@@ -832,13 +1040,8 @@ pub fn sync(m: &crate::app::MainWindow, cx: &mut App) {
     });
 }
 
-/// A question's options (label, description).
-fn options_of(n: &NeedsYou) -> Vec<(String, String)> {
-    n.question.as_ref().map(|q| q.options.iter().map(|o| (o.label.clone(), o.description.trim().to_string())).collect()).unwrap_or_default()
-}
-
 /// A needs-you item's notification kind (as midnad picks it).
-fn category_of(k: NeedsYouKind) -> &'static str {
+pub(super) fn category_of(k: NeedsYouKind) -> &'static str {
     match k {
         NeedsYouKind::Approval | NeedsYouKind::PermissionPrompt => "approval",
         NeedsYouKind::Blocked | NeedsYouKind::Note => "attention",
@@ -869,6 +1072,7 @@ fn icon_of(category: &str) -> Icon {
         "pr_checks" => Icon::Pr,
         "exited" => Icon::Screen,
         "agent" => Icon::Orbit,
+        "nearby" => Icon::Mac,
         "from_trigger" | "triggers" => Icon::Triggers,
         "restarted" => Icon::Restart,
         "cleanup" => Icon::Trash,
@@ -876,7 +1080,7 @@ fn icon_of(category: &str) -> Icon {
     }
 }
 
-fn capitalize(s: &str) -> String {
+pub(super) fn capitalize(s: &str) -> String {
     let mut c = s.chars();
     c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
 }
@@ -990,6 +1194,12 @@ impl Badge {
             }
         });
         cx.observe_global::<Theme>(|_, cx| cx.notify()).detach();
+        // What waits on my other Macs: their tabs.
+        cx.observe_global::<crate::mac_feed::MacFeeds>(|b, cx| {
+            let feeds = crate::mac_feed::list(cx);
+            b.follow_macs(&feeds, cx);
+        })
+        .detach();
         // The badge's window never takes keys: ⎋ in any midna window closes its open list
         // first (the same cascade as clicking the badge).
         let me = cx.entity().downgrade();
@@ -1013,8 +1223,9 @@ impl Badge {
             }
         })
         .detach();
-        // Dev (screenshots): `MIDNA_DEBUG_BADGE=list|card|menu` opens the list (with its first
-        // card) or the menu.
+        // Dev (screenshots): `MIDNA_DEBUG_BADGE=list|card|menu|mac|switch:<ms>` opens the list
+        // (with its first card), the menu, the first other Mac's list, or switches to it
+        // (`debug_mac` has the other Mac's).
         let debug = crate::dev::var("MIDNA_DEBUG_BADGE").ok();
         Badge {
             debug,
@@ -1028,11 +1239,13 @@ impl Badge {
             shared: false,
             watched_at: None,
             colors: HashMap::new(),
+            keys: mac_tab::keys("⌘J", "⌥⌘J"),
             needs: vec![],
             held: vec![],
             pending: vec![],
             answered: vec![],
             picks: HashMap::new(),
+            steps: HashMap::new(),
             lines: VecDeque::new(),
             serial: 0,
             count: 0,
@@ -1083,6 +1296,15 @@ impl Badge {
             reprevent: None,
             preventing: false,
             handed_off: false,
+            macs: vec![],
+            arrivals: 0,
+            mac_line: None,
+            remote: vec![],
+            list_mac: None,
+            switch: None,
+            hover_part: None,
+            middles: Vec::new(),
+            spoken: String::new(),
             _ticker: ticker,
         }
     }
@@ -1107,16 +1329,37 @@ impl Badge {
         self.needs.iter().chain(self.held.iter()).collect()
     }
 
-    /// What the list shows (and the badge counts): what's waiting, less what you cleared from
-    /// it, newest first.
-    fn rows(&self) -> Vec<&Waiting> {
-        let mut rows: Vec<(usize, &Waiting)> = self.waiting().into_iter().filter(|w| !self.cleared.contains(&w.id)).enumerate().collect();
+    /// A Mac's list (None this Mac's, or another's peer): what's waiting there, less what you
+    /// cleared from it, newest first.
+    fn mac_rows(&self, mac: &Option<String>) -> Vec<&Waiting> {
+        let all: Vec<&Waiting> = match mac {
+            None => self.waiting(),
+            Some(peer) => self.remote.iter().filter(|w| w.mac.as_ref() == Some(peer)).collect(),
+        };
+        let mut rows: Vec<(usize, &Waiting)> = all.into_iter().filter(|w| !self.cleared.contains(&w.id)).enumerate().collect();
         // Times are to the second: in the same second, the one added last is the newest.
         rows.sort_by(|(i, a), (j, b)| b.at.cmp(&a.at).then(j.cmp(i)));
         rows.into_iter().map(|(_, w)| w).collect()
     }
 
-    fn open_list(&mut self) {
+    /// What the open list shows: its Mac's rows.
+    fn rows(&self) -> Vec<&Waiting> {
+        self.mac_rows(&self.list_mac)
+    }
+
+    /// What the badge counts: this Mac's rows.
+    fn here(&self) -> Vec<&Waiting> {
+        self.mac_rows(&None)
+    }
+
+    /// A row of any Mac's list, by id.
+    fn row(&self, id: &str) -> Option<&Waiting> {
+        self.waiting().into_iter().chain(self.remote.iter()).find(|w| w.id == id && !self.cleared.contains(&w.id))
+    }
+
+    fn open_list(&mut self, mac: Option<String>) {
+        self.list_mac = mac;
+        self.switch = None;
         self.list = true;
         self.landing = None;
         self.list_since = Instant::now();
@@ -1129,6 +1372,79 @@ impl Badge {
         self.arrived.clear();
         self.fresh.clear();
         self.snapshot();
+    }
+
+    /// Switch the open list to another Mac's (`part`): the old rows slide out toward the part you
+    /// left as the new ones come in from the one you clicked. Under Reduce Motion they just swap.
+    fn switch_to(&mut self, part: Option<String>, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let from_x = self.zones.middle(&self.list_mac);
+        let dir = mac_tab::slide_dir(from_x.unwrap_or(0.), self.zones.middle(&part).unwrap_or(0.));
+        let rows: Vec<Waiting> = self.rows().into_iter().cloned().collect();
+        let switch = Switch { at: now, dir, rows, scroll: self.scroll_now(now), height: self.list_fit(now), from_x, held: None };
+        // A capsule of the Mac you switch to lands in its row; another's goes.
+        let landing = self.capsule_into(&part, now);
+        self.list_mac = part;
+        self.landing = None;
+        self.scroll = 0.;
+        self.glide = None;
+        self.expanded = None;
+        self.button_menu = None;
+        self.collapsing.clear();
+        self.going.clear();
+        self.arrived.clear();
+        self.fresh.clear();
+        self.hot = None;
+        self.hot_left = None;
+        self.cool = None;
+        self.list_touched = now;
+        self.snapshot();
+        self.switch = (!super::queue::reduce_motion()).then_some(switch);
+        self.land(landing, now, cx);
+        crate::lifecycle::log(&format!("badge list switched to {}", self.list_mac.as_deref().unwrap_or("this Mac")));
+        cx.notify();
+    }
+
+    /// Dev (`MIDNA_DEBUG_BADGE=mac|mac-card[:<i>]|open-on[:<i>]|switch:<ms>`): open the first
+    /// other Mac's list (with its `i`th row's card, or pressing that card's "Open on <Mac>"), or
+    /// this Mac's and then (once both parts have painted) switch to it, held that far in.
+    fn debug_mac(&mut self, now: Instant, cx: &mut Context<Self>) -> bool {
+        let Some(d) = self.debug.clone().filter(|d| d == "mac" || d.starts_with("mac-card") || d.starts_with("open-on") || d.starts_with("switch:")) else { return false };
+        let Some(peer) = self.macs.iter().map(|m| Some(m.peer.clone())).find(|p| !self.mac_rows(p).is_empty()) else { return false };
+        let stay = now + Duration::from_secs(3600);
+        if d == "mac" || d.starts_with("mac-card") || d.starts_with("open-on") {
+            self.debug = None;
+            self.open_list(peer.clone());
+            self.list_touched = stay;
+            let i = d.split_once(':').and_then(|(_, i)| i.parse::<usize>().ok()).unwrap_or(0);
+            let row = self.mac_rows(&peer).get(i).map(|w| (w.id.clone(), w.mac.clone(), w.session.clone(), w.need.clone()));
+            if let Some((id, mac, session, need)) = row.filter(|_| d != "mac") {
+                self.toggle_card(&id);
+                if d.starts_with("open-on") && let Some(mac) = mac {
+                    self.open_on(mac, session, need, cx);
+                }
+            }
+            return true;
+        }
+        if !self.list {
+            if self.here().is_empty() {
+                return false;
+            }
+            self.open_list(None);
+            self.list_touched = stay;
+            return true;
+        }
+        if self.zones.middle(&peer).is_none() || self.zones.middle(&None).is_none() || now.duration_since(self.list_since) < Duration::from_secs(1) {
+            return false;
+        }
+        self.debug = None;
+        let held = d["switch:".len()..].parse().map(Duration::from_millis).unwrap_or(mac_tab::SWITCH_OUT / 2);
+        self.switch_to(peer, cx);
+        if let Some(w) = self.switch.as_mut() {
+            w.held = Some(held);
+        }
+        self.list_touched = stay;
+        true
     }
 
     /// Note the list's rows as they are (what comes in or goes after is measured from them).
@@ -1191,36 +1507,222 @@ impl Badge {
         cx.notify();
     }
 
-    /// Whether clicking the badge has a list to open: what's waiting, or a capsule beside it.
-    fn can_open(&self) -> bool {
-        (self.count > 0 || self.lines.front().is_some_and(|l| l.leaving.is_none())) && !self.quiet()
+    /// Whether clicking a part of the badge has a list to open: the pill, what's waiting on this
+    /// Mac or a capsule of its beside it; a Mac's tab, what's waiting there.
+    fn can_open(&self, part: &Option<String>) -> bool {
+        let any = match part {
+            None => self.count > 0 || self.lines.front().is_some_and(|l| l.leaving.is_none() && l.mac.is_none()),
+            Some(_) => !self.mac_rows(part).is_empty(),
+        };
+        any && !self.quiet()
     }
 
-    /// Open the list from the badge, handing it the capsule beside it: it flies into its row,
-    /// and a passing one is held from here (counted until you dismiss it). Its card open
-    /// beside the badge, it stays there.
-    fn open_from_badge(&mut self, cx: &mut Context<Self>) {
+    /// What waits on my other Macs (`mac_feed`) changed: their tabs follow it, and what just
+    /// came in on one springs out beside the badge a moment after its tab pops on.
+    fn follow_macs(&mut self, feeds: &[crate::mac_feed::Feed], cx: &mut Context<Self>) {
         let now = Instant::now();
-        let carded = self.lines.front().is_some_and(|l| self.expanded.as_ref().is_some_and(|(e, _)| *e == self.line_waiting(l).id));
-        let landing = self.lines.front().filter(|l| l.leaving.is_none() && !carded).map(|l| {
-            let fill = l.stay.map(|stay| 1. - (l.until.saturating_duration_since(now).as_secs_f32() / stay.as_secs_f32()).clamp(0., 1.));
-            let id = l.waiting.clone().unwrap_or_else(|| format!("h{}", l.serial));
-            (id, fill, l.color.clone(), l.waiting.is_none().then(|| Waiting { id: format!("h{}", l.serial), at: midna_proto::time::now_rfc3339(), ..self.line_waiting(l) }))
-        });
-        self.open_list();
-        if let Some((id, fill, color, held)) = landing {
-            self.held.extend(held);
-            self.snapshot();
-            self.lines.clear();
-            if let Some(from) = self.zones.line.get().filter(|_| !super::queue::reduce_motion()) {
-                self.landing = Some(Landing { id, from, fill, color, at: now, to: Rc::new(Cell::new(None)) });
-            }
-            self.recount(cx);
+        let (tabs, arrival) = mac_tab::follow(&self.macs, feeds, &mut self.arrivals, now);
+        let remote = remote_rows(feeds, &self.colors);
+        let same = |a: &[Waiting], b: &[Waiting]| a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.id == b.id && a.title == b.title && a.detail == b.detail && a.name == b.name && a.on == b.on && a.asleep == b.asleep && a.since == b.since && a.approval == b.approval && a.local_only == b.local_only && a.ask == b.ask);
+        if tabs == self.macs && same(&remote, &self.remote) {
+            return;
         }
+        self.macs = tabs;
+        self.remote = remote;
+        // Its open list follows, as this Mac's does when its items change.
+        if self.list_mac.is_some() {
+            self.recount(cx);
+        } else {
+            self.cleared.retain(|id| self.needs.iter().chain(self.remote.iter()).any(|w| w.id == *id));
+        }
+        if let Some(a) = arrival {
+            let held = self.hover == Some("line") || self.lines.front().is_some_and(|l| l.leaving.is_none() && self.expanded.as_ref().is_some_and(|(e, _)| *e == self.line_waiting(l).id));
+            crate::lifecycle::log(&format!("badge {} came in on {} (list {}, capsule held {held})", a.id, a.mac, self.list));
+            // Like this Mac's: no capsule over the open list or one you're on, or on a shared screen.
+            if !self.quiet() && !self.list && !held {
+                self.serial += 1;
+                let waiting = mac_tab::row_id(&a.peer, &a.id);
+                // Its row's colour (its kind's, or a post's own).
+                let color = self.remote.iter().find(|w| w.id == waiting).map_or_else(|| default_color(&a.category).to_string(), |w| w.color.clone());
+                let line = Line {
+                    serial: self.serial,
+                    born: now,
+                    wear: self.serial,
+                    replaced: false,
+                    waiting: Some(waiting),
+                    session: None,
+                    need: None,
+                    sent: None,
+                    color,
+                    category: a.category,
+                    name: a.place.map_or_else(|| a.mac.clone(), |p| p.terminal),
+                    text: a.title,
+                    detail: None,
+                    label: String::new(),
+                    image: None,
+                    stay: None,
+                    until: now,
+                    leaving: None,
+                    seq: 0,
+                    stale_logged: false,
+                    mac: Some(a.mac),
+                    peer: Some(a.peer),
+                };
+                let after = if super::queue::reduce_motion() { Duration::ZERO } else { mac_tab::CAPSULE_AFTER };
+                self.mac_line = Some((now + after, line));
+            }
+        }
+        self.speak();
+        cx.notify();
+    }
+
+    /// Another Mac's capsule, due: it springs out (a passing one of this Mac's makes way).
+    fn spring_mac_line(&mut self, now: Instant) -> bool {
+        if self.mac_line.as_ref().is_none_or(|(at, _)| now < *at) {
+            return false;
+        }
+        let Some((_, mut line)) = self.mac_line.take() else { return false };
+        if self.list || self.quiet() || self.hover == Some("line") {
+            return false;
+        }
+        line.born = now;
+        line.until = now + LINE_SHOW;
+        line.replaced = self.lines.front().is_some_and(|l| l.leaving.is_none());
+        // A passing one it cuts short goes into the list as one of this Mac's would.
+        if let Some(l) = self.lines.front().filter(|l| l.leaving.is_none() && l.waiting.is_none() && l.mac.is_none())
+            && let Some(stay) = l.stay
+        {
+            let span = stay * BUMPED;
+            let w = Waiting { id: format!("h{}", l.serial), at: midna_proto::time::now_rfc3339(), timer: Some((l.born + span, span)), ..self.line_waiting(l) };
+            self.held.push(w);
+        }
+        self.lines.clear();
+        crate::lifecycle::log(&format!("badge {} in", line.describe(now)));
+        self.lines.push_back(line);
+        true
+    }
+
+    /// The capsule beside the badge, when it's showing, is about a terminal or an item, and is
+    /// from `mac` (None this Mac, or another's peer). Another Mac's goes by its row, which its
+    /// card opens there (its line holds no ids: those are that Mac's, not this one's).
+    fn front_line(&self, mac: &crate::windows::MacId) -> Option<&Line> {
+        self.lines
+            .front()
+            .filter(|l| l.leaving.is_none() && l.peer == *mac)
+            .filter(|l| if l.peer.is_some() { self.line_row(l).is_some_and(opens_on_mac) } else { l.session.is_some() || l.need.is_some() })
+    }
+
+    /// The list's row a capsule is about, while it's still waiting.
+    fn line_row(&self, l: &Line) -> Option<&Waiting> {
+        l.waiting.as_deref().and_then(|id| self.row(id))
+    }
+
+    /// The Macs' tabs that show: those with something waiting.
+    fn tabs(&self) -> Vec<mac_tab::Tab> {
+        self.counted().into_iter().filter(|m| m.count() > 0).collect()
+    }
+
+    /// The Macs' tabs as they count: less what you cleared from their lists.
+    fn counted(&self) -> Vec<mac_tab::Tab> {
+        mac_tab::uncleared(&self.macs, &self.cleared)
+    }
+
+    /// The tooltip's first line, once there's another Mac to count.
+    fn tip(&self) -> Option<String> {
+        (!self.macs.is_empty()).then(|| mac_tab::tip(self.count, &self.counted()))
+    }
+
+    /// Tell VoiceOver what the badge says (its window's label), when that changed.
+    fn speak(&mut self) {
+        let mut words = if self.macs.is_empty() { format!("Needs you: {}", self.count) } else { mac_tab::spoken(self.count, &self.counted(), &self.keys) };
+        // Another Mac's capsule says where it's from (it shows only its colour).
+        if let Some(l) = self.lines.front().filter(|l| l.leaving.is_none() && !self.quiet()) {
+            words.push_str(&match &l.mac {
+                Some(mac) => format!(". {} on {mac}: {}", l.name, l.text),
+                None => format!(". {}: {}", l.name, l.text),
+            });
+        }
+        if words == self.spoken {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(ns) = self.ns.as_ref()
+            && let Some(view) = ns.contentView()
+        {
+            let s = objc2_foundation::NSString::from_str(&words);
+            unsafe {
+                let _: () = objc2::msg_send![&*view, setAccessibilityLabel: &*s];
+            }
+        }
+        self.spoken = words;
+    }
+
+    /// Press on the badge (or one of its Mac tabs): a click opens the list, a drag slings it.
+    fn press(&mut self, part: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = false;
+        #[cfg(target_os = "macos")]
+        if let Some(ns) = super::twilight::ns_window(window) {
+            // Caught mid-sling: it's held where it is.
+            self.slide = None;
+            let (f, m) = (ns.frame(), objc2_app_kit::NSEvent::mouseLocation());
+            let mouse = (m.x, m.y);
+            self.pressing = Some(Press { part, mouse, origin: (f.origin.x, f.origin.y), moved: false, last: (mouse, Instant::now()), vel: (0., 0.) });
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (part, window);
+        cx.notify();
+    }
+
+    /// Open a part's list (None the pill's, this Mac's; or a Mac's tab's), handing it the capsule
+    /// beside the badge: it flies into its row, and a passing one is held from here (counted
+    /// until you dismiss it). Its card open beside the badge, it stays there.
+    fn open_from_badge(&mut self, part: Option<String>, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let landing = self.capsule_into(&part, now);
+        self.open_list(part);
+        self.land(landing, now, cx);
+    }
+
+    /// The capsule beside the badge, as `part`'s list opens: one of that Mac's lands in its row
+    /// (a passing one of this Mac's held there first); one of another Mac's goes, and a passing
+    /// one of this Mac's is held without flying.
+    fn capsule_into(&mut self, part: &Option<String>, now: Instant) -> Option<(String, Option<f32>, String, Option<Waiting>)> {
+        let carded = self.lines.front().is_some_and(|l| self.expanded.as_ref().is_some_and(|(e, _)| *e == self.line_waiting(l).id));
+        let l = self.lines.front().filter(|l| l.leaving.is_none() && !carded)?;
+        let fill = l.stay.map(|stay| 1. - (l.until.saturating_duration_since(now).as_secs_f32() / stay.as_secs_f32()).clamp(0., 1.));
+        let id = l.waiting.clone().unwrap_or_else(|| format!("h{}", l.serial));
+        let held = (l.waiting.is_none() && l.mac.is_none()).then(|| Waiting { id: format!("h{}", l.serial), at: midna_proto::time::now_rfc3339(), ..self.line_waiting(l) });
+        if l.peer == *part {
+            return Some((id, fill, l.color.clone(), held));
+        }
+        if l.mac.is_some() {
+            if let Some(l) = self.lines.front_mut() {
+                l.leaving.get_or_insert(now);
+            }
+        } else {
+            self.held.extend(held);
+            self.lines.clear();
+        }
+        None
+    }
+
+    fn land(&mut self, landing: Option<(String, Option<f32>, String, Option<Waiting>)>, now: Instant, cx: &mut Context<Self>) {
+        let Some((id, fill, color, held)) = landing else {
+            self.recount(cx);
+            return;
+        };
+        self.held.extend(held);
+        self.snapshot();
+        self.lines.clear();
+        if let Some(from) = self.zones.line.get().filter(|_| !super::queue::reduce_motion()) {
+            self.landing = Some(Landing { id, from, fill, color, at: now, to: Rc::new(Cell::new(None)) });
+        }
+        self.recount(cx);
     }
 
     fn close_list(&mut self) {
         self.list = false;
+        self.switch = None;
         self.landing = None;
         self.hover_opened = None;
         self.list_closing = None;
@@ -1249,7 +1751,8 @@ impl Badge {
         for l in self.lines.iter_mut().filter(|l| l.waiting.as_deref() == Some(id)) {
             l.leaving.get_or_insert(Instant::now());
         }
-        if let Some(sent) = self.held.iter().find(|w| w.id == id).and_then(|w| w.sent.clone()) {
+        // Another Mac's post is dismissed there too (`respond`).
+        if let Some(sent) = self.held.iter().chain(self.remote.iter()).find(|w| w.id == id).and_then(|w| w.sent.clone()) {
             self.respond(&sent, midna_proto::notify::ResponseKind::Dismissed, None);
         }
         if self.held.iter().any(|w| w.id == id) {
@@ -1262,10 +1765,23 @@ impl Badge {
 
     /// Clear: everything off the list (and so the badge, until something new comes in).
     fn clear_all(&mut self, cx: &mut Context<Self>) {
-        self.held.clear();
-        self.cleared = self.needs.iter().map(|w| w.id.clone()).collect();
         let now = Instant::now();
-        for l in self.lines.iter_mut() {
+        if self.list_mac.is_some() {
+            // Another Mac's list: only its rows (and its capsule) go.
+            let ids: Vec<String> = self.rows().iter().map(|w| w.id.clone()).collect();
+            self.cleared.extend(ids);
+            for l in self.lines.iter_mut().filter(|l| l.peer == self.list_mac) {
+                l.leaving.get_or_insert(now);
+            }
+            self.close_list();
+            self.recount(cx);
+            self.speak();
+            return;
+        }
+        self.held.clear();
+        self.cleared.retain(|id| self.remote.iter().any(|w| w.id == *id));
+        self.cleared.extend(self.needs.iter().map(|w| w.id.clone()));
+        for l in self.lines.iter_mut().filter(|l| l.mac.is_none()) {
             l.leaving.get_or_insert(now);
         }
         self.close_list();
@@ -1471,7 +1987,8 @@ impl Badge {
                 || self.held.iter().any(|w| w.timer.is_some())
                 || self.cool.is_some()
                 || self.expanded.as_ref().is_some_and(|(_, t)| now.duration_since(*t) < CARD_IN + CARD_FADE_AFTER + CARD_FADE)
-                || self.hot.as_ref().is_some_and(|(_, t)| now.duration_since(*t) < GROW))
+                || self.hot.as_ref().is_some_and(|(_, t)| now.duration_since(*t) < GROW)
+                || self.switch.as_ref().is_some_and(|w| mac_tab::switching(w.since(now))))
     }
 
     /// The count is what's waiting; a change rolls the number.
@@ -1483,10 +2000,10 @@ impl Badge {
                 l.leaving = Some(Instant::now());
             }
         }
-        self.cleared.retain(|id| self.needs.iter().any(|w| w.id == *id));
+        self.cleared.retain(|id| self.needs.iter().chain(self.remote.iter()).any(|w| w.id == *id));
         self.reflow();
-        let n = self.rows().len();
-        if n > 0 && let Some(d) = self.debug.take() {
+        let n = self.here().len();
+        if n > 0 && self.debug.as_deref().is_some_and(|d| matches!(d, "list" | "card" | "menu")) && let Some(d) = self.debug.take() {
             self.list = d == "list" || d == "card";
             if d == "card" {
                 self.expanded = self.rows().first().map(|w| (w.id.clone(), Instant::now()));
@@ -1507,16 +2024,17 @@ impl Badge {
             self.roll += 1;
             self.roll_at = Instant::now();
         }
-        self.failed.retain(|id, _| self.needs.iter().any(|w| w.id == *id));
-        self.picks.retain(|id, _| self.needs.iter().any(|w| w.id == *id));
+        self.failed.retain(|id, _| self.needs.iter().chain(self.remote.iter()).any(|w| w.id == *id));
+        self.picks.retain(|id, _| self.needs.iter().chain(self.remote.iter()).any(|w| w.id == *id));
+        self.steps.retain(|id, _| self.needs.iter().chain(self.remote.iter()).any(|w| w.id == *id));
         if let Some(id) = self.reopen.clone()
-            && self.rows().iter().any(|w| w.id == id)
+            && let Some(mac) = self.row(&id).map(|w| w.mac.clone())
         {
             self.reopen = None;
-            self.open_list();
+            self.open_list(mac);
             self.toggle_card(&id);
         }
-        if n == 0 {
+        if self.rows().is_empty() {
             self.close_list();
         } else if self.expanded.as_ref().is_some_and(|(id, _)| line_serial(id).is_none() && !self.rows().iter().any(|w| w.id == *id)) {
             self.expanded = None;
@@ -1558,12 +2076,15 @@ impl Badge {
                     detail: need.as_ref().map(|n| super::setting_change::summary(n).unwrap_or_else(|| n.detail.trim().to_string())).filter(|d| !d.is_empty()),
                     command: need.as_ref().filter(|n| n.setting.is_none()).and_then(|n| n.approval.as_ref()).map(|a| a.action.value.clone()).filter(|v| !v.is_empty()),
                     approval: need.as_ref().map_or(p.category == "approval", |n| n.is_approval()),
-                    options: need.as_ref().map(options_of).unwrap_or_default(),
-                    multi: need.as_ref().and_then(|n| n.question.as_ref()).is_some_and(|q| q.multi_select),
-                    question: need.as_ref().and_then(|n| n.question.as_ref()).map(|q| q.text.clone()),
+                    ask: need.as_ref().and_then(|n| n.question.clone()),
                     image: p.image.clone().map(PathBuf::from),
                     at: midna_proto::time::now_rfc3339(),
                     timer: None,
+                    mac: None,
+                    local_only: false,
+                    on: None,
+                    asleep: false,
+                    since: None,
                 });
             }
             waiting = Some(id);
@@ -1589,12 +2110,15 @@ impl Badge {
                 detail: Some(lines.collect::<Vec<_>>().join("\n")).filter(|d| !d.is_empty()),
                 command: None,
                 approval: false,
-                options: vec![],
-                multi: false,
-                question: None,
+                ask: None,
                 image: p.image.clone().map(PathBuf::from),
                 at: midna_proto::time::now_rfc3339(),
                 timer: None,
+                mac: None,
+                local_only: false,
+                on: None,
+                asleep: false,
+                since: None,
             });
             waiting = Some(id);
         }
@@ -1644,12 +2168,15 @@ impl Badge {
                     detail: Some(lines.collect::<Vec<_>>().join("\n")).filter(|d| !d.is_empty()),
                     command: None,
                     approval: false,
-                    options: vec![],
-                    multi: false,
-                    question: None,
+                    ask: None,
                     image: p.image.clone().map(PathBuf::from),
                     at: midna_proto::time::now_rfc3339(),
                     timer: Some((now + stay * BUMPED, stay * BUMPED)),
+                    mac: None,
+                    local_only: false,
+                    on: None,
+                    asleep: false,
+                    since: None,
                 });
             }
             self.recount(cx);
@@ -1688,6 +2215,8 @@ impl Badge {
             leaving: None,
             seq,
             stale_logged: false,
+            mac: None,
+            peer: None,
         });
         if let Some(l) = self.lines.back() {
             crate::lifecycle::log(&format!("badge {} in (replaced one {replaced}, shown {}, within {})", l.describe(now), self.shown, self.within));
@@ -1708,11 +2237,40 @@ impl Badge {
 
     /// Report what you did with a `notify.send` notification.
     fn respond(&self, sent: &Sent, kind: midna_proto::notify::ResponseKind, action: Option<String>) {
-        crate::notify::respond(&self.backend, &sent.id, midna_proto::notify::Response { kind, action });
+        // Another Mac's, while it's asleep: nothing goes, and nothing is queued for when it wakes.
+        if sent.mac.as_deref().is_some_and(|p| self.asleep(p)) {
+            return;
+        }
+        if let Some(backend) = self.backend_of(sent.mac.as_deref()) {
+            crate::notify::respond(&backend, &sent.id, midna_proto::notify::Response { kind, action });
+        }
+    }
+
+    /// Where `mac`'s items are answered: this Mac's backend, or that Mac's link
+    /// (`backend::for_mac`, the one its windows and its feed use). None for a Mac it no longer
+    /// follows: nothing goes to this Mac by mistake.
+    fn backend_of(&self, mac: Option<&str>) -> Option<Arc<dyn Backend>> {
+        let Some(peer) = mac else { return Some(self.backend.clone()) };
+        let t = self.macs.iter().find(|t| t.peer == peer)?;
+        Some(crate::backend::for_mac(&self.backend, crate::backend::Mac { peer: t.peer.clone(), name: t.name.clone() }))
+    }
+
+    /// Whether my other Mac `peer` can't be reached now (its tab, list and cards grey out).
+    fn asleep(&self, peer: &str) -> bool {
+        self.macs.iter().any(|t| t.peer == peer && t.asleep)
+    }
+
+    /// The name of my other Mac `peer`.
+    fn mac_name(&self, peer: &str) -> String {
+        self.macs.iter().find(|t| t.peer == peer).map_or_else(|| "the other Mac".into(), |t| t.name.clone())
     }
 
     /// One of a `notify.send` notification's buttons: report it, and it's handled.
     fn pick(&mut self, id: &str, sent: &Sent, action: String, cx: &mut Context<Self>) {
+        // Its Mac is asleep: nothing goes, and nothing is queued for when it wakes.
+        if self.row(id).is_some_and(|w| w.asleep) {
+            return;
+        }
         self.respond(sent, midna_proto::notify::ResponseKind::Action, Some(action));
         self.dismiss(id, cx);
     }
@@ -1720,7 +2278,7 @@ impl Badge {
     /// What the capsule beside the badge shows as its card: what's waiting, while the list has
     /// it, or the notification itself (its id `line:<serial>`).
     fn line_waiting(&self, l: &Line) -> Waiting {
-        if let Some(w) = l.waiting.as_ref().and_then(|id| self.rows().into_iter().find(|w| w.id == *id)) {
+        if let Some(w) = l.waiting.as_ref().and_then(|id| self.row(id)) {
             return w.clone();
         }
         Waiting {
@@ -1736,12 +2294,15 @@ impl Badge {
             detail: l.detail.clone(),
             command: None,
             approval: false,
-            options: vec![],
-            multi: false,
-            question: None,
+            ask: None,
             image: l.image.clone(),
             at: String::new(),
             timer: None,
+            mac: None,
+            local_only: false,
+            on: None,
+            asleep: false,
+            since: None,
         }
     }
 
@@ -1777,7 +2338,8 @@ impl Badge {
         }
     }
 
-    /// Drop a held notification (the stack's Dismiss).
+    /// Drop a held notification (the stack's Dismiss). Another Mac's stays in its feed (it keeps
+    /// what it heard): hidden here.
     fn dismiss(&mut self, id: &str, cx: &mut Context<Self>) {
         if let Some(serial) = line_serial(id) {
             for l in self.lines.iter_mut().filter(|l| l.serial == serial) {
@@ -1786,6 +2348,9 @@ impl Badge {
             return cx.notify();
         }
         self.held.retain(|w| w.id != id);
+        if self.remote.iter().any(|w| w.id == id) && !self.cleared.iter().any(|c| c == id) {
+            self.cleared.push(id.to_string());
+        }
         for l in self.lines.iter_mut().filter(|l| l.waiting.as_deref() == Some(id)) {
             l.leaving.get_or_insert(Instant::now());
         }
@@ -1795,54 +2360,122 @@ impl Badge {
     /// Answer an approval. It goes at once; if midnad turns the answer down (say, what it'd run
     /// changed since you were asked), it comes back with the reason on its card, the stack open
     /// on it (the home window's toast for it isn't where you're looking).
-    fn approve(&mut self, need: String, deny: bool, cx: &mut Context<Self>) {
-        self.needs.retain(|w| w.id != need);
-        self.failed.remove(&need);
-        self.recount(cx);
-        crate::sounds::play(if deny { "denied" } else { "approved" });
+    fn approve(&mut self, id: String, deny: bool, cx: &mut Context<Self>) {
         let res = if deny { Resolution::Deny } else { Resolution::Approve { scope: ApprovalScope::Once } };
+        if self.resolve(id, res, cx) {
+            crate::sounds::play(if deny { "denied" } else { "approved" });
+        }
+    }
+
+    /// Resolve the needs-you item of row `id`: this Mac's, or another Mac's over its link, as the
+    /// human there (`needs_you.resolve`; T2083). It goes at once and comes back with the reason
+    /// on its card if it doesn't go through. False if there's nothing to resolve.
+    fn resolve(&mut self, id: String, res: Resolution, cx: &mut Context<Self>) -> bool {
+        let (need, mac) = match self.row(&id) {
+            // Its Mac is asleep: nothing goes, and nothing is queued for when it wakes.
+            Some(w) if w.asleep => return false,
+            Some(w) if w.mac.is_some() => (w.need.clone(), w.mac.clone()),
+            _ => (Some(id.clone()), None),
+        };
+        let (Some(need), Some(backend)) = (need, self.backend_of(mac.as_deref())) else { return false };
+        let remote = mac.is_some();
+        // Another Mac's stays in its feed until that Mac says it's gone: hidden here till then.
+        if remote {
+            self.cleared.push(id.clone());
+        } else {
+            self.needs.retain(|w| w.id != id);
+        }
+        self.failed.remove(&id);
+        self.recount(cx);
         let params = json!({ "id": need, "resolution": res });
-        let backend = self.backend.clone();
         cx.spawn(async move |this, cx| {
             let r = cx.background_executor().spawn(async move { backend.call("needs_you.resolve", params) }).await;
             let _ = this.update(cx, |b, cx| {
                 if let Err(e) = r {
-                    b.failed.insert(need.clone(), format!("{e:#}"));
-                    b.reopen = Some(need);
+                    b.failed.insert(id.clone(), format!("{e:#}"));
+                    b.reopen = Some(id.clone());
+                    if remote {
+                        b.cleared.retain(|c| *c != id);
+                        b.recount(cx);
+                    }
                     cx.notify();
                 }
             });
-            // Either way, the home window refetches (and syncs the badge).
-            let _ = cx.update(|cx| crate::windows::with_active(cx, |m, _, cx| m.request_refresh(crate::app::refresh::NEEDS | crate::app::refresh::SESSIONS | crate::app::refresh::RULES, cx)));
+            // Either way, the home window refetches (and syncs the badge). Another Mac's feed
+            // refetches on its own `needs_you.*` events.
+            if !remote {
+                let _ = cx.update(|cx| crate::windows::with_active_local(cx, |m, _, cx| m.request_refresh(crate::app::refresh::NEEDS | crate::app::refresh::SESSIONS | crate::app::refresh::RULES, cx)));
+            }
         })
         .detach();
+        true
     }
 
-    /// Answer a question with these options (0-based), as if picked in its terminal. It goes at
-    /// once; if midnad can't answer (the picker changed, or it asks more than this question),
-    /// it comes back with the reason on its card, as a turned-down approval does.
+    /// Answer the question the card shows with these options (0-based), as if picked in its
+    /// terminal. A picker of several questions moves on to the next; the last answer sends them
+    /// all at once. If midnad can't answer (the picker changed), it comes back with the reason
+    /// on its card, as a turned-down approval does, and the card starts over at the first.
     fn answer(&mut self, w: &Waiting, options: Vec<usize>, cx: &mut Context<Self>) {
-        let (Some(need), Some(session)) = (w.need.clone(), w.session.clone()) else { return };
-        self.needs.retain(|x| x.id != need);
-        self.failed.remove(&need);
-        self.picks.remove(&need);
-        self.answered.push((need.clone(), Instant::now()));
+        if w.asleep {
+            return;
+        }
+        let (Some(need), Some(session), Some(ask)) = (w.need.clone(), w.session.clone(), w.ask.clone()) else { return };
+        let mut done = self.steps.get(&w.id).cloned().unwrap_or_default();
+        done.push(options);
+        self.picks.remove(&w.id);
+        if done.len() < ask.count() {
+            self.steps.insert(w.id.clone(), done);
+            cx.notify();
+            return;
+        }
+        self.steps.remove(&w.id);
+        let Some(backend) = self.backend_of(w.mac.as_deref()) else { return };
+        let (id, remote) = (w.id.clone(), w.mac.is_some());
+        if remote {
+            self.cleared.push(id.clone());
+        } else {
+            self.needs.retain(|x| x.id != need);
+            self.answered.push((need.clone(), Instant::now()));
+        }
+        self.failed.remove(&id);
+        self.picks.remove(&id);
         self.recount(cx);
-        let params = json!({ "id": session, "answers": [{ "options": options, "question": w.question }] });
-        let backend = self.backend.clone();
+        let answers: Vec<Value> = ask.all().zip(&done).map(|(q, o)| json!({ "options": o, "question": q.text })).collect();
+        let params = json!({ "id": session, "answers": answers });
         cx.spawn(async move |this, cx| {
             let r = cx.background_executor().spawn(async move { backend.call("session.answer_question", params) }).await;
             let _ = this.update(cx, |b, cx| {
                 if let Err(e) = r {
-                    b.answered.retain(|(id, _)| *id != need);
-                    b.failed.insert(need.clone(), format!("{e:#}"));
-                    b.reopen = Some(need);
+                    b.answered.retain(|(a, _)| *a != need);
+                    b.failed.insert(id.clone(), format!("{e:#}"));
+                    b.reopen = Some(id.clone());
+                    if remote {
+                        b.cleared.retain(|c| *c != id);
+                        b.recount(cx);
+                    }
                     cx.notify();
                 }
             });
-            let _ = cx.update(|cx| crate::windows::with_active(cx, |m, _, cx| m.request_refresh(crate::app::refresh::NEEDS | crate::app::refresh::SESSIONS, cx)));
+            if !remote {
+                let _ = cx.update(|cx| crate::windows::with_active_local(cx, |m, _, cx| m.request_refresh(crate::app::refresh::NEEDS | crate::app::refresh::SESSIONS, cx)));
+            }
         })
         .detach();
+    }
+
+    /// Back to the question before the one the card shows, its answer taken back.
+    fn step_back(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(done) = self.steps.get_mut(id) {
+            done.pop();
+        }
+        self.picks.remove(id);
+        cx.notify();
+    }
+
+    /// The question card `w` shows: which of the picker's (0-based) and the question.
+    fn shown<'a>(&self, w: &'a Waiting) -> Option<(usize, &'a NeedsYouQuestion)> {
+        let k = self.steps.get(&w.id).map_or(0, Vec::len);
+        w.ask.as_ref()?.all().nth(k).map(|q| (k, q))
     }
 
     /// Pick or unpick a multi-select question's option on its card.
@@ -1878,13 +2511,38 @@ impl Badge {
         match session {
             Some(s) if terminal => crate::windows::reveal_terminal(s, need, cx),
             Some(s) => crate::windows::reveal_need(s, need, cx),
-            None => crate::windows::with_active(cx, |m, window, cx| {
+            None => crate::windows::with_active_local(cx, |m, window, cx| {
                 window.activate_window();
                 if let Some(id) = need.filter(|id| m.needs.iter().any(|n| n.id == *id)) {
                     crate::ui::needs_you::show(m, id, window, cx);
                 }
             }),
         }
+        cx.notify();
+    }
+
+    /// Another Mac's row, opened there as its card's "Open on <Mac>" does. A post is seen (that
+    /// Mac hears it was clicked, and it leaves the list), unless that Mac is asleep.
+    fn open_row_on(&mut self, w: &Waiting, cx: &mut Context<Self>) {
+        let Some(peer) = w.mac.clone() else { return };
+        if w.need.is_none() && !w.asleep {
+            if let Some(sent) = &w.sent {
+                self.respond(sent, midna_proto::notify::ResponseKind::Clicked, None);
+            }
+            self.dismiss(&w.id, cx);
+        }
+        self.open_on(peer, w.session.clone(), w.need.clone(), cx);
+    }
+
+    /// Another Mac's card's "Open on <Mac>": that Mac's window comes forward on the item's
+    /// terminal, its card showing. With no window onto that Mac, one opens and connects first.
+    fn open_on(&mut self, peer: String, session: Option<String>, need: Option<String>, cx: &mut Context<Self>) {
+        let Some(name) = self.macs.iter().find(|t| t.peer == peer).map(|t| t.name.clone()) else { return };
+        self.close_list();
+        self.menu = false;
+        self.lines.clear();
+        self.bring_forward(cx);
+        crate::windows::reveal_on_mac(&self.backend, crate::backend::Mac { peer, name }, session, need, cx);
         cx.notify();
     }
 
@@ -1999,7 +2657,9 @@ impl Badge {
         // Midna came to the front or went: spring onto its window's top right, or back to the
         // corner (straight there while it's hidden). A press on the badge says neither.
         let mains = crate::windows::ns_windows(cx);
-        if let Some(within) = here(&ns, &mains)
+        // `MIDNA_DEBUG_BADGE_DOCK` (dev screenshots): docked in the window, though it's not in front.
+        let in_main = if crate::dev::var("MIDNA_DEBUG_BADGE_DOCK").is_ok() { Some(true) } else { here(&ns, &mains) };
+        if let Some(within) = in_main
             && within != self.within
             && self.pressing.is_none()
         {
@@ -2061,6 +2721,9 @@ impl Badge {
             }
         }
 
+        // Another Mac's capsule, due a moment after its tab popped on.
+        changed |= self.spring_mac_line(now);
+
         // Capsules: the front one shows until its time (held while the pointer's on it).
         // Its card open: it stays while the pointer comes back to it; left alone, both go.
         let carded = self.lines.front().is_some_and(|l| self.expanded.as_ref().is_some_and(|(e, _)| *e == self.line_waiting(l).id));
@@ -2118,8 +2781,8 @@ impl Badge {
         }
         if self.held.iter().any(|w| w.timer.is_some_and(|(until, _)| now >= until)) {
             let s = self.scroll_now(now);
-            let order: Vec<String> = self.rows().iter().map(|w| w.id.clone()).collect();
-            let showing = self.list && self.list_closing.is_none() && !super::queue::reduce_motion();
+            let order: Vec<String> = self.here().iter().map(|w| w.id.clone()).collect();
+            let showing = self.list && self.list_mac.is_none() && self.list_closing.is_none() && !super::queue::reduce_motion();
             let (out, keep): (Vec<Waiting>, Vec<Waiting>) = std::mem::take(&mut self.held).into_iter().partition(|w| w.timer.is_some_and(|(until, _)| now >= until));
             self.held = keep;
             for w in out {
@@ -2167,7 +2830,7 @@ impl Badge {
             self.menu = false;
             changed = true;
         }
-        let want = enabled && (self.idle || matches!(self.mode, Mode::Always) || self.count > 0 || !self.lines.is_empty() || self.list || self.menu);
+        let want = enabled && (self.idle || matches!(self.mode, Mode::Always) || self.count > 0 || !self.lines.is_empty() || self.list || self.menu || !self.tabs().is_empty());
         if want != self.shown {
             self.shown = want;
             crate::lifecycle::log(&format!(
@@ -2188,6 +2851,9 @@ impl Badge {
             changed = true;
         }
 
+        if self.shown && self.debug_mac(now, cx) {
+            changed = true;
+        }
         // The pointer's on something that keeps the open list up.
         let mut keep = false;
         if self.shown {
@@ -2195,22 +2861,28 @@ impl Badge {
             let mouse = objc2_app_kit::NSEvent::mouseLocation();
             let f = ns.frame();
             let p = point(px((mouse.x - f.origin.x) as f32), px((f.origin.y + f.size.height - mouse.y) as f32));
-            let hover = self.zones.hit(p);
+            // Dev (`MIDNA_DEBUG_BADGE=tip`): rest on the pill for good, its tooltip up.
+            let tip = self.debug.as_deref() == Some("tip");
+            let hover = if tip { Some("badge") } else { self.zones.hit(p) };
             keep = matches!(hover, Some("badge" | "line")) || (hover == Some("panel") && self.zones.keeps(p));
-            if hover != self.hover {
-                if hover == Some("badge") {
+            // Which part of it: moving from the pill to a Mac's tab starts the rest over.
+            let part = if tip { None } else { self.zones.part(p).flatten() };
+            if hover != self.hover || (hover == Some("badge") && part != self.hover_part) {
+                if hover == Some("badge") && !tip {
                     self.hover_since = Some(now);
                 } else if self.hover == Some("badge") {
                     self.hover_since = None;
                 }
                 self.hover = hover;
+                self.hover_part = part;
                 changed = true;
             }
-            // Resting on the badge opens the list.
+            // Resting on a part of the badge opens its Mac's list.
             if self.hover_since.is_some_and(|t| now.duration_since(t) >= HOVER_OPEN) && self.pressing.is_none() {
                 self.hover_since = None;
-                if !self.list && !self.menu && self.can_open() {
-                    self.open_from_badge(cx);
+                let part = self.hover_part.clone();
+                if !self.list && !self.menu && self.can_open(&part) {
+                    self.open_from_badge(part, cx);
                     self.hover_opened = Some(now);
                     changed = true;
                 }
@@ -2218,10 +2890,10 @@ impl Badge {
             ns.setIgnoresMouseEvents(hover.is_none() && self.pressing.is_none());
 
             // A press on the badge ended: a drag slings to the nearest corner, a click opens the stack.
-            if let Some(p) = self.pressing
+            if self.pressing.is_some()
                 && objc2_app_kit::NSEvent::pressedMouseButtons() & 1 == 0
+                && let Some(p) = self.pressing.take()
             {
-                self.pressing = None;
                 // A click or a drag ends the wait to open the list by resting there.
                 self.hover_since = None;
                 if p.moved {
@@ -2244,13 +2916,23 @@ impl Badge {
                 } else if self.menu {
                     self.menu = false;
                 } else {
-                    if self.hover_opened.take().is_some_and(|t| now.duration_since(t) < HOVER_GRACE) {
+                    let open = (self.list && self.list_closing.is_none()).then_some(&self.list_mac);
+                    match mac_tab::click(open, &p.part) {
                         // Clicked as resting there opened it: it stays open.
-                    } else if self.list && self.list_closing.is_none() {
+                        mac_tab::Click::Close if self.hover_opened.take().is_some_and(|t| now.duration_since(t) < HOVER_GRACE) => {}
                         // Its rows lift away first (tick closes it after).
-                        self.list_closing = Some(now);
-                    } else if self.can_open() {
-                        self.open_from_badge(cx);
+                        mac_tab::Click::Close => self.list_closing = Some(now),
+                        mac_tab::Click::Switch => {
+                            self.hover_opened = None;
+                            if self.can_open(&p.part) {
+                                self.switch_to(p.part, cx);
+                            }
+                        }
+                        mac_tab::Click::Open => {
+                            if self.can_open(&p.part) {
+                                self.open_from_badge(p.part, cx);
+                            }
+                        }
                     }
                 }
                 changed = true;
@@ -2265,7 +2947,9 @@ impl Badge {
         }
         // Something other than a click on the badge brought midna forward (an app switcher like
         // Charmstone, ⌘-Tab) and AppKit made the badge, midna's frontmost window, its key window:
-        // midna's active but none of its windows came up. Its last-used main window takes over.
+        // midna's active but none of its windows came up. Its last-used main window on screen
+        // takes over. Minimizing the only main window on screen lands here too (the badge is
+        // all that's left to be key), so a minimized window is never brought back.
         let badge_key = crate::sounds::app_active()
             && objc2::MainThreadMarker::new()
                 .and_then(|mtm| objc2_app_kit::NSApplication::sharedApplication(mtm).keyWindow())
@@ -2273,7 +2957,7 @@ impl Badge {
         let stray = badge_key && self.hover.is_none() && self.pressing.is_none();
         if stray && !self.handed_off {
             crate::lifecycle::log("midna came forward with the badge as its key window: focusing the main window");
-            crate::windows::with_active(cx, |_, window, _| window.activate_window());
+            crate::windows::focus_shown(cx);
         }
         self.handed_off = stray;
         // The list: × and arrow linger, then shrink; finished animations end.
@@ -2334,18 +3018,25 @@ fn measure(cell: Rc<Cell<Option<Bounds<Pixels>>>>) -> impl IntoElement {
 }
 
 /// `measure`, adding to a list (one of many).
+fn measure_part(list: Rc<RefCell<Vec<(String, Bounds<Pixels>)>>>, peer: String) -> impl IntoElement {
+    canvas(move |b, _, _| list.borrow_mut().push((peer, b)), |_, _, _, _| {}).absolute().top_0().left_0().size_full()
+}
+
 fn measure_into(list: Rc<RefCell<Vec<Bounds<Pixels>>>>) -> impl IntoElement {
     canvas(move |b, _, _| list.borrow_mut().push(b), |_, _, _, _| {}).absolute().top_0().left_0().size_full()
 }
 
 /// A question's options, numbered as in the terminal. Clicking one answers the question; on a
-/// multi-select one it picks it, and the card's Submit answers.
-fn options(t: &Theme, w: &Waiting, picked: &[usize], cx: &mut Context<Badge>) -> Div {
+/// multi-select one it picks it, and the card's Submit (Next, before the picker's last
+/// question) answers.
+fn options(t: &Theme, w: &Waiting, q: &NeedsYouQuestion, last: bool, picked: &[usize], cx: &mut Context<Badge>) -> Div {
     let mut col = div().flex().flex_col().gap(px(5.));
-    if w.multi {
-        col = col.child(div().text_size(px(11.5)).text_color(t.dim).child("Pick any number of these, then Submit"));
+    let multi = q.multi_select;
+    if multi {
+        col = col.child(div().text_size(px(11.5)).text_color(t.dim).child(if last { "Pick any number of these, then Submit" } else { "Pick any number of these, then Next" }));
     }
-    for (i, (label, description)) in w.options.iter().enumerate() {
+    for (i, o) in q.options.iter().enumerate() {
+        let (label, description) = (o.label.clone(), o.description.trim().to_string());
         let on = picked.contains(&i);
         let w2 = w.clone();
         col = col.child(
@@ -2359,9 +3050,10 @@ fn options(t: &Theme, w: &Waiting, picked: &[usize], cx: &mut Context<Badge>) ->
                 .border_1()
                 .border_color(if on { t.accent } else { t.line })
                 .bg(if on { t.accent_soft } else { t.panel })
-                .cursor_pointer()
-                .hover(|s| s.border_color(t.accent))
-                .on_click(cx.listener(move |b, _, _, cx| if w2.multi { b.toggle_pick(&w2.id, i, cx) } else { b.answer(&w2, vec![i], cx) }))
+                // Its Mac asleep: shown, but nothing to pick till it wakes.
+                .when(w.asleep, |d| d.opacity(0.55))
+                .when(!w.asleep, |d| d.cursor_pointer().hover(|s| s.border_color(t.accent)))
+                .on_click(cx.listener(move |b, _, _, cx| if multi { b.toggle_pick(&w2.id, i, cx) } else { b.answer(&w2, vec![i], cx) }))
                 .child(div().flex_none().w(px(14.)).font_family(t.mono_font.clone()).text_size(px(11.5)).text_color(if on { t.accent } else { t.dim }).child(if on { "✓".to_string() } else { (i + 1).to_string() }))
                 .child(
                     div()
@@ -2375,6 +3067,12 @@ fn options(t: &Theme, w: &Waiting, picked: &[usize], cx: &mut Context<Badge>) ->
         );
     }
     col
+}
+
+/// An approval's two buttons: Trust / Don't trust for an agent's folder-trust dialog, else
+/// Approve / Deny.
+fn approve_labels(title: &str) -> (&'static str, &'static str) {
+    if super::needs_you::is_trust(title) { ("Trust", "Don't trust") } else { ("Approve", "Deny") }
 }
 
 fn button(t: &Theme, id: impl Into<ElementId>, label: &str, primary: bool) -> Stateful<Div> {
@@ -2399,6 +3097,33 @@ fn button(t: &Theme, id: impl Into<ElementId>, label: &str, primary: bool) -> St
         .child(label.to_string())
 }
 
+/// A button that's off for now (its Mac is asleep): dimmed, nothing to press (the canvas's
+/// `.btn:disabled`).
+fn button_off(t: &Theme, id: impl Into<ElementId>, label: &str, primary: bool) -> Stateful<Div> {
+    let b = div().id(id).flex_none().h(px(26.)).px(px(10.)).flex().items_center().justify_center().rounded(px(13.)).text_size(px(12.)).opacity(0.55);
+    let b = if primary { b.bg(t.accent).text_color(t.accent_fg).font_weight(FontWeight::BOLD) } else { b.border_1().border_color(t.line).text_color(t.fg) };
+    b.child(label.to_string())
+}
+
+/// "Decide at <Mac>", in Approve's place on another Mac's card when approving it can only be done
+/// there: shaped like a button, but nothing to press.
+fn decide_at(t: &Theme, mac: &str) -> Stateful<Div> {
+    div()
+        .id("card-decide")
+        .flex_none()
+        .h(px(26.))
+        .px(px(10.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(13.))
+        .text_size(px(12.))
+        .border_1()
+        .border_color(t.line)
+        .text_color(t.dim)
+        .child(format!("Decide at {mac}"))
+}
+
 impl Badge {
     fn color(&self, t: &Theme, c: &str) -> Hsla {
         super::notifications::color_of(t, c).unwrap_or(t.accent)
@@ -2409,9 +3134,9 @@ impl Badge {
     /// its color (most first, up to three); a teal shine along its top edge. All theme colors.
     fn badge(&self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let reduce = super::queue::reduce_motion();
-        let passing = self.lines.front().filter(|l| l.leaving.is_none() && l.waiting.is_none());
+        let passing = self.lines.front().filter(|l| l.leaving.is_none() && l.waiting.is_none() && l.mac.is_none());
         let mut tally: Vec<(String, usize)> = vec![];
-        for w in self.rows() {
+        for w in self.here() {
             match tally.iter_mut().find(|(c, _)| *c == w.color) {
                 Some((_, n)) => *n += 1,
                 None => tally.push((w.color.clone(), 1)),
@@ -2446,6 +3171,8 @@ impl Badge {
                     .into_any_element()
             });
 
+        // Nothing here, but something on another Mac: only the diamond, dimmed (the tab has the number).
+        let elsewhere = self.count == 0 && passing.is_none() && !self.tabs().is_empty();
         // The lead diamond: the accent, glowing (a passing line's color while one shows).
         let lead = passing.map_or(t.accent, |l| self.color(t, &l.color));
         let mark = div()
@@ -2455,8 +3182,8 @@ impl Badge {
             .flex()
             .items_center()
             .justify_center()
-            .child(div().absolute().size(px(6.)).rounded_full().shadow(vec![BoxShadow { color: lead.opacity(0.7), offset: point(px(0.), px(0.)), blur_radius: px(9.), spread_radius: px(1.), inset: false }]))
-            .child(diamond(9., lead));
+            .when(!elsewhere, |d| d.child(div().absolute().size(px(6.)).rounded_full().shadow(vec![BoxShadow { color: lead.opacity(0.7), offset: point(px(0.), px(0.)), blur_radius: px(9.), spread_radius: px(1.), inset: false }])))
+            .child(diamond(9., if elsewhere { lead.opacity(0.5) } else { lead }));
         let kinds = div().flex().items_center().gap(px(4.)).children(tally.iter().take(3).map(|(c, _)| diamond(6., self.color(t, c))));
         // While a capsule with an image shows, the badge wears it in the diamond's place.
         let worn = self.lines.front().filter(|_| !self.quiet()).and_then(|l| Some(self.worn(l.wear, l.wear != l.serial, l.leaving.is_some(), l.image.clone()?, self.color(t, &l.color), reduce)));
@@ -2487,12 +3214,16 @@ impl Badge {
             })
             .map(|d| match passing {
                 Some(l) if self.count == 0 => d.child(Icon::Check.el(16., self.color(t, &l.color))),
+                _ if elsewhere => d.min_w(px(SIZE - 2.)).px_0().justify_center(),
                 _ => d.child(number),
             })
             .when(!tally.is_empty(), |d| d.child(kinds));
 
         let pulse = self.color(t, &self.pulse.1);
-        let lift = self.hover == Some("badge");
+        // The pointer's on the pill (not a Mac's tab); its list is open (it stays lit, underlined).
+        let lift = self.hover == Some("badge") && self.hover_part.is_none();
+        let lit = self.list && self.list_closing.is_none() && self.list_mac.is_none();
+        let underline = div().absolute().left(px(10.)).right(px(10.)).bottom(px(4.)).h(px(2.)).rounded(px(1.)).bg(t.fg.opacity(0.75));
         let el = div()
             .id("badge")
             .relative()
@@ -2501,28 +3232,15 @@ impl Badge {
             .rounded(px(SIZE / 2.))
             .bg(linear_gradient(180., linear_color_stop(t.raised, 0.), linear_color_stop(t.panel, 1.)))
             .border_1()
-            .border_color(if lift { t.dim.opacity(0.5) } else { t.line })
+            .border_color(if lit { t.fg.opacity(0.35) } else if lift { t.dim.opacity(0.5) } else { t.line })
             .cursor_pointer()
             .shadow(vec![BoxShadow { color: hsla(0., 0., 0., if lift { 0.5 } else { 0.4 }), offset: point(px(0.), px(10.)), blur_radius: px(26.), spread_radius: px(0.), inset: false }])
             .child(shine)
             .children(self.shimmer.filter(|(_, _, at)| self.within && !reduce && at.elapsed() < SHIMMER).map(|(n, alpha, _)| self.sweep(t, n, alpha)))
             .child(inner)
+            .when(lit, |d| d.child(underline))
             .child(measure(self.zones.badge.clone()))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|b, _, window, cx| {
-                    b.menu = false;
-                    #[cfg(target_os = "macos")]
-                    if let Some(ns) = super::twilight::ns_window(window) {
-                        // Caught mid-sling: it's held where it is.
-                        b.slide = None;
-                        let (f, m) = (ns.frame(), objc2_app_kit::NSEvent::mouseLocation());
-                        let mouse = (m.x, m.y);
-                        b.pressing = Some(Press { mouse, origin: (f.origin.x, f.origin.y), moved: false, last: (mouse, Instant::now()), vel: (0., 0.) });
-                    }
-                    cx.notify();
-                }),
-            )
+            .on_mouse_down(MouseButton::Left, cx.listener(|b, _, window, cx| b.press(None, window, cx)))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|b, _, _, cx| {
@@ -2531,13 +3249,17 @@ impl Badge {
                     cx.notify();
                 }),
             );
+        // The Macs' tabs go over the badge, beside it rather than in it: a div's border paints
+        // after its children, and the badge's would cross them.
+        let tabs = self.mac_tabs(t, Instant::now(), cx);
+        let with_tabs = |el: AnyElement| div().relative().flex_none().child(el).children(tabs).into_any_element();
         if reduce || self.pulse.0 == 0 {
-            return el.into_any_element();
+            return with_tabs(el.into_any_element());
         }
         // It stays wrapped once the pulse is over (its ring at nothing): unwrapping it would change
         // what's inside's element ids, and the image the badge wears would grow in again.
         let shade = if lift { 0.5 } else { 0.4 };
-        el.with_animation(SharedString::from(format!("pulse-{}", self.pulse.0)), Animation::new(PULSE), move |el, d| {
+        with_tabs(el.with_animation(SharedString::from(format!("pulse-{}", self.pulse.0)), Animation::new(PULSE), move |el, d| {
             // Up fast, then fade: a ring of the kind's color around the badge.
             let k = if d < 0.25 { d / 0.25 } else { 1. - (d - 0.25) / 0.75 };
             el.shadow(vec![
@@ -2545,7 +3267,136 @@ impl Badge {
                 BoxShadow { color: hsla(0., 0., 0., shade), offset: point(px(0.), px(10.)), blur_radius: px(26.), spread_radius: px(0.), inset: false },
             ])
         })
-        .into_any_element()
+        .into_any_element())
+    }
+
+    /// My other Macs' tabs on the badge's outer corner (its top, toward where the capsule springs
+    /// out), like an app icon's badge: a Mac's count and its desk icon in its colour, the first
+    /// Mac nearest the badge. One that just got something pops on and pings twice.
+    fn mac_tabs(&self, t: &Theme, now: Instant, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let tabs = self.tabs();
+        if tabs.is_empty() {
+            return None;
+        }
+        let reduce = super::queue::reduce_motion();
+        // The first tab's start sits 10 px out past the badge's (24 px in, at its usual width).
+        let reach = self.badge_w.get().max(SIZE) - 24.;
+        let mac = t.ansi[6];
+        let mut row = div().absolute().top(px(-8.)).h(px(24.)).flex().items_center().gap(px(6.));
+        row = if self.side().right() { row.right(px(reach)).flex_row_reverse() } else { row.left(px(reach)) };
+        for (i, m) in tabs.into_iter().enumerate() {
+            let came = m.came.filter(|_| !reduce);
+            // Popping on, it grows from nothing (overshooting a little) about its middle.
+            let k = came.and_then(|c| mac_tab::pop(&c, now)).unwrap_or(1.).max(0.);
+            let lift = self.hover == Some("badge") && self.hover_part.as_deref() == Some(m.peer.as_str());
+            // Its list is open: it stays lit, a ring of its colour around its gap.
+            let lit = self.list && self.list_closing.is_none() && self.list_mac.as_deref() == Some(m.peer.as_str());
+            let (bg, fg) = if m.asleep { (t.panel, t.dim) } else { (if lift { mac.blend(hsla(0., 0., 1., 0.1)) } else { mac }, mac_tab::fg_on(mac)) };
+            let mut shadow = vec![
+                BoxShadow { color: t.term, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(2.), inset: false },
+                BoxShadow { color: hsla(0., 0., 0., 0.3), offset: point(px(0.), px(3. * k)), blur_radius: px(8. * k), spread_radius: px(0.), inset: false },
+            ];
+            if lit {
+                // Asleep, a grey ring (the canvas's `.tabm.off.open`).
+                let ring = if m.asleep { t.dim } else { mac };
+                shadow.insert(0, BoxShadow { color: ring, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(4.), inset: false });
+            }
+            // Asleep: a grey outline, its icon locked; the count stays (its items still wait there).
+            if m.asleep {
+                shadow.push(BoxShadow { color: t.dim, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(1.5), inset: true });
+            }
+            let label = if m.count() > 99 { "99+".to_string() } else { m.count().to_string() };
+            let tab = div()
+                .flex()
+                .items_center()
+                .gap(px(4. * k))
+                .h(px(24. * k))
+                .min_w(px(24. * k))
+                .pl(px(5. * k))
+                .pr(px(6. * k))
+                .rounded(px(12. * k))
+                .bg(bg)
+                .text_color(fg)
+                .text_size(px((12. * k).max(1.)))
+                .font_weight(FontWeight::EXTRA_BOLD)
+                .shadow(shadow)
+                .when(k > 0.05, |d| d.child((if m.asleep { Icon::MacOff } else { Icon::Mac }).el(13. * k, fg)).child(label))
+                .child(measure_part(self.zones.tabs.clone(), m.peer.clone()));
+            // The ping: a ring of the Mac's colour growing out of the tab and fading, twice.
+            let ping = came.and_then(|c| mac_tab::ping(&c, now)).map(|(scale, alpha)| {
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(24.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(div().flex_none().size(px(22. * scale)).rounded_full().border_2().border_color(mac.opacity(alpha)))
+            });
+            row = row.child(
+                div()
+                    .id(("mac-tab", i))
+                    .relative()
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .children(ping)
+                    .child(tab)
+                    // A press here is a press on the badge (not on it as well).
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener({
+                            let peer = m.peer.clone();
+                            move |b, _, window, cx| {
+                                cx.stop_propagation();
+                                b.press(Some(peer.clone()), window, cx);
+                            }
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|b, _, _, cx| {
+                            cx.stop_propagation();
+                            b.menu = !b.menu;
+                            b.close_list();
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        Some(row.into_any_element())
+    }
+
+    /// Resting on the badge with another Mac to count: what waits where, and the keys.
+    fn tooltip(&self, t: &Theme) -> Option<AnyElement> {
+        if self.hover != Some("badge") || self.list || self.menu || self.pressing.is_some() || !self.lines.is_empty() {
+            return None;
+        }
+        let tip = self.tip()?;
+        // The room beside the pill, in the window (`render`'s `side`); past it, a line wraps.
+        let room = MX + SIZE - self.badge_w.get().max(SIZE) - 16.;
+        Some(
+            div()
+                .max_w(px(room))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(8.))
+                .bg(t.raised)
+                .border_1()
+                .border_color(t.line)
+                .shadow(vec![BoxShadow { color: hsla(0., 0., 0., 0.35), offset: point(px(0.), px(6.)), blur_radius: px(16.), spread_radius: px(0.), inset: false }])
+                .text_size(px(12.))
+                .child(div().text_color(t.fg).child(tip))
+                .when(!self.keys.is_empty(), |d| d.child(div().text_color(t.dim).child(self.keys.clone())))
+                .into_any_element(),
+        )
     }
 
     /// The image the badge wears while its capsule shows, ringed in the kind's color: it grows
@@ -2626,7 +3477,12 @@ impl Badge {
         let hover = self.hover == Some("line");
         let key = format!("line:{}", l.serial);
         let k = self.grow(&key, Instant::now()).max(0.);
-        let out = k > 0.01;
+        // Another Mac's: no × or arrow (its terminal is over there), and it opens its Mac's list as
+        // that Mac's tab does.
+        let remote = l.mac.is_some();
+        let peer = l.peer.clone();
+        let out = k > 0.01 && !remote;
+        let k = if remote { 0. } else { k };
         let hot = self.hot.as_ref().is_some_and(|(h, _)| *h == key);
         let need = l.need.clone().filter(|id| self.needs.iter().any(|w| w.id == *id && w.approval));
         let (session, need_id, waiting, sent) = (l.session.clone(), l.need.clone(), l.waiting.clone(), l.sent.clone());
@@ -2665,7 +3521,15 @@ impl Badge {
                 move |b, on: &bool, _, cx| b.hover_row(&key, *on, cx)
             }))
             .on_click(cx.listener(move |b, _, _, cx| {
-                b.open_line_card(&card_id);
+                if let Some(peer) = peer.clone() {
+                    // Another Mac's opens its list, flying into its row there.
+                    let part = Some(peer);
+                    if !b.list && b.can_open(&part) {
+                        b.open_from_badge(part, cx);
+                    }
+                } else {
+                    b.open_line_card(&card_id);
+                }
                 cx.notify();
             }));
         // A passing kind's tint clears from left to right over its time. Not while it slides
@@ -2676,6 +3540,10 @@ impl Badge {
             row = row.child(tint.with_animation(SharedString::from(format!("fill-{}", l.serial)), Animation::new(stay), |el, d| el.left(relative(d))));
         }
         row = row.child(measure(self.zones.line.clone()));
+        // Another Mac's: a bar of that Mac's colour on its edge.
+        if remote {
+            row = row.child(div().absolute().left(px(9.)).top(px(9.)).bottom(px(9.)).w(px(3.)).rounded(px(2.)).bg(t.ansi[6]));
+        }
         if out {
             row = row.child(
                 div()
@@ -2705,7 +3573,7 @@ impl Badge {
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .pl(px(14. - 6. * k.min(1.)))
+                .pl(px(if remote { 20. } else { 14. - 6. * k.min(1.) }))
                 .pr(px(if out || need.as_ref().is_some_and(|_| hover) { 6. } else { 14. }))
                 .child(icon_of(&l.category).el(14., color))
                 .child(div().flex_none().max_w(px(180.)).truncate().font_weight(FontWeight::BOLD).text_color(t.fg).child(l.name.clone()))
@@ -2713,6 +3581,7 @@ impl Badge {
         );
         if let (Some(id), true) = (need, hover) {
             let (a, d) = (id.clone(), id);
+            let (yes, no) = approve_labels(&l.text);
             row = row.child(
                 div()
                     .flex_none()
@@ -2720,11 +3589,11 @@ impl Badge {
                     .items_center()
                     .gap(px(6.))
                     .mr(px(6.))
-                    .child(button(t, "line-approve", "Approve", true).on_click(cx.listener(move |b, _, _, cx| {
+                    .child(button(t, "line-approve", yes, true).on_click(cx.listener(move |b, _, _, cx| {
                         cx.stop_propagation();
                         b.approve(a.clone(), false, cx);
                     })))
-                    .child(button(t, "line-deny", "Deny", false).on_click(cx.listener(move |b, _, _, cx| {
+                    .child(button(t, "line-deny", no, false).on_click(cx.listener(move |b, _, _, cx| {
                         cx.stop_propagation();
                         b.approve(d.clone(), true, cx);
                     }))),
@@ -2823,6 +3692,11 @@ impl Badge {
         }
         let now = Instant::now();
         let right = self.side().right();
+        // Switching from another Mac's list: how far in the new rows are, out the old, and across
+        // the notch and height.
+        let sw = self.switch.as_ref().filter(|w| mac_tab::switching(w.since(now)));
+        let (si, so, sg) = sw.map_or((1., 1., 1.), |w| mac_tab::switch_at(w.since(now)));
+        let dir = sw.map_or(0., |w| w.dir);
         let (tops, heights) = self.layout(&rows, now);
         let s = self.scroll_now(now);
         let mid = s + LIST_H / 2. - LIST_TOP;
@@ -2832,9 +3706,10 @@ impl Badge {
         let (more_above, more_below) = (s > lo + 0.5, s < hi - 0.5);
         let mut col = div()
             .absolute()
-            .left_0()
-            .right_0()
+            .left(px(dir * mac_tab::SWITCH_DX * (1. - si)))
+            .right(px(-dir * mac_tab::SWITCH_DX * (1. - si)))
             .top(px(LIST_TOP - s))
+            .opacity(si)
             .flex()
             .flex_col()
             .gap(px(GAP))
@@ -2932,7 +3807,24 @@ impl Badge {
         });
         // As tall as its rows (up to `LIST_H`), so a short list sits against Clear and the badge
         // in a bottom corner instead of at the top of an empty viewport.
-        let fit = tops.last().zip(heights.last()).map_or(LIST_H, |(t, h)| (LIST_TOP + t + h + LIST_TOP).min(LIST_H));
+        let fit = self.list_fit(now);
+        // The old Mac's rows, sliding out toward the part you left.
+        let ghost = sw.filter(|_| so < 1.).map(|w| {
+            let mut col = div()
+                .absolute()
+                .left(px(-dir * mac_tab::SWITCH_DX * so))
+                .right(px(dir * mac_tab::SWITCH_DX * so))
+                .top(px(LIST_TOP - w.scroll))
+                .opacity(1. - so)
+                .flex()
+                .flex_col()
+                .gap(px(GAP))
+                .map(|d| if right { d.items_end().pr(px(10.)) } else { d.items_start().pl(px(10.)) });
+            for (_, r) in w.rows.iter().enumerate().take_while(|(i, _)| LIST_TOP + *i as f32 * (ROW + GAP) - w.scroll < w.height) {
+                col = col.child(div().flex().child(self.capsule(t, r, now, 1., 1., cx)));
+            }
+            col
+        });
         let viewport = div()
             .id("badge-list")
             .relative()
@@ -2941,23 +3833,20 @@ impl Badge {
             .overflow_hidden()
             .on_scroll_wheel(cx.listener(|b, e: &ScrollWheelEvent, _, cx| b.wheel(f32::from(e.delta.pixel_delta(px(18.)).y), cx)))
             .child(measure(self.zones.viewport.clone()))
+            .children(ghost)
             .child(col)
             .children(thumb)
             .children(chip);
         let clear = div()
             .id("list-clear")
             .relative()
+            .flex_none()
             .px(px(10.))
-            .py(px(3.))
-            .rounded(px(11.))
+            .py(px(2.))
+            .rounded(px(10.))
             .bg(t.raised)
             .border_1()
             .border_color(t.dim.opacity(0.3))
-            // A faint dark ring keeps it apart from a busy window behind.
-            .shadow(vec![
-                BoxShadow { color: t.bg.opacity(0.35), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(4.), inset: false },
-                BoxShadow { color: hsla(0., 0., 0., 0.5), offset: point(px(0.), px(4.)), blur_radius: px(14.), spread_radius: px(0.), inset: false },
-            ])
             .text_size(px(12.))
             .text_color(t.fg.opacity(0.85))
             .cursor_pointer()
@@ -2965,8 +3854,16 @@ impl Badge {
             .on_click(cx.listener(|b, _, _, cx| b.clear_all(cx)))
             .child(measure(self.zones.clear.clone()))
             .child("Clear");
-        let header = div().relative().opacity(self.cascade(if self.list_closing.is_some() { CASCADE_ROWS - 1 } else { 0 }, now).clamp(0., 1.)).w(px(LIST_W)).h(px(26.)).px(px(6.)).flex().items_center().map(|d| if right { d.justify_end() } else { d.justify_start() }).child(clear);
         let top = self.side().top();
+        let header = div()
+            .relative()
+            .opacity(self.cascade(if self.list_closing.is_some() { CASCADE_ROWS - 1 } else { 0 }, now).clamp(0., 1.))
+            .w(px(LIST_W))
+            .px(px(6.))
+            .flex()
+            .map(|d| if right { d.justify_end() } else { d.justify_start() })
+            // With no other Mac linked, whose list it is goes without saying: Clear alone.
+            .map(|d| if self.macs.is_empty() && self.list_mac.is_none() { d.child(clear) } else { d.child(self.strip(t, sw, (si, sg), top, clear)) });
         Some(
             div()
                 .relative()
@@ -2979,6 +3876,111 @@ impl Badge {
                 .child(viewport)
                 .into_any_element(),
         )
+    }
+
+    /// How tall the list's viewport stands: as tall as its rows (up to `LIST_H`); switching
+    /// Macs, it goes from the old list's height to the new one's.
+    fn list_fit(&self, now: Instant) -> f32 {
+        let rows = self.list_rows();
+        let (tops, heights) = self.layout(&rows, now);
+        let fit = tops.last().zip(heights.last()).map_or(LIST_H, |(t, h)| (LIST_TOP + t + h + LIST_TOP).min(LIST_H));
+        match self.switch.as_ref().filter(|w| mac_tab::switching(w.since(now))) {
+            Some(w) => w.height + (fit - w.height) * mac_tab::switch_at(w.since(now)).2,
+            None => fit,
+        }
+    }
+
+    /// The list's header: whose list it is (this Mac's laptop, or another's desk in its colour),
+    /// with its count and Clear, and a notch on its edge pointing at the lit part of the badge.
+    /// Switching Macs, the new name slides in with its rows and the notch glides across.
+    fn strip(&self, t: &Theme, sw: Option<&Switch>, (si, sg): (f32, f32), top: bool, clear: impl IntoElement) -> Div {
+        let mac = t.ansi[6];
+        let dir = sw.map_or(0., |w| w.dir);
+        let label = |of: &Option<String>, k: f32, off: f32| {
+            let (icon, color, name) = match of {
+                None => (Icon::Laptop, t.fg, "This Mac".to_string()),
+                // Asleep: "<Mac> · asleep", its icon locked and grey.
+                Some(peer) if self.asleep(peer) => (Icon::MacOff, t.dim, format!("{} · asleep", self.mac_name(peer))),
+                Some(peer) => (Icon::Mac, mac, self.macs.iter().find(|m| m.peer == *peer).map_or_else(|| peer.clone(), |m| m.name.clone())),
+            };
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(off))
+                .right(px(-off))
+                .opacity(k)
+                .flex()
+                .items_center()
+                .gap(px(7.))
+                .child(icon.el(14., color))
+                .child(div().min_w_0().truncate().text_size(px(11.)).font_weight(FontWeight::BOLD).text_color(t.dim).child(name.to_uppercase()))
+                .child(div().flex_none().text_size(px(11.)).text_color(t.dim.opacity(0.8)).child(self.mac_rows(of).len().to_string()))
+        };
+        let names = div()
+            .relative()
+            .flex_1()
+            .h_full()
+            .overflow_hidden()
+            .child(label(&self.list_mac, si, dir * mac_tab::SWITCH_DX * (1. - si)));
+        let border = match &self.list_mac {
+            Some(peer) if !self.asleep(peer) => mac.opacity(0.5),
+            _ => t.line,
+        };
+        let to = self.middles.iter().find(|(p, _)| *p == self.list_mac).map(|(_, x)| *x);
+        let x = match sw.and_then(|w| w.from_x) {
+            Some(from) => to.map(|to| from + (to - from) * sg),
+            None => to,
+        };
+        let (fill, edge) = (t.panel, border);
+        let notch = x.map(|x| {
+            canvas(
+                |_, _, _| {},
+                move |b, _, window, _| {
+                    let (left, w) = (f32::from(b.origin.x), f32::from(b.size.width));
+                    let x = left + (x - left).clamp(18., (w - 18.).max(18.));
+                    let (y, d) = if top { (f32::from(b.origin.y), -1.) } else { (f32::from(b.origin.y + b.size.height), 1.) };
+                    let at = |x: f32, y: f32| point(px(x), px(y));
+                    let apex = at(x, y + d * 6.5);
+                    let mut body = PathBuilder::fill();
+                    body.move_to(at(x - 7.5, y - d * 1.));
+                    body.line_to(apex);
+                    body.line_to(at(x + 7.5, y - d * 1.));
+                    body.close();
+                    if let Ok(path) = body.build() {
+                        window.paint_path(path, fill);
+                    }
+                    let mut line = PathBuilder::stroke(px(1.));
+                    line.move_to(at(x - 7., y + d * 0.5));
+                    line.line_to(apex);
+                    line.line_to(at(x + 7., y + d * 0.5));
+                    if let Ok(path) = line.build() {
+                        window.paint_path(path, edge);
+                    }
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+        });
+        div()
+            .relative()
+            .w(px(LIST_W - 12.))
+            .h(px(32.))
+            .pl(px(11.))
+            .pr(px(4.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .rounded(px(12.))
+            .bg(t.panel)
+            .border_1()
+            .border_color(border)
+            .shadow(vec![BoxShadow { color: hsla(0., 0., 0., 0.4), offset: point(px(0.), px(6.)), blur_radius: px(18.), spread_radius: px(0.), inset: false }])
+            .child(names)
+            .child(clear)
+            .children(notch)
     }
 
     /// A row as a capsule: dot, terminal, what it's about. With the pointer on it, an × grows
@@ -3076,11 +4078,13 @@ impl Badge {
                 .pl(px(14. - 6. * k.min(1.)))
                 .pr(px(if w.image.is_some() { 8. } else { 14. - 6. * k.min(1.) }))
                 .opacity(words)
-                .child(div().size(px(8.)).flex_none().rounded_full().bg(color))
-                .child(div().flex_none().max_w(px(130.)).truncate().font_weight(FontWeight::BOLD).text_color(t.fg).child(w.name.clone()))
+                // Its Mac asleep: its dot and terminal go grey (the canvas's `.cap.off`).
+                .child(div().size(px(8.)).flex_none().rounded_full().bg(if w.asleep { t.dim } else { color }))
+                .child(div().flex_none().max_w(px(130.)).truncate().font_weight(FontWeight::BOLD).text_color(if w.asleep { t.dim } else { t.fg }).child(w.name.clone()))
                 .child(div().min_w_0().truncate().text_color(t.dim).child(w.title.clone())),
         );
-        if out {
+        // Another Mac's row has no arrow: its terminal is over there.
+        if out && w.mac.is_none() {
             let (session, need, sent) = (w.session.clone(), w.need.clone(), w.sent.clone());
             let held = w.need.is_none().then(|| w.id.clone());
             row = row.child(
@@ -3213,13 +4217,51 @@ impl Badge {
             .when(!w.label.is_empty(), |d| d.child(div().flex_none().text_size(px(12.)).text_color(t.dim).child(w.label.clone())))
             .child(div().flex_1())
             .child(Icon::Chevron.el(12., t.dim).with_transformation(Transformation::rotate(radians(std::f32::consts::PI))));
+        // A question: the one of the picker's the card is on, past the first its own words.
+        let shown = self.shown(w);
+        let count = w.ask.as_ref().map_or(1, NeedsYouQuestion::count);
+        let last = shown.is_none_or(|(k, _)| k + 1 == count);
+        let (title, detail) = match shown {
+            Some((k, q)) if k > 0 => (if q.header.trim().is_empty() { "Asked a question".to_string() } else { q.header.trim().to_string() }, Some(q.text.trim().to_string()).filter(|d| !d.is_empty())),
+            _ => (w.title.clone(), w.detail.clone()),
+        };
         let mut buttons = div().flex().flex_wrap().gap(px(8.)).pt(px(4.));
         let mut menu = None;
-        if let Some(need) = w.need.clone().filter(|_| w.approval) {
-            let (a, d) = (need.clone(), need);
-            buttons = buttons
-                .child(button(t, "card-approve", "Approve", true).flex_1().on_click(cx.listener(move |b, _, _, cx| b.approve(a.clone(), false, cx))))
-                .child(button(t, "card-deny", "Deny", false).on_click(cx.listener(move |b, _, _, cx| b.approve(d.clone(), true, cx))));
+        if w.asleep {
+            // Its Mac is asleep: what would go over its link is off till it wakes.
+            buttons = match (w.approval, w.mac.as_deref().filter(|_| w.local_only)) {
+                (true, Some(peer)) => buttons.child(decide_at(t, &self.mac_name(peer)).flex_1()).child(button_off(t, "card-deny", "Deny", false)).child(button_off(t, "card-dismiss", "Dismiss", false)),
+                (true, None) => {
+                    let (yes, no) = approve_labels(&w.title);
+                    buttons.child(button_off(t, "card-approve", yes, true).flex_1()).child(button_off(t, "card-deny", no, false))
+                }
+                // A post's own buttons, off (as many as its card would show).
+                (false, _) => match w.sent.as_ref().filter(|s| !s.actions.is_empty()) {
+                    Some(sent) => buttons.children(super::button_slots::slots(&sent.actions).iter().enumerate().map(|(n, slot)| {
+                        let first = slot.members()[0];
+                        let label = if matches!(slot, Slot::More(_)) { "More" } else { sent.actions[first].as_str() };
+                        button_off(t, ("card-action", n), label, first == 0 && !matches!(slot, Slot::More(_)))
+                    })),
+                    None => buttons.child(button_off(t, "card-dismiss", "Dismiss", false)),
+                },
+            }
+            .child(div().flex_1());
+        } else if w.need.is_some() && w.approval {
+            let (a, d, x) = (w.id.clone(), w.id.clone(), w.id.clone());
+            buttons = match w.mac.as_deref().filter(|_| w.local_only) {
+                // Approving it can only be done at that Mac (DECISIONS.md, Local-only): said in
+                // Approve's place. Deny and Dismiss grant nothing, so they still work from here.
+                Some(peer) => buttons
+                    .child(decide_at(t, &self.mac_name(peer)).flex_1())
+                    .child(button(t, "card-deny", "Deny", false).on_click(cx.listener(move |b, _, _, cx| b.approve(d.clone(), true, cx))))
+                    .child(button(t, "card-dismiss", "Dismiss", false).on_click(cx.listener(move |b, _, _, cx| _ = b.resolve(x.clone(), Resolution::Dismiss, cx)))),
+                None => {
+                    let (yes, no) = approve_labels(&w.title);
+                    buttons
+                        .child(button(t, "card-approve", yes, true).flex_1().on_click(cx.listener(move |b, _, _, cx| b.approve(a.clone(), false, cx))))
+                        .child(button(t, "card-deny", no, false).on_click(cx.listener(move |b, _, _, cx| b.approve(d.clone(), true, cx))))
+                }
+            };
         } else if let Some(sent) = w.sent.clone().filter(|s| !s.actions.is_empty()) {
             // A `notify.send` notification's own buttons, like ones folded into a split button.
             let slots = super::button_slots::slots(&sent.actions);
@@ -3230,18 +4272,49 @@ impl Badge {
             buttons = buttons.child(div().flex_1());
             menu = open.and_then(|n| slots.get(n)).map(|slot| self.slot_menu(t, w, &sent, slot, cx));
         } else {
-            if let Some(picked) = self.picks.get(&w.id).filter(|p| w.multi && !p.is_empty()) {
+            if let Some(picked) = self.picks.get(&w.id).filter(|p| shown.is_some_and(|(_, q)| q.multi_select) && !p.is_empty()) {
                 let (w2, picked) = (w.clone(), picked.clone());
-                buttons = buttons.child(button(t, "card-submit", "Submit", true).on_click(cx.listener(move |b, _, _, cx| b.answer(&w2, picked.clone(), cx))));
+                let label = if last { "Submit" } else { "Next" };
+                buttons = buttons.child(button(t, "card-submit", label, true).on_click(cx.listener(move |b, _, _, cx| b.answer(&w2, picked.clone(), cx))));
             }
-            let id = w.id.clone();
-            buttons = buttons.child(button(t, "card-dismiss", "Dismiss", false).on_click(cx.listener(move |b, _, _, cx| b.forget(&id, cx)))).child(div().flex_1());
+            if shown.is_some_and(|(k, _)| k > 0) {
+                let id = w.id.clone();
+                buttons = buttons.child(button(t, "card-back", "Back", false).on_click(cx.listener(move |b, _, _, cx| b.step_back(&id, cx))));
+            }
+            let (id, there) = (w.id.clone(), w.mac.is_some() && w.need.is_some());
+            buttons = buttons
+                .child(button(t, "card-dismiss", "Dismiss", false).on_click(cx.listener(move |b, _, _, cx| {
+                    // Another Mac's item is dismissed there, as the human there would (its row's ×
+                    // only clears it from this pill).
+                    if there {
+                        b.resolve(id.clone(), Resolution::Dismiss, cx);
+                    } else {
+                        b.forget(&id, cx);
+                    }
+                })))
+                .child(div().flex_1());
         }
         let (session, need, sent) = (w.session.clone(), w.need.clone(), w.sent.clone());
         let held = w.need.is_none().then(|| w.id.clone());
         let opens = sent.as_ref().is_some_and(|s| s.open.is_some());
-        // Somewhere to go: its URL, its terminal, or its needs-you card.
-        if opens || session.is_some() || need.is_some() {
+        // Another Mac's post's link, when it opens here too (it goes first, as this Mac's does).
+        let web = sent.as_ref().and_then(|s| s.open.as_deref()).is_some_and(web_url);
+        if let Some(peer) = w.mac.as_deref().filter(|_| opens_on_mac(w)) {
+            // Another Mac's: that Mac's window, on its terminal with its card showing. Asleep,
+            // its window shows it reconnecting, then the terminal once it's back.
+            let label = if w.asleep { "Open when back".to_string() } else { format!("Open on {}", self.mac_name(peer)) };
+            let row = w.clone();
+            buttons = buttons.child(
+                button(t, "card-open", &label, false)
+                    .gap(px(6.))
+                    .child(Icon::Arrow.el(12., t.fg))
+                    .on_click(cx.listener(move |b, _, _, cx| b.open_row_on(&row, cx))),
+            );
+        } else if w.mac.is_some() && !web {
+            // Another Mac's post with no terminal there and no web link: nowhere to go from here
+            // (a file it opens is on that Mac).
+        } else if opens || session.is_some() || need.is_some() {
+            // Somewhere to go: its URL, its terminal, or its needs-you card.
             buttons = buttons.child(
                 button(t, "card-open", if opens { "Open" } else { "Terminal" }, false)
                     .gap(px(6.))
@@ -3256,6 +4329,20 @@ impl Badge {
             .flex_col()
             .gap(px(9.))
             .opacity(fade)
+            .children(w.mac.as_deref().map(|peer| {
+                // "<Mac> · project › terminal"; asleep, grey and locked, with since when.
+                let (icon, color) = if w.asleep { (Icon::MacOff, t.dim) } else { (Icon::Mac, t.ansi[6]) };
+                let words: Vec<String> = [Some(self.mac_name(peer)), w.asleep.then(|| mac_tab::asleep_since(w.since, super::screen_kit::now_unix())), w.on.clone()].into_iter().flatten().collect();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(color)
+                    .child(icon.el(13., color))
+                    .child(div().min_w_0().truncate().child(words.join(" · ")))
+            }))
             .child(match w.image.clone() {
                 // Its image beside the title, the card's detail under the title beside it too.
                 Some(path) => div()
@@ -3269,18 +4356,20 @@ impl Badge {
                             .flex()
                             .flex_col()
                             .gap(px(6.))
-                            .child(div().text_size(px(14.)).font_weight(FontWeight::BOLD).line_height(px(19.)).max_h(px(19. * 3.)).overflow_hidden().child(w.title.clone()))
-                            .children(w.detail.clone().filter(|_| w.command.is_none()).map(|d| div().max_h(px(19. * 5.)).overflow_hidden().text_size(px(13.)).line_height(px(19.)).text_color(t.dim).child(d))),
+                            .child(div().text_size(px(14.)).font_weight(FontWeight::BOLD).line_height(px(19.)).max_h(px(19. * 3.)).overflow_hidden().child(title.clone()))
+                            .children(detail.clone().filter(|_| w.command.is_none()).map(|d| div().max_h(px(19. * 5.)).overflow_hidden().text_size(px(13.)).line_height(px(19.)).text_color(t.dim).child(d))),
                     )
                     .child(thumb(path, 56., 10.)),
-                None => div().text_size(px(14.)).font_weight(FontWeight::BOLD).line_height(px(19.)).max_h(px(19. * 3.)).overflow_hidden().child(w.title.clone()),
+                None => div().text_size(px(14.)).font_weight(FontWeight::BOLD).line_height(px(19.)).max_h(px(19. * 3.)).overflow_hidden().child(title.clone()),
             })
             .children(self.failed.get(&w.id).map(|e| {
                 div().px(px(10.)).py(px(7.)).rounded(px(7.)).bg(t.err.opacity(0.14)).text_size(px(12.5)).line_height(px(18.)).text_color(t.err).child(format!("Didn't go through: {e}"))
             }))
             .children(w.command.clone().map(|c| div().px(px(10.)).py(px(8.)).rounded(px(7.)).bg(t.term).font_family(t.mono_font.clone()).text_size(px(12.)).truncate().child(c)))
-            .children(w.detail.clone().filter(|_| w.image.is_none() || w.command.is_some()).map(|d| div().max_h(px(19. * 5.)).overflow_hidden().text_size(px(13.)).line_height(px(19.)).text_color(t.dim).child(d)))
-            .when(!w.options.is_empty(), |d| d.child(options(t, w, self.picks.get(&w.id).map_or(&[][..], |p| &p[..]), cx)))
+            .children(detail.clone().filter(|_| w.image.is_none() || w.command.is_some()).map(|d| div().max_h(px(19. * 5.)).overflow_hidden().text_size(px(13.)).line_height(px(19.)).text_color(t.dim).child(d)))
+            .children(shown.filter(|_| count > 1).map(|(k, _)| div().text_size(px(11.5)).text_color(t.dim).child(format!("Question {} of {count}", k + 1))))
+            .children(shown.filter(|(_, q)| !q.options.is_empty()).map(|(_, q)| options(t, w, q, last, self.picks.get(&w.id).map_or(&[][..], |p| &p[..]), cx)))
+            .children(w.mac.as_deref().filter(|_| w.asleep).map(|peer| div().text_size(px(12.)).line_height(px(17.)).text_color(t.dim).child(mac_tab::asleep_why(&self.mac_name(peer)))))
             .child(buttons)
             .children(menu);
         div()
@@ -3340,6 +4429,7 @@ impl Badge {
 impl Render for Badge {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.global::<Theme>().clone();
+        self.middles = std::iter::once(None).chain(self.zones.tabs.borrow().iter().map(|(p, _)| Some(p.clone()))).filter_map(|p| self.zones.middle(&p).map(|x| (p, x))).collect();
         self.zones.clear();
         let (top, right) = (self.side().top(), self.side().right());
         // `inset` is from the screen's edge, as if the badge's corner were the window's.
@@ -3358,15 +4448,17 @@ impl Render for Badge {
             || self.expanded.as_ref().is_some_and(|(_, t)| now.duration_since(*t) < CARD_IN + CARD_FADE_AFTER + CARD_FADE)
             // A button menu opening or closing: the card's height is measured as it paints.
             || self.button_menu_at.is_some_and(|t| now.duration_since(t) < Duration::from_millis(100));
-        if self.list_moving(now) || card_moving || self.cool.is_some() || self.hot.as_ref().is_some_and(|(_, t)| now.duration_since(*t) < GROW) {
+        let tab_moving = self.macs.iter().any(|m| m.came.is_some_and(|c| mac_tab::moving(&c, now))) && !super::queue::reduce_motion();
+        if tab_moving || self.mac_line.is_some() || self.list_moving(now) || card_moving || self.cool.is_some() || self.hot.as_ref().is_some_and(|(_, t)| now.duration_since(*t) < GROW) {
             window.request_animation_frame();
         }
-        if let Some(line) = self.line(&t, cx).filter(|_| !self.list) {
+        if let Some(line) = self.line(&t, cx).filter(|_| !self.list).or_else(|| self.tooltip(&t)) {
             let side = MX + self.badge_w.get().max(SIZE) + 8.;
             let at = div().absolute().flex().map(|d| if top { d.top(px(MY + 4.)) } else { d.bottom(px(MY + 4.)) });
             let at = if right { at.right(px(side)).justify_end() } else { at.left(px(side)) };
             root = root.child(at.child(line));
         }
+        self.speak();
         if let Some(fly) = self.fly(&t, now, cx) {
             root = root.child(fly);
         }
@@ -3377,5 +4469,320 @@ impl Render for Badge {
             root = root.child(edge(div().absolute(), below).child(list));
         }
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Mac;
+    use crate::backend::fake::FakeBackend;
+    use crate::mac_feed::Feed;
+
+    #[test]
+    fn a_folder_trust_asks_trust_or_dont() {
+        assert_eq!(approve_labels("Trust this folder? /Users/me/src/app/.claude/worktrees/slot-2"), ("Trust", "Don't trust"));
+        assert_eq!(approve_labels("Approve npm publish?"), ("Approve", "Deny"));
+        assert_eq!(approve_labels("Run: rm -rf trust this folder?"), ("Approve", "Deny"));
+    }
+    use gpui_kit::TestAppContext;
+    use ::core::prelude::v1::test;
+
+    struct Pill {
+        badge: WindowHandle<Badge>,
+        here: Arc<dyn Backend>,
+        mini: Arc<dyn Backend>,
+        peer: String,
+    }
+
+    /// The pill over a fresh fake (this Mac) following its Mac mini, under a fingerprint of the
+    /// test's own (`for_mac` keeps one backend per fingerprint for the whole run).
+    fn pill(c: char, cx: &mut TestAppContext) -> Pill {
+        cx.update(|cx| cx.set_global(Theme::from_def(&midna_proto::themes::builtin("twilight").unwrap(), "ui".into(), "mono".into())));
+        let here: Arc<dyn Backend> = Arc::new(FakeBackend::new());
+        let mac = Mac { peer: c.to_string().repeat(64), name: "Morgan's Mac mini".into() };
+        let mini = crate::backend::for_mac(&here, mac.clone());
+        let h = here.clone();
+        let badge = cx.add_window(|window, cx| Badge::new(h, window, cx));
+        let pill = Pill { badge, here, mini, peer: mac.peer };
+        follow(&pill, cx);
+        pill
+    }
+
+    /// The Mac mini's feed as it stands now, as `mac_feed` hands it over.
+    fn follow(p: &Pill, cx: &mut TestAppContext) {
+        follow_as(p, Feed::new(p.mini.mac().unwrap().clone()).reach, cx);
+    }
+
+    /// The same, with the Mac mini reached (or not) like this.
+    fn follow_as(p: &Pill, reach: crate::mac_feed::Reach, cx: &mut TestAppContext) {
+        follow_posts(p, reach, vec![], cx);
+    }
+
+    /// The same, with these posts heard from it.
+    fn follow_posts(p: &Pill, reach: crate::mac_feed::Reach, posts: Vec<crate::mac_feed::Post>, cx: &mut TestAppContext) {
+        let mut feed = Feed::new(p.mini.mac().unwrap().clone());
+        feed.reach = reach;
+        feed.posts = posts;
+        feed.needs = parse_list(&p.mini.call("needs_you.list", json!({})).unwrap());
+        let projects: Vec<Project> = parse_list(&p.mini.call("project.list", json!({})).unwrap());
+        let sessions: Vec<Session> = parse_list(&p.mini.call("session.list", json!({})).unwrap());
+        for s in sessions {
+            let project = projects.iter().find(|x| Some(&x.id) == s.project_id.as_ref()).map(|x| x.name.clone());
+            feed.places.insert(s.id, crate::mac_feed::Place { terminal: s.name, project });
+        }
+        p.badge.update(cx, |b, _, cx| b.follow_macs(&[feed], cx)).unwrap();
+    }
+
+    fn ids(b: &Arc<dyn Backend>) -> Vec<String> {
+        let list: Vec<NeedsYou> = parse_list(&b.call("needs_you.list", json!({})).unwrap());
+        list.into_iter().map(|n| n.id).collect()
+    }
+
+    /// The Mac mini's row whose item there is `need` (its id there starts so).
+    fn row(p: &Pill, need: &str, cx: &mut TestAppContext) -> Waiting {
+        p.badge.read_with(cx, |b, _| b.remote.iter().find(|w| w.need.as_deref().is_some_and(|n| n.starts_with(need))).cloned()).unwrap().expect(need)
+    }
+
+    #[gpui_kit::test]
+    fn another_macs_card_approves_and_denies_there(cx: &mut TestAppContext) {
+        let p = pill('1', cx);
+        let (mine, theirs) = (ids(&p.here), ids(&p.mini));
+        let publish = row(&p, "n_publsh", cx);
+        assert_eq!(publish.mac.as_deref(), Some(p.peer.as_str()));
+        assert!(publish.approval && !publish.local_only);
+        assert!(publish.on.as_deref().is_some_and(|on| on.contains(" › ")), "{:?}", publish.on);
+        assert!(!publish.asleep && publish.since.is_none());
+        p.badge.update(cx, |b, _, cx| b.approve(publish.id.clone(), false, cx)).unwrap();
+        cx.run_until_parked();
+        let need = publish.need.clone().unwrap();
+        assert!(!ids(&p.mini).contains(&need), "approved on the Mac mini");
+        assert_eq!(ids(&p.here), mine, "nothing changes on this Mac");
+        p.badge.read_with(cx, |b, _| assert!(b.row(&publish.id).is_none() && b.failed.is_empty())).unwrap();
+        // Deny goes there too, local-only or not: it grants nothing.
+        let setting = row(&p, "n_settng", cx);
+        p.badge.update(cx, |b, _, cx| b.approve(setting.id.clone(), true, cx)).unwrap();
+        cx.run_until_parked();
+        assert_eq!(ids(&p.mini).len(), theirs.len() - 2);
+        assert_eq!(ids(&p.here), mine);
+    }
+
+    #[gpui_kit::test]
+    fn a_local_only_item_is_decided_at_its_mac(cx: &mut TestAppContext) {
+        let p = pill('2', cx);
+        let setting = row(&p, "n_settng", cx);
+        assert!(setting.approval && setting.local_only, "its card says Decide at, not Approve");
+        // Approving it anyway (its flag was stale): that Mac turns it down, and its card comes
+        // back open with the reason.
+        p.badge.update(cx, |b, _, cx| b.approve(setting.id.clone(), false, cx)).unwrap();
+        cx.run_until_parked();
+        assert!(ids(&p.mini).contains(setting.need.as_ref().unwrap()));
+        p.badge
+            .read_with(cx, |b, _| {
+                assert!(b.row(&setting.id).is_some(), "back in the list");
+                assert!(b.failed.get(&setting.id).is_some_and(|e| e.contains("Do this at Morgan's Mac mini")), "{:?}", b.failed);
+                assert_eq!(b.list_mac.as_deref(), Some(p.peer.as_str()));
+                assert_eq!(b.expanded.as_ref().map(|e| e.0.as_str()), Some(setting.id.as_str()));
+            })
+            .unwrap();
+        // Dismiss still goes through there.
+        p.badge.update(cx, |b, _, cx| b.resolve(setting.id.clone(), Resolution::Dismiss, cx)).unwrap();
+        cx.run_until_parked();
+        assert!(!ids(&p.mini).contains(setting.need.as_ref().unwrap()));
+    }
+
+    #[gpui_kit::test]
+    fn a_resolved_row_stays_hidden_until_its_mac_drops_it(cx: &mut TestAppContext) {
+        let p = pill('3', cx);
+        let question = row(&p, "n_golden", cx);
+        p.badge.update(cx, |b, _, cx| b.resolve(question.id.clone(), Resolution::Dismiss, cx)).unwrap();
+        // Before that Mac's feed has caught up, the row is already gone here.
+        p.badge.read_with(cx, |b, _| assert!(b.row(&question.id).is_none())).unwrap();
+        cx.run_until_parked();
+        follow(&p, cx);
+        p.badge.read_with(cx, |b, _| assert!(!b.remote.iter().any(|w| w.id == question.id))).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_card_takes_each_of_several_questions_before_answering(cx: &mut TestAppContext) {
+        let p = pill('7', cx);
+        let golden = row(&p, "n_golden", cx);
+        // The picker asks a second, multi-select question after the golden one.
+        let second = NeedsYouQuestion { text: "Which platforms?".into(), header: "Platforms".into(), multi_select: true, options: crate::backend::fake::fake_question().options, more: vec![] };
+        let id = golden.id.clone();
+        p.badge
+            .update(cx, |b, _, _| {
+                let w = b.remote.iter_mut().find(|w| w.id == id).unwrap();
+                w.ask.as_mut().unwrap().more = vec![second.clone()];
+            })
+            .unwrap();
+        let w = row(&p, "n_golden", cx);
+        let shown = |cx: &mut TestAppContext| p.badge.read_with(cx, |b, _| b.shown(&w).map(|(k, q)| (k, q.text.clone()))).unwrap();
+        assert_eq!(shown(cx).map(|s| s.0), Some(0));
+        // The first answer moves the card on; nothing goes yet.
+        p.badge.update(cx, |b, _, cx| b.answer(&w, vec![2], cx)).unwrap();
+        cx.run_until_parked();
+        assert_eq!(shown(cx), Some((1, "Which platforms?".into())));
+        p.badge.read_with(cx, |b, _| assert!(b.row(&w.id).is_some() && b.failed.is_empty() && b.cleared.is_empty())).unwrap();
+        // Back takes it back.
+        p.badge.update(cx, |b, _, cx| b.step_back(&w.id, cx)).unwrap();
+        assert_eq!(shown(cx).map(|s| s.0), Some(0));
+        // Both answered: they go together, and the card is done stepping.
+        p.badge.update(cx, |b, _, cx| b.answer(&w, vec![0], cx)).unwrap();
+        p.badge.update(cx, |b, _, cx| b.answer(&w, vec![0, 1], cx)).unwrap();
+        p.badge.read_with(cx, |b, _| assert!(b.steps.is_empty() && b.cleared.contains(&w.id))).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn this_macs_items_stay_on_this_mac(cx: &mut TestAppContext) {
+        let p = pill('4', cx);
+        let theirs = ids(&p.mini);
+        let need = ids(&p.here).into_iter().find(|id| id == "n_migrat").unwrap();
+        p.badge.update(cx, |b, _, cx| b.approve(need.clone(), false, cx)).unwrap();
+        cx.run_until_parked();
+        assert!(!ids(&p.here).contains(&need));
+        assert_eq!(ids(&p.mini), theirs);
+    }
+
+    #[gpui_kit::test]
+    fn an_asleep_mac_greys_out_holds_its_items_and_comes_back_by_itself(cx: &mut TestAppContext) {
+        use crate::mac_feed::Reach;
+        let p = pill('6', cx);
+        let theirs = ids(&p.mini);
+        let since = super::super::screen_kit::now_unix() - 120;
+        // Its lid closes: the tab greys out but keeps its count, its rows grey out.
+        follow_as(&p, Reach::Asleep { since: Some(since) }, cx);
+        let publish = row(&p, "n_publsh", cx);
+        assert!(publish.asleep && publish.since == Some(since));
+        p.badge
+            .read_with(cx, |b, _| {
+                let tabs = b.tabs();
+                assert!(tabs.len() == 1 && tabs[0].asleep && tabs[0].count() == theirs.len());
+                assert!(b.asleep(&p.peer));
+                assert!(b.remote.iter().all(|w| w.asleep), "all its rows");
+                assert!(b.tip().is_some_and(|t| t.ends_with(&format!("{} on Morgan's Mac mini (asleep)", theirs.len()))), "{:?}", b.tip());
+            })
+            .unwrap();
+        // Approve, Deny, Dismiss and its options are off: nothing goes, nothing is queued.
+        let went = p.badge.update(cx, |b, _, cx| b.resolve(publish.id.clone(), Resolution::Approve { scope: ApprovalScope::Once }, cx)).unwrap();
+        let question = row(&p, "n_golden", cx);
+        p.badge.update(cx, |b, _, cx| b.answer(&question, vec![0], cx)).unwrap();
+        cx.run_until_parked();
+        assert!(!went);
+        assert_eq!(ids(&p.mini), theirs);
+        p.badge.read_with(cx, |b, _| assert!(b.cleared.is_empty() && b.row(&publish.id).is_some())).unwrap();
+        // It wakes: all of it comes back, and Approve goes through again.
+        follow_as(&p, Reach::Connected, cx);
+        let publish = row(&p, "n_publsh", cx);
+        assert!(!publish.asleep && publish.since.is_none());
+        p.badge.read_with(cx, |b, _| assert!(!b.asleep(&p.peer) && b.tabs().iter().all(|t| !t.asleep))).unwrap();
+        p.badge.update(cx, |b, _, cx| b.approve(publish.id.clone(), false, cx)).unwrap();
+        cx.run_until_parked();
+        assert!(!ids(&p.mini).contains(publish.need.as_ref().unwrap()));
+    }
+
+    /// What the Mac mini heard last for `notify.send` notification `id` (null: nothing yet),
+    /// waiting up to `wait` for it (answers go on a thread of their own).
+    fn response(p: &Pill, id: &str, wait: Duration) -> Value {
+        let start = Instant::now();
+        loop {
+            let r = p.mini.call("notify.response", json!({ "id": id })).unwrap()["response"].clone();
+            if !r.is_null() || start.elapsed() >= wait {
+                return r;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[gpui_kit::test]
+    fn another_macs_post_waits_in_its_list_and_answers_there(cx: &mut TestAppContext) {
+        use crate::mac_feed::{Post, Reach};
+        let p = pill('p', cx);
+        let sid = p.mini.call("session.list", json!({})).unwrap()[0]["id"].as_str().unwrap().to_string();
+        let post = |seq: u64, id: &str| {
+            let posted = json!({ "category": "attention", "title": "", "via": "app", "id": id, "body": "Deploy 1.4 to prod?\nAll checks green", "actions": ["Deploy", "Later"] });
+            Post { seq, session: Some(sid.clone()), at: midna_proto::time::now_rfc3339(), posted: serde_json::from_value(posted).unwrap() }
+        };
+        let theirs = ids(&p.mini).len();
+        follow_posts(&p, Reach::Connected, vec![post(41, "deploy")], cx);
+        let w = p.badge.read_with(cx, |b, _| b.row(&mac_tab::row_id(&p.peer, "n41")).cloned()).unwrap().expect("its row");
+        let sent = w.sent.clone().expect("its buttons");
+        assert_eq!((sent.mac.as_deref(), sent.actions.as_slice()), (Some(p.peer.as_str()), ["Deploy".to_string(), "Later".to_string()].as_slice()));
+        assert_eq!((w.title.as_str(), w.detail.as_deref(), w.mac.as_deref()), ("Deploy 1.4 to prod?", Some("All checks green"), Some(p.peer.as_str())));
+        assert!(w.on.is_some() && w.need.is_none() && !w.asleep);
+        p.badge.read_with(cx, |b, _| assert_eq!(b.tabs()[0].count(), theirs + 1, "its tab counts it")).unwrap();
+        // A button goes to the Mac mini, not this Mac, and the row goes.
+        p.badge.update(cx, |b, _, cx| b.pick(&w.id, &sent, "Deploy".into(), cx)).unwrap();
+        assert_eq!(response(&p, "deploy", Duration::from_secs(5)), json!({ "kind": "action", "action": "Deploy" }));
+        assert!(p.here.call("notify.response", json!({ "id": "deploy" })).unwrap()["response"].is_null());
+        p.badge.read_with(cx, |b, _| assert!(b.row(&w.id).is_none() && b.tabs()[0].count() == theirs)).unwrap();
+
+        // Asleep: its buttons and Dismiss send nothing, now or once it wakes.
+        follow_posts(&p, Reach::Asleep { since: None }, vec![post(41, "deploy"), post(42, "later")], cx);
+        let w = p.badge.read_with(cx, |b, _| b.row(&mac_tab::row_id(&p.peer, "n42")).cloned()).unwrap().expect("its row");
+        assert!(w.asleep);
+        p.badge.update(cx, |b, _, cx| b.pick(&w.id, w.sent.as_ref().unwrap(), "Later".into(), cx)).unwrap();
+        p.badge.read_with(cx, |b, _| assert!(b.row(&w.id).is_some(), "still waiting")).unwrap();
+        p.badge.update(cx, |b, _, cx| b.forget(&w.id, cx)).unwrap();
+        assert!(response(&p, "later", Duration::from_millis(300)).is_null());
+        // Awake again, Dismiss on another goes there.
+        follow_posts(&p, Reach::Connected, vec![post(43, "again")], cx);
+        p.badge.update(cx, |b, _, cx| b.forget(&mac_tab::row_id(&p.peer, "n43"), cx)).unwrap();
+        assert_eq!(response(&p, "again", Duration::from_secs(5)), json!({ "kind": "dismissed" }));
+    }
+
+    #[gpui_kit::test]
+    fn cmd_j_takes_another_macs_capsule_in_its_window(cx: &mut TestAppContext) {
+        use crate::mac_feed::{Post, Reach};
+        let p = pill('j', cx);
+        let peer = Some(p.peer.clone());
+        let sid = p.mini.call("session.list", json!({})).unwrap()[0]["id"].as_str().unwrap().to_string();
+        let post = |seq: u64, session: Option<String>| {
+            let posted = json!({ "category": "attention", "title": "", "via": "app", "id": format!("p{seq}"), "body": "Build finished", "stay_secs": 0 });
+            Post { seq, session, at: midna_proto::time::now_rfc3339(), posted: serde_json::from_value(posted).unwrap() }
+        };
+        // Its capsule springs out: the row ⌘J opens there from that Mac's window, and whether
+        // ⌘J in this Mac's window takes it (never).
+        let front = |cx: &mut TestAppContext| {
+            p.badge
+                .update(cx, |b, _, _| {
+                    b.spring_mac_line(Instant::now() + Duration::from_secs(60));
+                    (b.front_line(&peer).and_then(|l| b.line_row(l)).map(|w| w.id.clone()), b.front_line(&None).is_some())
+                })
+                .unwrap()
+        };
+        follow_as(&p, Reach::Connected, cx);
+        // A post from a terminal there.
+        follow_posts(&p, Reach::Connected, vec![post(51, Some(sid.clone()))], cx);
+        assert_eq!(front(cx), (Some(mac_tab::row_id(&p.peer, "n51")), false));
+        // One from no terminal: nowhere there to go.
+        follow_posts(&p, Reach::Connected, vec![post(51, Some(sid.clone())), post(52, None)], cx);
+        assert_eq!(front(cx), (None, false));
+        // An item there.
+        let mut item = serde_json::to_value(&parse_list::<NeedsYou>(&p.mini.call("needs_you.list", json!({})).unwrap())[0]).unwrap();
+        item["title"] = json!("Run the migration?");
+        let need = p.mini.call("needs_you.raise", item).unwrap()["id"].as_str().unwrap().to_string();
+        follow_posts(&p, Reach::Connected, vec![post(51, Some(sid.clone())), post(52, None)], cx);
+        let item = mac_tab::row_id(&p.peer, &need);
+        assert_eq!(front(cx), (Some(item.clone()), false));
+        // Its id is that Mac's, not this one's: a recount here leaves its capsule be.
+        p.badge.update(cx, |b, _, cx| b.recount(cx)).unwrap();
+        assert_eq!(front(cx), (Some(item.clone()), false));
+        // Once it's handled there, ⌘J has nothing to go to.
+        p.badge.update(cx, |b, _, _| b.cleared.push(item.clone())).unwrap();
+        assert_eq!(front(cx), (None, false));
+    }
+
+    #[gpui_kit::test]
+    fn a_mac_it_no_longer_follows_gets_nothing(cx: &mut TestAppContext) {
+        let p = pill('5', cx);
+        let publish = row(&p, "n_publsh", cx);
+        let mine = ids(&p.here);
+        p.badge.update(cx, |b, _, _| b.macs.clear()).unwrap();
+        let went = p.badge.update(cx, |b, _, cx| b.resolve(publish.id.clone(), Resolution::Approve { scope: ApprovalScope::Once }, cx)).unwrap();
+        cx.run_until_parked();
+        assert!(!went);
+        assert!(ids(&p.mini).contains(publish.need.as_ref().unwrap()));
+        assert_eq!(ids(&p.here), mine);
     }
 }

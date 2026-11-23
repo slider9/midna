@@ -19,6 +19,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use midna_proto::settings::{SETTINGS, SettingKind};
 use serde_json::{Value, json};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,8 @@ mod looks;
 mod folders;
 #[path = "settings_chips.rs"]
 mod chips;
+#[path = "settings_nearby.rs"]
+mod nearby;
 
 pub(crate) use chips::{KEYS as CHIP_KEYS, chip_label, is_script, moved, script_items, script_value, toggled};
 
@@ -56,16 +59,43 @@ pub(crate) fn place_of(key: &str) -> String {
     }
 }
 
-struct SettingsWindowHandle(Option<WindowHandle<SettingsWindow>>);
-impl Global for SettingsWindowHandle {}
+/// The open Settings windows, one per Mac: keyed by the Mac's fingerprint, None for this Mac.
+#[derive(Default)]
+struct SettingsWindows(std::collections::HashMap<Option<String>, WindowHandle<SettingsWindow>>);
+impl Global for SettingsWindows {}
 
-/// Open (or bring forward) the Settings window. Not while setup is showing.
+/// `backend`'s Settings window, if it's open.
+fn handle_for(backend: &Arc<dyn Backend>, cx: &App) -> Option<WindowHandle<SettingsWindow>> {
+    cx.try_global::<SettingsWindows>()?.0.get(&crate::backend::mac_id(&**backend)).copied()
+}
+
+/// The Settings window's title: "Settings", or "Settings — <Mac>" for another Mac's.
+fn window_title(backend: &dyn Backend) -> String {
+    match backend.mac() {
+        Some(m) => format!("Settings — {}", m.name),
+        None => "Settings".into(),
+    }
+}
+
+/// The sidebar's connection line: "Live", or "Live on <Mac>" in another Mac's Settings.
+fn conn_state(live: bool, backend: &dyn Backend) -> String {
+    match (live, backend.mac()) {
+        (true, Some(m)) => format!("Live on {}", m.name),
+        (false, Some(m)) => format!("{} not connected", m.name),
+        (true, None) => "Live".into(),
+        (false, None) => "Not connected".into(),
+    }
+}
+
+/// Open (or bring forward) `backend`'s Settings window. Each Mac has its own, so another Mac's
+/// window opens that Mac's settings, named in its title and sidebar. Not while setup is showing.
 pub fn open(backend: Arc<dyn Backend>, cx: &mut App) {
     if !crate::ui::onboarding::settings_allowed() {
         return;
     }
-    if let Some(h) = cx.try_global::<SettingsWindowHandle>().and_then(|g| g.0)
-        && h.update(cx, |_, w, _| w.activate_window()).is_ok()
+    let off_screen = off_screen();
+    if let Some(h) = handle_for(&backend, cx)
+        && h.update(cx, |_, w, _| if !off_screen { w.activate_window() }).is_ok()
     {
         return;
     }
@@ -73,17 +103,33 @@ pub fn open(backend: Arc<dyn Backend>, cx: &mut App) {
     let h: f32 = std::env::var("MIDNA_SETTINGS_H").ok().and_then(|v| v.parse().ok()).unwrap_or(680.);
     let opts = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(w), px(h)), cx))),
-        titlebar: Some(TitlebarOptions { title: Some("Settings".into()), appears_transparent: true, traffic_light_position: Some(point(px(16.), px(17.))) }),
+        titlebar: Some(TitlebarOptions { title: Some(window_title(&*backend).into()), appears_transparent: true, traffic_light_position: Some(point(px(16.), px(17.))) }),
         window_min_size: Some(size(px(760.), px(440.))),
         app_id: Some("com.mrgnhnt.midna".into()),
-        focus: std::env::var("MIDNA_NO_ACTIVATE").is_err(),
+        focus: !off_screen && std::env::var("MIDNA_NO_ACTIVATE").is_err(),
+        show: !off_screen,
         ..Default::default()
     };
+    let key = crate::backend::mac_id(&*backend);
     let h = cx.open_window(opts, |window, cx| cx.new(|cx| SettingsWindow::new(backend, window, cx)));
     if let Ok(h) = h {
-        cx.set_global(SettingsWindowHandle(Some(h)));
+        cx.default_global::<SettingsWindows>().0.insert(key, h);
         #[cfg(feature = "snapshot")]
         snapshot(h, cx);
+    }
+}
+
+/// Whether Settings opens without ever showing: under Slate, which hides only the main window,
+/// and for `MIDNA_SETTINGS_SNAPSHOT`, which renders it offscreen.
+fn off_screen() -> bool {
+    crate::hidden::enabled() || (cfg!(feature = "snapshot") && std::env::var_os("MIDNA_SETTINGS_SNAPSHOT").is_some())
+}
+
+/// Open Settings at Nearby (the Mac switcher's "Pair another Mac…").
+pub fn open_nearby(backend: Arc<dyn Backend>, cx: &mut App) {
+    open(backend.clone(), cx);
+    if let Some(h) = handle_for(&backend, cx) {
+        let _ = h.update(cx, |s, _, cx| s.open_section(Sec::Nearby, cx));
     }
 }
 
@@ -98,10 +144,16 @@ enum Sec {
     Limits,
     Notifications,
     Sounds,
+    Nearby,
     Webhooks,
     System,
 }
 
+#[cfg(target_os = "macos")]
+const SECS: [Sec; 11] =
+    [Sec::General, Sec::Appearance, Sec::Terminal, Sec::Shortcuts, Sec::Agents, Sec::Limits, Sec::Notifications, Sec::Sounds, Sec::Nearby, Sec::Webhooks, Sec::System];
+/// Nearby isn't on Windows yet (midnad refuses it), so it has no section there.
+#[cfg(not(target_os = "macos"))]
 const SECS: [Sec; 10] = [Sec::General, Sec::Appearance, Sec::Terminal, Sec::Shortcuts, Sec::Agents, Sec::Limits, Sec::Notifications, Sec::Sounds, Sec::Webhooks, Sec::System];
 
 impl Sec {
@@ -115,6 +167,7 @@ impl Sec {
             Sec::Limits => "Agent limits",
             Sec::Notifications => "Notifications",
             Sec::Sounds => "Sounds",
+            Sec::Nearby => "Nearby",
             Sec::Webhooks => "Webhooks",
             Sec::System => "System",
         }
@@ -130,6 +183,7 @@ impl Sec {
             Sec::Limits => "What agents may do without asking. Only you can change these.",
             Sec::Notifications => "What tells you, and how. A terminal can override any of these.",
             Sec::Sounds => "What each notification and action sounds like.",
+            Sec::Nearby => "Other Midnas on this network: who can find this Mac, and the devices it's paired with.",
             Sec::Webhooks => "How GitHub and Bitbucket events reach midna to start triggers.",
             Sec::System => "macOS permissions, the daemon, and starting over.",
         }
@@ -145,14 +199,15 @@ impl Sec {
             Sec::Limits => Icon::Rules,
             Sec::Notifications => Icon::Bell,
             Sec::Sounds => Icon::Play,
+            Sec::Nearby => Icon::Chain,
             Sec::Webhooks => Icon::Globe,
             Sec::System => Icon::Screen,
         }
     }
 
-    /// A gap above it in the sidebar: the agent sections, then the system ones.
+    /// A gap above it in the sidebar: the agent sections, then the network and system ones.
     fn gap(self) -> bool {
-        matches!(self, Sec::Agents | Sec::Webhooks)
+        matches!(self, Sec::Agents | Sec::Nearby)
     }
 
     /// For `MIDNA_SETTINGS_VIEW`.
@@ -189,7 +244,7 @@ const LAYOUT: &[(Sec, &str, &[&str])] = &[
     (
         Sec::Agents,
         "Runaway work",
-        &["system.busy_cpu", "system.busy_memory", "system.busy_load", "guard.background_agents", "guard.busy_gate", "guard.max_subagents", "guard.build_slots", "guard.model_slots", "guard.panic_hold", "guard.overload_alert", "guard.overload_secs", "guard.loop_max_hours", "worktrees.auto_clean_hours"],
+        &["system.busy_cpu", "system.busy_memory", "system.busy_load", "guard.background_agents", "guard.busy_gate", "guard.max_subagents", "guard.build_slots", "guard.model_slots", "guard.hold_agents_at", "guard.panic_hold", "guard.memory_alert", "guard.overload_alert", "guard.overload_secs", "guard.loop_max_hours", "worktrees.auto_clean_hours"],
     ),
     (
         Sec::Agents,
@@ -216,6 +271,11 @@ const LAYOUT: &[(Sec, &str, &[&str])] = &[
     (Sec::Notifications, "Text", &["@texts"]),
     (Sec::Sounds, "", &["notify.sounds", "notify.sounds_in_app", "@sounds"]),
     (Sec::Sounds, "Sound effects", &["@effects"]),
+    (Sec::Nearby, "This Mac", &["@nearby_me", "nearby.visibility", "nearby.name", "nearby.downloads"]),
+    (Sec::Nearby, "On this network", &["@nearby_peers"]),
+    (Sec::Nearby, "Paired devices", &["@nearby_paired"]),
+    (Sec::Nearby, "Driving this Mac", &["@nearby_drive"]),
+    (Sec::Nearby, "My other Macs' windows here", &["@nearby_looks"]),
     (Sec::Webhooks, "Delivery", &["webhooks.path", "webhooks.port", "webhooks.relay_url"]),
     (Sec::Webhooks, "Triggers", &["triggers.agent_mode"]),
     (Sec::System, "macOS", &["@accessibility", "@notifications", "@login"]),
@@ -298,6 +358,7 @@ pub struct SettingsWindow {
     /// "Reset midna" (daemon.reset) armed by its first click.
     armed_daemon_reset: bool,
     copied: Option<(String, Instant)>,
+    nearby: nearby::State,
     focus: FocusHandle,
     scroll: ScrollHandle,
     _subs: Vec<Subscription>,
@@ -371,12 +432,26 @@ impl SettingsWindow {
             armed_reset: false,
             armed_daemon_reset: false,
             copied: None,
+            nearby: nearby::State::default(),
             focus,
             scroll: ScrollHandle::new(),
             _subs: subs,
             _tasks: vec![task],
         };
         s.load(cx);
+        // Nearby's countdowns (Everyone's 10 minutes, a pairing's time to confirm)
+        s._tasks.push(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let Ok(()) = this.update(cx, |s, cx| {
+                    if s.nearby_ticking() {
+                        cx.notify();
+                    }
+                }) else {
+                    break;
+                };
+            }
+        }));
         if let Some(sc) = crate::dev::var("MIDNA_SETTINGS_EDIT").ok().and_then(|k| crate::actions::SHORTCUTS.iter().find(|s| s.setting == k)) {
             // dev (screenshots): start rebinding this shortcut
             cx.spawn_in(window, async move |this, cx| {
@@ -413,8 +488,20 @@ impl SettingsWindow {
             BackendEvent::Event(e) if e.kind == "settings.changed" => {
                 self.note_change(&e);
                 self.load(cx);
+                // another Mac's windows show what this Mac picked for them, at once (this Mac's
+                // picks: another Mac's Settings changing its own say nothing about them)
+                if self.backend.mac().is_none() && matches!(e.data.get("key").and_then(Value::as_str), Some("nearby.mac_themes" | "theme.colors")) {
+                    crate::theme::refresh_picks(self.backend.clone(), cx);
+                }
             }
             BackendEvent::Event(e) if e.kind.starts_with("webhooks.") || e.kind == "notify.media" || e.kind == "notify.kinds_changed" || e.kind == midna_proto::kinds::LINK_PATTERNS_CHANGED || e.kind == midna_proto::kinds::LINK_ACTIONS_CHANGED => self.load(cx),
+            BackendEvent::Event(e) if e.kind.starts_with("peers.") => self.peers_event(&e, cx),
+            // Nearby counts the "Always" rules that let agents send to each device
+            BackendEvent::Event(e)
+                if matches!(e.kind.as_str(), midna_proto::kinds::RULE_ADDED | midna_proto::kinds::RULE_REMOVED | midna_proto::kinds::RULE_EXPIRED | midna_proto::kinds::RULE_RESTORED) =>
+            {
+                self.load_peers(cx)
+            }
             BackendEvent::Event(e) if e.kind == "hooks.changed" => {
                 self.hooks = e.data.clone();
                 cx.notify();
@@ -466,6 +553,7 @@ impl SettingsWindow {
     fn load(&mut self, cx: &mut Context<Self>) {
         // The answer lands before the rows below are fetched (Settings ▸ Permissions).
         crate::notify::refresh_permission();
+        self.load_peers(cx);
         let backend = self.backend.clone();
         cx.spawn(async move |this, cx| {
             let r = cx
@@ -558,6 +646,8 @@ impl SettingsWindow {
         }
         want.push(("agents.resume_after_sleep_prompt".into(), self.value("agents.resume_after_sleep_prompt").as_str().unwrap_or("").to_string(), "continue"));
         want.push(("webhooks.relay_url".into(), self.value("webhooks.relay_url").as_str().unwrap_or("").to_string(), "https://relay.example.com"));
+        want.push(("nearby.name".into(), self.value("nearby.name").as_str().unwrap_or("").to_string(), self.nearby_name_placeholder()));
+        want.push(("nearby.downloads".into(), self.value("nearby.downloads").as_str().unwrap_or("").to_string(), "~/Downloads/Midna"));
         self.edits.retain(|key, _| want.iter().any(|(k, ..)| k == key));
         self.edit_subs.retain(|key, _| want.iter().any(|(k, ..)| k == key));
         self.edit_saves.retain(|key, _| want.iter().any(|(k, ..)| k == key));
@@ -880,6 +970,8 @@ enum Control {
     /// A list (or a script's `+` parts) as chips to toggle and drag (settings_chips.rs):
     /// `(item, label, on)`, on ones first in order.
     Chips { key: String, chips: Vec<(String, String, bool)> },
+    /// Settings › Nearby's own controls (settings_nearby.rs).
+    Nearby(nearby::Ctl),
 }
 
 #[derive(Clone)]
@@ -945,6 +1037,7 @@ impl RowSpec {
             Control::Folders { list, .. } => out.extend(list.iter().map(|f| ("Folder", f.clone()))),
             Control::Chips { chips, .. } => out.extend(chips.iter().map(|(_, l, _)| ("Option", l.clone()))),
             Control::Hours => out.push(("Key", "keep_awake.start keep_awake.end".into())),
+            Control::Nearby(c) => out.extend(c.fields()),
             _ => {}
         }
         if let Some(k) = self.key() {
@@ -1056,6 +1149,9 @@ pub(crate) fn label_for(key: &str) -> String {
         "agents.claude.statusline" => "Claude status line (cost)",
         "agents.claude.crons_to_midna" => "Claude's crons become Midna schedules",
         "agents.mcp" => "Give agents the midna MCP tools",
+        "nearby.visibility" => "Who can find this Mac",
+        "nearby.name" => "Name other Midnas see",
+        "nearby.downloads" => "Save received files in",
         "keep_awake.enabled" => "Keep the Mac awake for agents",
         "keep_awake.mode" => "When",
         "keep_awake.start" => "From",
@@ -1072,8 +1168,10 @@ pub(crate) fn label_for(key: &str) -> String {
         "guard.max_subagents" => "Most subagents an agent runs at once",
         "guard.build_slots" => "Most builds and tests at once",
         "guard.model_slots" => "Most local model runs at once",
+        "guard.hold_agents_at" => "Hold new agents at load per core (%)",
         "system.busy_memory" => "Short of memory at pressure",
         "guard.panic_hold" => "After a kernel panic, hold agents until I've looked",
+        "guard.memory_alert" => "Tell me when the Mac is short of memory",
         "guard.overload_alert" => "Offer to pause terminals hogging the Mac",
         "guard.overload_secs" => "After the Mac is busy for (seconds)",
         "guard.loop_max_hours" => "Stop agents' poll loops after (hours)",
@@ -1203,6 +1301,9 @@ pub(crate) fn option_label(key: &str, v: &str) -> String {
         ("terminal.image_paste", "inline") => "Paste it inline".into(),
         ("projects.new_terminal_in", "project") => "The project's folder".into(),
         ("projects.new_terminal_in", "main") => "The main or master checkout".into(),
+        ("nearby.visibility", "off") => "No one (Nearby off)".into(),
+        ("nearby.visibility", "paired") => "Paired devices only".into(),
+        ("nearby.visibility", "everyone") => "Everyone for 10 minutes".into(),
         ("keep_awake.mode", "with_work") => "Only while there's work".into(),
         ("keep_awake.mode", "always") => "The whole time".into(),
         ("notify.badge", "background") => "Unless another midna is in front".into(),
@@ -1324,21 +1425,39 @@ impl SettingsWindow {
     fn theme_control(&self, t: &Theme, key: String, current: String, cx: &mut Context<Self>) -> impl IntoElement {
         use midna_proto::themes;
         let current = if key == "theme" && current != "system" { themes::choose(&current, "", "", true) } else { current };
-        let all = crate::theme::cached_themes();
         let only = match key.as_str() {
             "theme.dark" => Some(true),
             "theme.light" => Some(false),
             _ => None,
         };
-        let chip = |id: String, name: String, swatch: Option<[Hsla; 3]>, on: bool, cx: &mut Context<Self>| {
-            let k = key.clone();
+        let first = (key == "theme").then(|| ("system".to_string(), "Follow macOS".to_string()));
+        let k = key.clone();
+        self.theme_chips(t, format!("theme-{key}"), &current, first, only, Rc::new(move |s, id, cx| s.set(&k, json!(id), cx)), cx)
+    }
+
+    /// Swatch chips for every theme on this Mac (customs too), a dark row then a light row (or
+    /// only one, `only`), after an optional `first` choice without a swatch. Clicking one that
+    /// isn't `current` calls `pick` with its id.
+    pub(super) fn theme_chips(
+        &self,
+        t: &Theme,
+        id: String,
+        current: &str,
+        first: Option<(String, String)>,
+        only: Option<bool>,
+        pick: Rc<dyn Fn(&mut Self, String, &mut Context<Self>)>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let all = crate::theme::cached_themes();
+        let chip = |theme: String, name: String, swatch: Option<[Hsla; 3]>, on: bool, cx: &mut Context<Self>| {
+            let pick = pick.clone();
             div()
-                .id(SharedString::from(format!("theme-{key}-{id}")))
+                .id(SharedString::from(format!("{id}-{theme}")))
                 .flex()
                 .items_center()
                 .gap(px(7.))
                 .h(px(28.))
-                .pl(px(5.))
+                .pl(px(if swatch.is_some() { 5. } else { 10. }))
                 .pr(px(10.))
                 .rounded(px(7.))
                 .border_1()
@@ -1357,14 +1476,15 @@ impl SettingsWindow {
                 }))
                 .on_click(cx.listener(move |s, _, _, cx| {
                     if !on {
-                        s.set(&k, json!(id), cx);
+                        pick(s, theme.clone(), cx);
                     }
                 }))
                 .child(name)
         };
         let mut col = div().flex().flex_col().gap(px(6.));
-        if key == "theme" {
-            col = col.child(div().flex().child(chip("system".into(), "Follow macOS".into(), None, current == "system", cx)));
+        if let Some((value, label)) = first {
+            let on = value == current;
+            col = col.child(div().flex().child(chip(value, label, None, on, cx)));
         }
         for dark in [true, false] {
             if only.is_some_and(|o| o != dark) {
@@ -1485,7 +1605,8 @@ impl SettingsWindow {
             }
             // only the self-hosted path uses it
             "webhooks.relay_url" if self.value("webhooks.path") != json!("self_relay") => return None,
-            "agents.resume_after_sleep_prompt" | "webhooks.relay_url" => r.control = Control::Edit { key: key.into(), actions: vec![] },
+            "agents.resume_after_sleep_prompt" | "webhooks.relay_url" | "nearby.downloads" => r.control = Control::Edit { key: key.into(), actions: vec![] },
+            "nearby.visibility" | "nearby.name" => self.nearby_key_row(t, key, &mut r),
             "webhooks.path" => {
                 let url = self.webhooks.get("public_url").and_then(Value::as_str).map(|u| format!("Public URL {u}"));
                 if let Some(n) = url.or_else(|| self.webhooks.get("message").and_then(Value::as_str).map(str::to_string)) {
@@ -1775,21 +1896,22 @@ impl SettingsWindow {
             "@app_link_patterns" => self
                 .app_patterns
                 .iter()
-                .flat_map(|a| a.patterns.iter().map(move |r| (a.owner.as_str(), r)))
-                .map(|(owner, rule)| {
+                .flat_map(|a| a.patterns.iter().map(move |r| (a.owner.as_str(), a.approved, r)))
+                .map(|(owner, approved, rule)| {
                     let (m, v) = rule.split_once('=').map(|(m, v)| (m.trim(), v.trim())).unwrap_or((rule.as_str(), ""));
                     // the hover card's command gets a line of its own, after the URL it fills
                     let (v, preview) = match v.split_once(" preview:") {
                         Some((v, _)) => (v.trim_end(), midna_proto::link_patterns::LinkPattern::parse(rule).ok().map(|p| p.preview.join(" "))),
                         None => (v, None),
                     };
-                    let note = match preview {
-                        Some(cmd) if !cmd.is_empty() => format!("Provided by {owner} · card from `{cmd}`"),
-                        _ => format!("Provided by {owner}"),
+                    let (note, color) = match preview {
+                        Some(cmd) if !cmd.is_empty() && approved => (format!("Provided by {owner} · card from `{cmd}`"), t.dim),
+                        Some(cmd) if !cmd.is_empty() => (format!("Provided by {owner} · card from `{cmd}` waits for your approval"), t.need),
+                        _ => (format!("Provided by {owner}"), t.dim),
                     };
                     RowSpec {
                         label: m.into(),
-                        note: Some((note, t.dim)),
+                        note: Some((note, color)),
                         control: Control::Text { dot: None, text: v.into(), color: t.fg, action: None },
                         cli: "midna links patterns".into(),
                         who: Who::ReadOnly,
@@ -1871,6 +1993,7 @@ impl SettingsWindow {
             "@effects" => self.sound_effect_rows(t),
             "@shortcuts" => self.shortcut_specs(t, false),
             "@built_in" => self.shortcut_specs(t, true),
+            n if nearby::ROWS.contains(&n) => self.nearby_rows(t, n),
             _ => vec![],
         }
     }
@@ -1913,6 +2036,7 @@ impl SettingsWindow {
                             "How long each kind stays on screen" => Some("Until handled: until you answer, open or dismiss it."),
                             "Colors" => Some("In the badge, the in-app card and the notifications list."),
                             "Your kinds" => Some("Kinds agents and triggers can send as."),
+                            "Paired devices" => Some("A contact is someone else's Midna: what it sends asks you first. My device is one of your own Macs."),
                             _ => None,
                         },
                         rows: items.iter().flat_map(|i| if i.starts_with('@') { self.special_rows(t, i) } else { self.key_row(t, i).into_iter().collect() }).collect(),
@@ -2264,6 +2388,9 @@ impl Render for SettingsWindow {
                     .child(self.footer(&t)),
             )
             .children(self.shortcut_menu_el(&t, cx))
+            .children(self.pairing_sheet(&t, cx))
+            .children(self.drive_sheet(&t, cx))
+            .children(self.send_sheet(&t, cx))
             .when(self.picker.is_some(), |d| {
                 // click-away layer under an open sound/image picker
                 d.child(
@@ -2365,6 +2492,10 @@ impl SettingsWindow {
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         let m = &ks.modifiers;
+        if !m.platform && !m.control && !m.alt && self.sheet_key(&ks.key, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if !m.secondary() || (m.control && m.platform) || m.shift {
             return;
         }
@@ -2523,6 +2654,7 @@ impl SettingsWindow {
             }
         }
         let live = self.error.is_none() && !self.entries.is_empty();
+        let state = conn_state(live, &*self.backend);
         let json_on = self.view == View::Json && !searching;
         div()
             .w(px(SIDEBAR_W))
@@ -2548,7 +2680,7 @@ impl SettingsWindow {
                     .text_size(px(12.))
                     .text_color(t.dim)
                     .child(div().size(px(7.)).rounded_full().bg(if live { t.ok } else { t.need }))
-                    .child(div().flex_1().child(if live { "Live" } else { "Not connected" }))
+                    .child(div().flex_1().min_w_0().truncate().child(state))
                     .child(
                         div()
                             .id("open-json")
@@ -2670,7 +2802,7 @@ impl SettingsWindow {
                         )
                     })
                     .when(!crumb, |d| d.child(g.name))
-                    .when_some(g.note, |d, n| d.child(div().font_weight(FontWeight::NORMAL).text_size(px(11.5)).child(format!("· {n}"))))
+                    .when_some(g.note, |d, n| d.items_baseline().child(div().flex_1().min_w_0().font_weight(FontWeight::NORMAL).text_size(px(11.5)).child(format!("· {n}"))))
             });
             let mut card = div().flex().flex_col().rounded(px(10.)).border_1().border_color(t.line).bg(t.panel).overflow_hidden();
             for (i, hit) in g.rows.into_iter().enumerate() {
@@ -2760,6 +2892,7 @@ impl SettingsWindow {
         // too long to sit beside the name without squeezing its description into a narrow column, go under it
         let wide = match &r.control {
             Control::Theme { .. } | Control::CleanupItems | Control::CleanupKeep | Control::CleanupRuns | Control::Looks | Control::Folders { .. } | Control::Chips { .. } => true,
+            Control::Nearby(c) if c.wide() => true,
             Control::Seg { options, .. } => options.len() <= 5 && options.iter().map(|(_, l)| l.chars().count() + 3).sum::<usize>() > 60,
             Control::Number { presets, .. } => presets.iter().map(|(_, l)| l.chars().count() + 3).sum::<usize>() + 14 > 60,
             _ => false,
@@ -2916,7 +3049,7 @@ impl SettingsWindow {
                 cx.notify();
             }
             Act::Life(c) => crate::lifecycle::command(c.clone(), cx),
-            &Act::Hooks { uninstall } => crate::windows::with_active(cx, |m, window, cx| {
+            &Act::Hooks { uninstall } => crate::windows::with_active_local(cx, |m, window, cx| {
                 if uninstall {
                     window.activate_window();
                     crate::ui::hooks::open(m, true, window, cx);
@@ -3180,6 +3313,7 @@ impl SettingsWindow {
             Control::Looks => self.looks_control(t, window, cx),
             Control::Folders { key, list } => self.folders_control(t, key, list, cx),
             Control::Chips { key, chips } => self.chips_control(t, key, chips, words, cx),
+            Control::Nearby(c) => self.nearby_control(t, c, id, window, cx),
             Control::Text { dot, text, color, action } => {
                 let color = if color == Hsla::default() { t.fg } else { color };
                 div()
@@ -3437,7 +3571,7 @@ fn relay_url_problem(text: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui's glob re-export would shadow `#[test]`.
-    use super::{Control, Group, Hsla, LAYOUT, RowSpec, Sec, Shown, Who, brief, excerpt, presets, relay_url_problem, search};
+    use super::{Control, Group, Hsla, LAYOUT, RowSpec, Sec, Shown, Who, brief, conn_state, excerpt, presets, relay_url_problem, search, window_title};
     use midna_proto::notify::{CATEGORIES, EFFECTS};
     use midna_proto::settings::{SETTINGS, setting};
 
@@ -3541,7 +3675,8 @@ mod tests {
         };
         // kept out of the window on purpose; still in the catalog (`midna settings`)
         // (keep_awake.end shares the Hours row with keep_awake.start; per-day hours are CLI-only)
-        let unlisted = ["updates.feed_url", "keep_awake.end", "keep_awake.hours"];
+        // (nearby.mac_themes is a row per Mac, `@nearby_looks`)
+        let unlisted = ["updates.feed_url", "keep_awake.end", "keep_awake.hours", "nearby.mac_themes"];
         for s in SETTINGS {
             assert!(listed.contains(&s.key) || unlisted.contains(&s.key) || s.key.starts_with("keys.") || per_kind(s.key), "{} has no place in Settings (add it to LAYOUT)", s.key);
         }
@@ -3566,8 +3701,23 @@ mod tests {
         ];
         for (_, _, items) in LAYOUT {
             for i in items.iter().filter(|i| i.starts_with('@')) {
-                assert!(known.contains(i), "{i} isn't handled by special_rows");
+                assert!(known.contains(i) || super::nearby::ROWS.contains(i), "{i} isn't handled by special_rows");
             }
         }
+    }
+
+    #[test]
+    fn another_macs_settings_name_that_mac() {
+        use crate::backend::{Backend, Mac, fake::FakeBackend, mac_id};
+        use std::sync::Arc;
+        let here: Arc<dyn Backend> = Arc::new(FakeBackend::local());
+        let mini = here.clone().open_mac(Mac { peer: "e".repeat(64), name: "Morgan's Mac mini".into() });
+        assert_eq!(window_title(&*here), "Settings");
+        assert_eq!(window_title(&*mini), "Settings — Morgan's Mac mini");
+        assert_eq!(conn_state(true, &*here), "Live");
+        assert_eq!(conn_state(true, &*mini), "Live on Morgan's Mac mini");
+        assert_eq!(conn_state(false, &*mini), "Morgan's Mac mini not connected");
+        // each Mac's Settings is its own window
+        assert_ne!(mac_id(&*here), mac_id(&*mini));
     }
 }

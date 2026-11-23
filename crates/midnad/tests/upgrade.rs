@@ -8,10 +8,9 @@
 mod common;
 use midna_proto::{Client, ClientError};
 use serde_json::{Value, json};
-use std::path::PathBuf;
-#[cfg(unix)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -20,15 +19,39 @@ static N: AtomicU32 = AtomicU32::new(0);
 const V1: &str = if cfg!(windows) { "v1.exe" } else { "v1" };
 const V2: &str = if cfg!(windows) { "v2.exe" } else { "v2" };
 
+/// This test process's own copy of the built midnad, run once before any test waits on it:
+/// macOS scans a new executable the first time it runs, which takes a second on a calm Mac
+/// and can outlast a test's wait for the socket on a loaded one. Tests hard-link it, so their
+/// v1/v2 are that same scanned file, at paths of their own that `cargo build` can't swap.
+fn built() -> &'static Path {
+    static BIN: OnceLock<PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| {
+        // Left by earlier runs whose process is gone.
+        for e in std::fs::read_dir(common::tmp()).into_iter().flatten().flatten() {
+            let pid = e.file_name().to_str().and_then(|n| n.strip_prefix("midna-u-bin-")).and_then(|p| p.parse::<i32>().ok());
+            if pid.is_some_and(|p| !midnad::sys::alive(p)) {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+        let dir = common::tmp().join(format!("midna-u-bin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join(if cfg!(windows) { "midnad.exe" } else { "midnad" });
+        std::fs::copy(env!("CARGO_BIN_EXE_midnad"), &bin).unwrap();
+        assert!(Command::new(&bin).arg("--version").stdout(Stdio::null()).status().unwrap().success());
+        bin
+    })
+}
+
 struct Bin {
     home: PathBuf,
     child: Child,
 }
 
 impl Bin {
-    /// Copies of the built midnad as v1/v2 (so `cargo build` can't swap them mid-test and the
-    /// watchdog has a stable fallback path), started from v1, on a calm Mac (MIDNA_DEBUG_LOAD=0:
-    /// `cargo test` itself loads the real one).
+    /// The built midnad as v1/v2 (links to `built()`, so `cargo build` can't swap them mid-test
+    /// and the watchdog has a stable fallback path), started from v1, on a calm Mac
+    /// (MIDNA_DEBUG_LOAD=0: `cargo test` itself loads the real one).
     fn start() -> Bin {
         Bin::start_with_load(0.)
     }
@@ -39,7 +62,7 @@ impl Bin {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         for v in [V1, V2] {
-            std::fs::copy(env!("CARGO_BIN_EXE_midnad"), home.join(v)).unwrap();
+            std::fs::hard_link(built(), home.join(v)).unwrap();
         }
         let log = std::fs::File::create(home.join("daemon.log")).unwrap();
         let child = Command::new(home.join(V1))
@@ -145,6 +168,42 @@ fn wait_for<T>(secs: u64, what: &str, mut f: impl FnMut() -> Option<T>) -> T {
 }
 
 // The helpers from here to the tests serve the in-place upgrade tests, which are Unix only.
+
+/// Wait for the counter in `id` to pass `n`, for as long as it keeps counting: fails only when
+/// it hasn't moved for 20s. A loaded Mac (or one that backgrounded this test's processes) can
+/// take seconds per tick; a counter that was hung up or killed stops for good.
+#[cfg(unix)]
+fn counts_past(c: &mut Client, id: &str, lines: u32, n: u64, what: &str) {
+    let (mut last, mut moved) = (None, Instant::now());
+    loop {
+        let now = counts(&read(c, id, lines)).last().copied();
+        if now.is_some_and(|v| v > n) {
+            return;
+        }
+        if now != last {
+            (last, moved) = (now, Instant::now());
+        }
+        assert!(moved.elapsed() < Duration::from_secs(20), "{what}: the counter stopped at {last:?}, waiting for {n}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Wait for `done` at the end of a session's output for as long as output keeps arriving:
+/// fails only when nothing has come for 30s.
+#[cfg(unix)]
+fn wait_flowing(c: &mut Client, id: &str, done: &str) {
+    loop {
+        let tail = read(c, id, 5);
+        if tail.contains(done) {
+            return;
+        }
+        let last = session(c, id)["last_activity_at"].as_str().and_then(midna_proto::time::parse_rfc3339).unwrap_or(0);
+        let idle = midna_proto::time::now_unix() - last;
+        assert!(idle < 30, "no output for {idle}s and no {done}: {tail:?}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 #[cfg(unix)]
 fn open(c: &mut Client, kind: &str, argv: &[&str]) -> (String, i64) {
     let s = call(c, "session.open", json!({ "kind": kind, "cwd": "/tmp", "command": argv, "cols": 100, "rows": 30 }));
@@ -266,7 +325,8 @@ fn upgrade_during_flood_loses_nothing() {
     call(&mut c, "daemon.upgrade", json!({ "binary_path": d.path("v1") }));
     d.wait_upgraded(2);
     let mut c = d.human();
-    wait_for(120, "flood to finish", || read(&mut c, &flood, 5).contains("FLOOD-DONE").then_some(()));
+    // 50 MB takes minutes on a loaded Mac: wait as long as it keeps coming, so only a stall fails.
+    wait_flowing(&mut c, &flood, "FLOOD-DONE");
     wait_for(60, "numbers to finish", || read(&mut c, &nums, 5).contains("NUMS-DONE").then_some(()));
     let text = read(&mut c, &nums, 9000);
     let v: Vec<u64> = text.lines().filter_map(|l| l.strip_prefix("N ")?.trim().parse().ok()).collect();
@@ -299,7 +359,7 @@ fn selftest_failure_aborts_the_upgrade() {
     assert_eq!(call(&mut c, "daemon.info", json!({}))["pid"].as_i64().unwrap(), pid0);
     assert!(!d.home.join("handoff").exists());
     let n0 = *counts(&read(&mut c, &loop_id, 2000)).last().unwrap_or(&0);
-    wait_for(10, "counting after abort", || (counts(&read(&mut c, &loop_id, 2000)).last().copied().unwrap_or(0) > n0 + 5).then_some(()));
+    counts_past(&mut c, &loop_id, 2000, n0 + 5, "counting after abort");
     let failed = call(&mut c, "events.list", json!({ "since_seq": 0, "filter": { "kinds": ["daemon.upgrade_failed"] } }));
     assert_eq!(failed.as_array().unwrap().len(), 1);
     // A binary that isn't there is a bad-params error, also without side effects.
@@ -345,7 +405,7 @@ fn watchdog_falls_back_when_the_new_binary_dies() {
     assert_ne!(pid1, pid0, "the watchdog process became the daemon");
     assert!(alive(loop_pid));
     let n0 = *counts(&read(&mut c, &loop_id, 3000)).last().unwrap();
-    wait_for(10, "counting after fallback", || (*counts(&read(&mut c, &loop_id, 3000)).last().unwrap() > n0 + 5).then_some(()));
+    counts_past(&mut c, &loop_id, 3000, n0 + 5, "counting after fallback");
     assert!(!Path::new(&hup).exists());
     // The shells aren't our children any more: exits are still noticed (kqueue), without a code.
     call(&mut c, "session.input", json!({ "id": sh_id, "text": "exit 3", "enter": true }));
@@ -374,7 +434,7 @@ fn sigterm_restarts_in_place_and_sigint_stops_and_hangs_up() {
     let mut c = d.human();
     assert_eq!(d.info()["pid"].as_i64().unwrap(), pid0);
     let n0 = *counts(&read(&mut c, &loop_id, 2000)).last().unwrap();
-    wait_for(10, "counting after restart", || (*counts(&read(&mut c, &loop_id, 2000)).last().unwrap() > n0 + 5).then_some(()));
+    counts_past(&mut c, &loop_id, 2000, n0 + 5, "counting after restart");
     assert!(!Path::new(&hup).exists());
 
     // A monitor whose job-controlled child ignores SIGHUP (the reported orphan) and a

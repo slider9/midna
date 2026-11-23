@@ -5,8 +5,14 @@
 //! `fake-engine` feature) runs a real PTY + libghostty engine per session so the terminal
 //! pane, keyboard input and resize can be exercised without the daemon.
 //!
-//! `MIDNA_FAKE_SETTINGS="theme=light,density=compact"` overrides initial settings.
-use super::{AttachRequest, Backend, BackendEvent, ConnState, TermStream};
+//! `MIDNA_FAKE_SETTINGS="theme=light,density=compact"` overrides initial settings;
+//! `MIDNA_FAKE_MAC_SETTINGS` the other Mac's (`theme=ember` is a theme only it has).
+//! `MIDNA_FAKE_MANY=N` adds N projects with three terminals each and N with only Summary
+//! records, for timing a long sidebar (`MIDNA_DEBUG_TERM=benchwheel:…`).
+//! `MIDNA_FAKE_LINK=finding|proving|loading` holds another Mac's window (`MIDNA_DEBUG_REMOTE`)
+//! on that step of its connecting card; `reconnecting|offline` drops its link once its terminals
+//! have shown.
+use super::{AttachRequest, Backend, BackendEvent, ConnState, Mac, TermStream};
 use crate::frame::FrameSink;
 use crate::model::*;
 use anyhow::{anyhow, bail};
@@ -17,6 +23,9 @@ use std::sync::{Arc, Mutex};
 
 pub struct FakeBackend {
     st: Arc<Mutex<FakeState>>,
+    /// Another of my Macs (`open_mac`): drops-app and midna only, under other session ids. With
+    /// this Mac's backend, which opened it.
+    mac: Option<(Mac, Arc<dyn Backend>)>,
 }
 
 struct FakeState {
@@ -31,11 +40,202 @@ struct FakeState {
     terms: HashMap<String, Arc<pty::FakeTerm>>,
     scripts: HashMap<String, String>,
     next_id: u64,
+    /// What the app reported for `notify.send` notifications (`notify.respond`), by id.
+    responses: Vec<(String, Value)>,
 }
 
 fn ago(mins: i64) -> String {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     rfc3339_from_unix(now - mins * 60)
+}
+
+/// Settings › Nearby: this Mac visible to everyone for a few more minutes, two Midnas nearby
+/// (one using a paired device's name with another key), four paired devices (one of my Macs
+/// allowed to drive this one, one that agents send some kinds to without asking), and a pairing
+/// waiting on this side's confirm.
+fn fake_peers() -> Value {
+    let now = midna_proto::time::now_unix();
+    let fp = |c: char| c.to_string().repeat(64);
+    json!({
+        "me": {
+            "fingerprint": fp('a'), "name": "Morgan's MacBook Pro", "visibility": "everyone",
+            "everyone_until": rfc3339_from_unix(now + 7 * 60 + 12), "service": "_midna._tcp",
+            "advertising": true, "browsing": true, "port": 52314, "protocol": midna_proto::nearby::PROTOCOL,
+        },
+        "peers": [
+            { "fingerprint": fp('b'), "name": "Ada's MacBook Air", "protocol": midna_proto::nearby::PROTOCOL, "seen_since": ago(3) },
+            { "fingerprint": fp('c'), "name": "Studio", "protocol": midna_proto::nearby::PROTOCOL, "seen_since": ago(1), "claims_name_of": fp('d') },
+            { "fingerprint": fp('d'), "name": "Studio", "protocol": midna_proto::nearby::PROTOCOL, "seen_since": ago(40), "tier": "my_device" },
+        ],
+        "paired": [
+            {
+                "fingerprint": fp('d'), "name": "Studio", "tier": "my_device", "paired_at": ago(60 * 24 * 9), "nearby": true, "drive": false,
+                "auto_accept": ["message", "snippet", "link", "file", "tab", "object", "agent_start", "agent_ask"],
+                "agent_send": ["file", "agent_start", "agent_ask"], "always_rules": 3,
+            },
+            { "fingerprint": fp('f'), "name": "Morgan's Mac mini", "tier": "my_device", "paired_at": ago(60 * 24 * 4), "nearby": false, "drive": true },
+            { "fingerprint": fp('e'), "name": "Sam's iMac", "tier": "contact", "paired_at": ago(60 * 24 * 30), "nearby": false },
+            { "fingerprint": fp('9'), "name": "Office iMac", "tier": "my_device", "paired_at": ago(60 * 24 * 20), "nearby": false },
+        ],
+        "pairings": [{
+            "id": "pr_7f3a19c2", "role": "outgoing", "fingerprint": fp('b'), "name": "Ada's MacBook Air", "state": "comparing",
+            "code": "482913", "confirmed": false, "peer_confirmed": false, "started_at": ago(0),
+            "expires_at": rfc3339_from_unix(now + 94),
+        }],
+    })
+}
+
+/// `drive.list`: the links to my Macs in `fake_peers`. The Mac mini's is up (its window is
+/// `MIDNA_DEBUG_REMOTE`'s), Studio refuses to be driven, the Office iMac has been away 2 h.
+fn fake_links() -> Value {
+    let fp = |c: char| c.to_string().repeat(64);
+    let link = |c: char, name: &str, state: &str, reason: Option<String>, seen: Option<String>| {
+        json!({ "link": format!("dl_{c}"), "peer": fp(c), "name": name, "socket": "", "state": state, "reason": reason, "last_seen": seen })
+    };
+    json!({ "links": [
+        link('f', "Morgan's Mac mini", "connected", None, Some(ago(0))),
+        link('d', "Studio", "reconnecting", Some("Studio doesn't let this Mac drive it: turn it on at Studio in Settings › Nearby".into()), None),
+        link('9', "Office iMac", "offline", Some("timed out".into()), Some(ago(121))),
+    ] })
+}
+
+/// `inbox.list`: shares to and from the paired Macs in `fake_peers`, newest first.
+fn fake_inbox() -> Value {
+    let fp = |c: char| c.to_string().repeat(64);
+    let item = |id: &str, dir: &str, peer: char, name: &str, payload: Value, state: &str, mins: i64, result: Option<&str>| {
+        let size = payload.get("text").or(payload.get("url")).and_then(Value::as_str).map_or(0, str::len);
+        json!({
+            "id": id, "direction": dir, "peer": fp(peer), "peer_name": name, "from": name, "size": size, "payload": payload, "state": state,
+            "sent_at": ago(mins), "decided_at": (state != "offered").then(|| ago(mins.saturating_sub(1))), "result": result,
+        })
+    };
+    let start = |prompt: &str| json!({"kind": "agent_start", "title": prompt.chars().take(40).collect::<String>(), "agent": "claude", "project": {"remote": "github.com/mrgnhnt96/midna", "path": ""}, "cwd": "/Users/me/Development/rust/midna", "prompt": prompt, "want_reply": true});
+    let mut file = item(
+        "sh_file0006",
+        "incoming",
+        'd',
+        "Studio",
+        json!({"kind": "file", "name": "screens", "folder": true, "files": [
+            {"path": "screens/home.png", "size": 812_000, "sha256": "0".repeat(64)},
+            {"path": "screens/settings.png", "size": 640_000, "sha256": "1".repeat(64)},
+        ]}),
+        "accepted",
+        12,
+        Some("saving"),
+    );
+    file["size"] = json!(1_452_000);
+    file["transfer"] = json!({"state": "moving", "done": 1_020_000, "total": 1_452_000, "files_done": 1, "files": 2});
+    json!({
+        "items": [
+            item("sh_start010", "incoming", 'd', "Studio", start("Why does the release build fail on this Mac? Run scripts/smoke.sh and tell me what breaks."), "offered", 0, None),
+            item("sh_answ0008", "incoming", 'd', "Studio", json!({"kind": "message", "text": "The zig toolchain isn't pinned there: env.sh points at 0.14. With .toolchain/zig 0.15.2 the smoke test passes.", "reply_to": "sh_start007"}), "accepted", 2, Some("read: the answer to sh_start007")),
+            item("sh_start007", "outgoing", 'd', "Studio", start("Does the smoke test pass on the Studio?"), "accepted", 8, Some("opened as s_9")),
+            item("sh_snip0001", "incoming", 'd', "Studio", json!({"kind": "snippet", "text": "cargo build --release\nscripts/test.sh -p midna-app", "title": "release build"}), "offered", 0, None),
+            file,
+            item("sh_msg00002", "incoming", 'd', "Studio", json!({"kind": "message", "text": "Build's green on the Studio, pushing now."}), "accepted", 25, Some("read")),
+            item("sh_link0003", "outgoing", 'e', "Sam's iMac", json!({"kind": "link", "url": "https://github.com/mrgnhnt96/midna/pull/183"}), "accepted", 60 * 3, Some("opened")),
+            item("sh_msg00004", "outgoing", 'd', "Studio", json!({"kind": "message", "text": "Can you run the smoke test there?"}), "offered", 60 * 5, None),
+            item("sh_snip0005", "incoming", 'e', "Sam's iMac", json!({"kind": "snippet", "text": "rm -rf ~/Library/Caches/midna"}), "declined", 60 * 26, None),
+        ],
+        "waiting": 2,
+    })
+}
+
+/// `MIDNA_FAKE_STREAMS=healthy|restarting|failing|paused|approval`: the design's three streams
+/// (design/stream-health) in that state. Unset: no streams.
+fn fake_streams_state() -> Option<String> {
+    crate::dev::var("MIDNA_FAKE_STREAMS").ok().filter(|v| !v.is_empty())
+}
+
+fn secs_from_now(secs: i64) -> String {
+    rfc3339_from_unix(midna_proto::time::now_unix() + secs)
+}
+
+fn fake_streams() -> Value {
+    let Some(state) = fake_streams_state() else {
+        return json!([]);
+    };
+    let s = |name: &str, cmd: &[&str], secrets: &[&str], last_mins: i64, kind: &str| {
+        json!({
+            "name": name, "command": cmd, "cwd": "/Users/me", "secrets": secrets, "enabled": true, "state": "running",
+            "pid": 4100 + name.len(), "started_at": ago(3 * 60 + 12), "restarts": 0,
+            "last_event": {"at": ago(last_mins), "kind": kind, "verdict": "accepted", "seq": 900},
+            "counts": {"accepted": 148, "duplicate": 2, "rate_limited": 0, "too_large": 0, "busy": 0, "refused": 0}, "exits_recent": 0, "log": format!("/Users/me/Library/Application Support/midna/streams/{name}.log"),
+            "log_tail": [
+                format!("{} connected", rfc3339_from_unix(midna_proto::time::now_unix() - 11520)),
+                format!("{} listening for events", rfc3339_from_unix(midna_proto::time::now_unix() - 11519)),
+            ],
+        })
+    };
+    let mut list = vec![
+        s("slack", &["node", "/Users/me/bin/slack-ci-listener.js"], &["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"], 2, "message"),
+        s("buildkite", &["bk-events", "--org", "roon", "--json"], &["BUILDKITE_TOKEN"], 41, "build"),
+        s("calendar", &["python3", "/Users/me/bin/cal-feed.py"], &["GOOGLE_CAL_TOKEN"], 6 * 60, "event"),
+    ];
+    match state.as_str() {
+        "restarting" => {
+            let b = &mut list[1];
+            b["state"] = json!("backoff");
+            b["restarts"] = json!(3);
+            b["pid"] = Value::Null;
+            b["retry_at"] = json!(secs_from_now(8));
+            b["why"] = json!("Exited 1: ECONNRESET");
+            b["exits_recent"] = json!(3);
+            b["log_tail"] = json!(["Error: read ECONNRESET", "    at TLSWrap.onStreamRead (node:internal/stream_base_commons:217:20)", "exit 1"]);
+        }
+        "failing" => {
+            let a = &mut list[0];
+            a["state"] = json!("failing");
+            a["restarts"] = json!(7);
+            a["pid"] = Value::Null;
+            a["exits_recent"] = json!(7);
+            a["why"] = json!("invalid_auth");
+            a["retry_at"] = json!(secs_from_now(4 * 60 + 20));
+            a["failing_since"] = json!(ago(9));
+            a["last_event"]["at"] = json!(ago(38));
+            a["log_tail"] = json!(["[socket-mode] connecting", "Error: An API error occurred: invalid_auth", "exit 1"]);
+        }
+        "paused" => {
+            let c = &mut list[2];
+            c["state"] = json!("paused");
+            c["enabled"] = json!(false);
+            c["pid"] = Value::Null;
+        }
+        "approval" => list.push(json!({
+            "name": "github-notifications", "command": ["gh", "api", "notifications", "--paginate"], "cwd": "/Users/me", "secrets": ["GITHUB_TOKEN"],
+            "enabled": false, "state": "awaiting_approval", "approval": "ny_stream01", "restarts": 0, "log": "/Users/me/Library/Application Support/midna/streams/github-notifications.log",
+        })),
+        _ => {}
+    }
+    Value::Array(list)
+}
+
+/// The selected stream's recent publishes (`streams.events`) and their payloads (`events.list`).
+fn fake_stream_events(name: &str) -> (Value, Vec<Value>) {
+    let rows: &[(i64, &str, &str, &str)] = match name {
+        "slack" => &[
+            (2 * 60, "message", "accepted", "failed to build on pipeline roon_mobile · branch master"),
+            (9 * 60, "message", "accepted", "deploy finished: roon_api 4.12.0"),
+            (9 * 60 + 1, "message", "duplicate", ""),
+            (31 * 60, "reaction", "accepted", ":white_check_mark: on \"release notes\""),
+            (58 * 60, "message", "accepted", "failed to build on pipeline roon_web · branch feat/login"),
+        ],
+        "buildkite" => &[(41 * 60, "build", "accepted", "roon_mobile #8812 passed"), (90 * 60, "build", "accepted", "roon_mobile #8811 failed")],
+        "calendar" => &[(6 * 3600, "event", "accepted", "Standup in 15 min")],
+        _ => &[],
+    };
+    let now = midna_proto::time::now_unix();
+    let (mut recs, mut events) = (vec![], vec![]);
+    for (i, (secs, kind, verdict, text)) in rows.iter().enumerate() {
+        let at = rfc3339_from_unix(now - secs);
+        let seq = 900 - i as u64;
+        let accepted = *verdict == "accepted";
+        recs.push(json!({"at": at, "kind": kind, "id": format!("ev{seq}"), "verdict": verdict, "seq": accepted.then_some(seq), "detail": (!accepted).then_some("same id as ev900")}));
+        if accepted {
+            events.push(json!({"seq": seq, "at": at, "kind": format!("stream.{name}.{kind}"), "data": {"text": text}}));
+        }
+    }
+    (json!({"stream": name, "events": recs, "counts": {"accepted": recs.len()}}), events)
 }
 
 /// Local triggers for the Triggers screen: the built-in prompt-blocked status, an
@@ -70,27 +270,39 @@ fn fake_triggers() -> Vec<midna_proto::Trigger> {
             "t_lblock",
             "Prompt blocked status",
             p::TriggerFilter::default(),
-            p::TriggerAction::SetStatus { label: "Prompt blocked".into(), color: "amber".into(), icon: None, base: p::StatusState::NeedsYou, clear_on: p::StatusClear::Prompt },
+            p::TriggerAction::SetStatus { label: "Prompt blocked".into(), color: "amber".into(), icon: None, base: p::StatusState::NeedsYou, clear_on: p::StatusClear::Prompt, to: None },
             Some("prompt_blocked_status"),
             3,
         ),
         t(
             "t_lcompact",
             "Compact and resend",
-            p::TriggerFilter { fields: [("message".to_string(), "*Compact first*".to_string())].into(), ..Default::default() },
+            p::TriggerFilter { fields: [("message".to_string(), "*Compact first*".into())].into(), ..Default::default() },
             p::TriggerAction::SendToSession {
                 steps: vec![p::SendStep { text: "/compact".into(), enter: true }, p::SendStep { text: "{{last_prompt}}".into(), enter: true }],
+                to: None,
             },
             None,
             0,
         ),
+        p::Trigger {
+            event: "stream.slack.message".into(),
+            ..t(
+                "t_lci",
+                "CI failure → build angel",
+                p::TriggerFilter { fields: [("data.text".to_string(), "*failed to build*".into())].into(), ..Default::default() },
+                p::TriggerAction::SendToSession { steps: vec![p::SendStep { text: "{{data.text}}".into(), enter: true }], to: Some("build angel".into()) },
+                None,
+                4,
+            )
+        },
         p::Trigger {
             event: "schedule".into(),
             ..t(
                 "t_lstandup",
                 "Morning standup",
                 p::TriggerFilter { cron: Some("0 9 * * mon-fri".into()), ..Default::default() },
-                p::TriggerAction::Notify { title: "Standup in 5".into(), body: "{{local_time}}".into(), sound: true, category: None, open: None, id: None },
+                p::TriggerAction::Notify { title: "Standup in 5".into(), body: "{{local_time}}".into(), sound: true, category: None, open: None, id: None, to: None },
                 None,
                 0,
             )
@@ -143,6 +355,9 @@ pub fn settings_catalog() -> Vec<SettingEntry> {
         let value = if s.key == "cleanup.items" { json!(["worktree", "branch", "remote_branch", "Stop any docker compose stack started in this folder"]) } else { s.default.to_json() };
         e(s.key, value, s.description, s.human_only)
     }));
+    // Nearby: who can find this Mac, and its name
+    let nearby = midna_proto::settings::SETTINGS.iter().filter(|s| s.key.starts_with("nearby."));
+    v.extend(nearby.map(|s| e(s.key, s.default.to_json(), s.description, s.human_only)));
     // every shortcut, so the Shortcuts tab and tooltips match the daemon
     let keys = midna_proto::settings::SETTINGS.iter().filter(|s| matches!(s.ty, midna_proto::settings::SettingKind::Keybinding));
     v.extend(keys.map(|s| e(s.key, s.default.to_json(), s.description, false)));
@@ -176,7 +391,7 @@ impl FakeBackend {
         let p = |id: &str, name: &str, order: u32| Project { id: id.into(), name: name.into(), path: format!("~/Development/{name}"), order, ..Default::default() };
         // dotfiles: pinned with no terminals, so the sidebar shows its "New terminal" row.
         // taskboard: every terminal closed, so it stays for its Summary row (`fake_summary`).
-        let projects = vec![
+        let mut projects = vec![
             p("p_zonai1", "zonai", 0),
             p("p_drops1", "drops-app", 1),
             p("p_midna1", "midna", 2),
@@ -207,7 +422,7 @@ impl FakeBackend {
                 git: g,
                 ..Default::default()
             };
-        let sessions = {
+        let mut sessions = {
             use AgentKind::*;
             use SessionKind::*;
             use StatusState::*;
@@ -224,7 +439,7 @@ impl FakeBackend {
                 trigger_id: None,
                 waiting_for: vec![],
             };
-            let trigger = midna_proto::Actor { kind: midna_proto::ActorKind::Trigger, session: None, name: Some("After compact, write notes".into()), trigger: None, via: None };
+            let trigger = midna_proto::Actor { kind: midna_proto::ActorKind::Trigger, session: None, name: Some("After compact, write notes".into()), trigger: None, via: None, peer: None };
             vec![
                 Session {
                     queue: vec![
@@ -349,17 +564,72 @@ impl FakeBackend {
                 ..Default::default()
             },
         ];
-        let mut settings = settings_catalog();
-        if let Ok(over) = crate::dev::var("MIDNA_FAKE_SETTINGS") {
-            for kv in over.split(',') {
-                if let Some((k, v)) = kv.split_once('=')
-                    && let Some(s) = settings.iter_mut().find(|s| s.key == k.trim())
-                {
-                    // lists use `|`: ui.status.items=daemon|spacer|script
-                    s.value = if s.value.is_array() { json!(v.split('|').map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>()) } else { json!(v.trim()) };
-                }
+        let mut needs = needs;
+        if crate::dev::var("MIDNA_FAKE_PAIRING").is_ok() {
+            // dev (screenshots): an incoming Nearby pairing first in the inbox
+            needs.insert(0, NeedsYou {
+                id: "n_pair01".into(),
+                kind: NeedsYouKind::Approval,
+                title: "Pair with Ada's MacBook Air? Code 482 913".into(),
+                detail: "Ada's MacBook Air asked to pair with this Mac. Approve only if Ada's MacBook Air shows the same code: 482 913. Approving keeps it as a contact; to keep it as one of your own Macs instead run: midna peers confirm pr_7f3a19c2 --as my-device\nDevice bbbb bbbb bbbb bbbb".into(),
+                asked_by: Actor { kind: "midnad".into(), session: None, name: None },
+                created_at: ago(0),
+                approval: Some(ApprovalRequest {
+                    action: PolicyAction { kind: "cli".into(), value: "midna peers confirm pr_7f3a19c2".into(), session: None, project: None },
+                    matched_rule: None,
+                }),
+                ..Default::default()
+            });
+        }
+        if crate::dev::var("MIDNA_FAKE_SHARE").is_ok_and(|v| v == "agent") {
+            // dev (screenshots): an agent start from one of your Macs first in the inbox
+            needs.insert(0, NeedsYou {
+                id: "n_share02".into(),
+                kind: NeedsYouKind::Approval,
+                title: "Studio asks Claude Code here: Why does the release build fail on this Mac?".into(),
+                detail: "Why does the release build fail on this Mac? Run scripts/smoke.sh and tell me what breaks.\n\nIt opens in ~/Development/rust/midna (project midna). Approving opens a new Claude Code terminal there and gives it this prompt, and sends Studio its answer when its first turn ends; nothing runs before. To open it in another folder: midna inbox accept sh_start010 --cwd <dir>\nFrom Studio, one of your Macs (device dddd dddd dddd dddd). Deny to decline it.".into(),
+                asked_by: Actor { kind: "midnad".into(), session: None, name: None },
+                created_at: ago(0),
+                approval: Some(ApprovalRequest {
+                    action: PolicyAction { kind: "cli".into(), value: "midna inbox accept sh_start010".into(), session: None, project: None },
+                    matched_rule: None,
+                }),
+                ..Default::default()
+            });
+        } else if crate::dev::var("MIDNA_FAKE_SHARE").is_ok() {
+            // dev (screenshots): a snippet from one of your Macs first in the inbox
+            needs.insert(0, NeedsYou {
+                id: "n_share01".into(),
+                kind: NeedsYouKind::Approval,
+                title: "Studio sent a snippet: release build (2 lines)".into(),
+                detail: "cargo build --release\nscripts/test.sh -p midna-app\n\nApproving keeps it in your inbox; nothing runs. To paste it into a terminal (never followed by Enter): midna inbox accept sh_snip0001 --into <terminal>\nFrom Studio, one of your Macs (device dddd dddd dddd dddd). Deny to decline it.".into(),
+                asked_by: Actor { kind: "midnad".into(), session: None, name: None },
+                created_at: ago(0),
+                approval: Some(ApprovalRequest {
+                    action: PolicyAction { kind: "cli".into(), value: "midna inbox accept sh_snip0001".into(), session: None, project: None },
+                    matched_rule: None,
+                }),
+                ..Default::default()
+            });
+        }
+        for i in 0..many() {
+            projects.push(p(&format!("p_many{i:03}"), &format!("busy-{i:03}"), 10 + 2 * i as u32));
+            projects.push(p(&format!("p_gone{i:03}"), &format!("closed-{i:03}"), 11 + 2 * i as u32));
+            for (j, (name, kind, agent, state)) in [
+                ("agent", SessionKind::Agent, Some(AgentKind::Claude), StatusState::Working),
+                ("zsh", SessionKind::Shell, None, StatusState::Idle),
+                ("watch", SessionKind::Monitor, None, StatusState::Done),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let id = format!("m{i:03}{j:04}");
+                let g = git("main", 3, 1, 1, None);
+                sessions.push(s(&id, &format!("p_many{i:03}"), name, kind, agent, state, None, (i + j) as i64, g));
             }
         }
+        let mut settings = settings_catalog();
+        override_settings(&mut settings, "MIDNA_FAKE_SETTINGS");
         let scripts: HashMap<String, String> = [
             (
                 "a1f00001",
@@ -432,9 +702,145 @@ impl FakeBackend {
                 terms: HashMap::new(),
                 scripts,
                 next_id: 8,
+                responses: vec![],
             })),
+            mac: None,
         }
     }
+
+    /// The app's fake daemon. Dev (screenshots): `MIDNA_FAKE_NEEDS=<n>` keeps only that many of
+    /// its needs-you items.
+    pub fn local() -> Self {
+        let b = FakeBackend::new();
+        if let Some(n) = crate::dev::var("MIDNA_FAKE_NEEDS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            b.st.lock().unwrap().needs.truncate(n);
+        }
+        b
+    }
+
+    /// The fake's other Mac: two of this one's projects, their terminals under ids of its own
+    /// (`b…`), so the windows of the two Macs never share a session id.
+    fn remote(mac: Mac, local: Arc<dyn Backend>) -> Self {
+        let b = FakeBackend::new();
+        {
+            let mut st = b.st.lock().unwrap();
+            let keep = ["p_drops1", "p_midna1"];
+            let id = |s: &str| format!("b{}", s.get(1..).unwrap_or_default());
+            st.projects.retain(|p| keep.contains(&p.id.as_str()));
+            st.sessions.retain(|s| s.project_id.as_deref().is_some_and(|p| keep.contains(&p)));
+            for s in &mut st.sessions {
+                s.id = id(&s.id);
+            }
+            let ids: Vec<String> = st.sessions.iter().map(|s| s.id.clone()).collect();
+            st.needs.retain_mut(|n| match &n.session_id {
+                Some(sid) if ids.contains(&id(sid)) => {
+                    n.session_id = Some(id(sid));
+                    n.id = format!("{}_{}", n.id, mac.peer.get(..4).unwrap_or_default());
+                    true
+                }
+                // a share sent to that Mac (`MIDNA_FAKE_SHARE`): accepted only there
+                None if n.id.starts_with("n_share") => {
+                    n.id = format!("{}_{}", n.id, mac.peer.get(..4).unwrap_or_default());
+                    true
+                }
+                _ => false,
+            });
+            // An agent there asking to run a command: approved from here, over the link.
+            let first = st.sessions.first().map(|s| (s.id.clone(), s.project_id.clone()));
+            if let Some((sid, project)) = first {
+                st.needs.insert(0, NeedsYou {
+                    id: format!("n_publsh_{}", mac.peer.get(..4).unwrap_or_default()),
+                    session_id: Some(sid.clone()),
+                    project_id: project.clone(),
+                    kind: NeedsYouKind::Approval,
+                    title: "Approve npm publish?".into(),
+                    asked_by: Actor { kind: "agent".into(), session: Some(sid.clone()), name: Some("claude".into()) },
+                    created_at: ago(1),
+                    approval: Some(ApprovalRequest {
+                        action: PolicyAction { kind: "command".into(), value: "npm publish --access public".into(), session: Some(sid), project },
+                        matched_rule: None,
+                    }),
+                    ..Default::default()
+                });
+            }
+            // A setting change there (a custom script's path) and a share sent there can only be
+            // approved at that Mac.
+            for n in &mut st.needs {
+                n.local_only = n.setting.is_some() || n.id.starts_with("n_share");
+            }
+            st.scripts = std::mem::take(&mut st.scripts).into_iter().map(|(k, v)| (id(&k), v)).collect();
+            st.settings = settings_catalog();
+            override_settings(&mut st.settings, "MIDNA_FAKE_MAC_SETTINGS");
+            // Dev (screenshots): `MIDNA_FAKE_MAC_NEEDS=<n>` keeps that many of the Mac mini's
+            // items, and none of the other Macs'.
+            if let Some(n) = crate::dev::var("MIDNA_FAKE_MAC_NEEDS").ok().and_then(|v| v.parse::<usize>().ok()) {
+                st.needs.truncate(if mac.peer == "f".repeat(64) { n } else { 0 });
+            }
+        }
+        // Dev (screenshots): `MIDNA_FAKE_MAC_ARRIVE=<seconds>`: an approval comes in on the Mac
+        // mini's first terminal that long after it's first reached.
+        if mac.peer == "f".repeat(64) && let Some(secs) = crate::dev::var("MIDNA_FAKE_MAC_ARRIVE").ok().and_then(|v| v.parse::<f64>().ok()) {
+            let st = b.st.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+                let mut st = st.lock().unwrap();
+                st.next_id += 1;
+                let need = NeedsYou {
+                    id: format!("ny_arrive{:05x}", st.next_id),
+                    session_id: st.sessions.first().map(|s| s.id.clone()),
+                    project_id: st.sessions.first().and_then(|s| s.project_id.clone()),
+                    kind: NeedsYouKind::Approval,
+                    title: "Approve npm publish?".into(),
+                    created_at: now_rfc3339(),
+                    ..Default::default()
+                };
+                st.needs.push(need.clone());
+                let session = need.session_id.clone();
+                st.emit("needs_you.raised", session.as_deref(), serde_json::to_value(&need).unwrap_or_default());
+            });
+        }
+        // Dev (screenshots): `MIDNA_FAKE_MAC_POST=<seconds>`: an agent on the Mac mini's first
+        // terminal posts a notification with buttons that long after it's first reached.
+        if mac.peer == "f".repeat(64) && let Some(secs) = crate::dev::var("MIDNA_FAKE_MAC_POST").ok().and_then(|v| v.parse::<f64>().ok()) {
+            let st = b.st.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+                let mut st = st.lock().unwrap();
+                let session = st.sessions.first().map(|s| s.id.clone());
+                let posted = json!({
+                    "category": "attention", "title": "", "via": "app", "id": "deploy_prod",
+                    "body": "Deploy api 1.4.2 to production?\nAll 214 checks passed on main",
+                    "actions": ["Deploy", "Wait an hour", "Cancel"],
+                });
+                st.emit("notify.posted", session.as_deref(), posted);
+            });
+        }
+        FakeBackend { st: b.st.clone(), mac: Some((mac, local)) }
+    }
+}
+
+/// `var` (`theme=light,density=compact`) over `settings`; lists use `|`
+/// (`ui.status.items=daemon|spacer|script`).
+fn override_settings(settings: &mut [SettingEntry], var: &str) {
+    let Ok(over) = crate::dev::var(var) else { return };
+    for kv in over.split(',') {
+        if let Some((k, v)) = kv.split_once('=')
+            && let Some(s) = settings.iter_mut().find(|s| s.key == k.trim())
+        {
+            s.value = if s.value.is_array() { json!(v.split('|').map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>()) } else { json!(v.trim()) };
+        }
+    }
+}
+
+/// A custom theme only the fake's other Mac has (`MIDNA_FAKE_MAC_SETTINGS=theme=ember`).
+fn mac_only_theme() -> midna_proto::themes::ThemeDef {
+    let mut t = midna_proto::themes::builtin("gruvbox").expect("built-in");
+    t.id = "ember".into();
+    t.name = "Ember".into();
+    for (k, c) in [("bg", "#1C120E"), ("panel", "#24170F"), ("raised", "#2E1D13"), ("line", "#4A2E1E"), ("accent", "#FF8A3D"), ("accent-fg", "#1C120E"), ("term", "#140C09")] {
+        midna_proto::themes::apply_overrides(&mut t, &[format!("{k} = {c}")]);
+    }
+    t
 }
 
 impl FakeState {
@@ -527,6 +933,18 @@ impl Backend for FakeBackend {
         PathBuf::from("(fake backend)")
     }
 
+    fn mac(&self) -> Option<&Mac> {
+        self.mac.as_ref().map(|(m, _)| m)
+    }
+
+    fn this_mac(&self) -> Option<Arc<dyn Backend>> {
+        self.mac.as_ref().map(|(_, l)| l.clone())
+    }
+
+    fn open_mac(self: Arc<Self>, mac: Mac) -> Arc<dyn Backend> {
+        Arc::new(FakeBackend::remote(mac, self))
+    }
+
     fn call(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         let mut st = self.st.lock().unwrap();
         let p = |k: &str| params.get(k).and_then(|v| v.as_str()).map(str::to_string);
@@ -544,7 +962,18 @@ impl Backend for FakeBackend {
                 {"name": "kass", "path": "~/Development/kass", "root": "~/Development", "git": true},
                 {"name": "midna", "path": "~/Development/rust/midna", "root": "~/Development", "git": true},
             ]),
+            "session.list" if self.mac.is_some() && fake_link().as_deref() == Some("loading") => bail!("still loading"),
             "session.list" => serde_json::to_value(&st.sessions)?,
+            "session.get" => serde_json::to_value(st.sessions.iter().find(|x| Some(&x.id) == p("id").as_ref()).ok_or_else(|| anyhow!("rpc error 3: no such session"))?)?,
+            // Only the person driving, over a link (`terminal::send_image`); this Mac's own
+            // windows are refused like midnad refuses them.
+            "session.send_image" => {
+                if self.mac.is_none() {
+                    bail!("rpc error 2: session.send_image takes an image from the Mac driving this one");
+                }
+                let name = p("name").unwrap_or_default();
+                json!({ "path": format!("/Users/me/Library/Application Support/com.mrgnhnt.midna/images/fake-{}", name.replace(' ', "-")) })
+            }
             "session.subagent_log" => fake_subagent_log(&p("agent").unwrap_or_default(), params.get("from").and_then(Value::as_u64).unwrap_or(0)),
             "needs_you.list" => serde_json::to_value(&st.needs)?,
             "notify.history" => fake_history(),
@@ -559,6 +988,41 @@ impl Backend for FakeBackend {
                 json!({ "read_seq": 900, "unread": 0 })
             }
             "settings.list" => serde_json::to_value(&st.settings)?,
+            // A link's card: files read as midnad would (the fake's Macs share this disk); a
+            // GitHub link answers a stand-in PR, an app's link (`taskboard://…`) a stand-in task.
+            "links.preview" => {
+                let target = p("target").unwrap_or_default();
+                let app = target.split_once("://").is_some_and(|(s, _)| !matches!(s, "http" | "https" | "file"));
+                if app {
+                    let id = target.rsplit('/').next().unwrap_or_default();
+                    json!({ "kind": "app", "json": {
+                        "title": "Water the beds on a schedule", "subtitle": format!("{id} · Garden goal"),
+                        "status": { "label": "In progress", "tone": "busy" },
+                        "fields": [["Terminal", "drops-app"], ["Branch", "schedule-rules"]],
+                        "progress": { "done": 3, "total": 5 },
+                        "actions": [{ "label": "Mark done", "run": ["tb", "done", id] }],
+                    } })
+                } else if midna_proto::link_preview::GithubLink::parse(&target).is_some() {
+                    json!({ "kind": "github", "json": { "title": "Water the beds on a schedule", "state": "OPEN", "isDraft": false, "headRefName": "schedule-rules", "baseRefName": "main", "additions": 120, "deletions": 14, "statusCheckRollup": [] } })
+                } else {
+                    let line = params.get("line").and_then(Value::as_u64).map(|l| l as u32);
+                    serde_json::to_value(midna_proto::link_preview::read_path(std::path::Path::new(&target), line))?
+                }
+            }
+            "peers.list" => fake_peers(),
+            "drive.list" => fake_links(),
+            "inbox.list" => fake_inbox(),
+            "share.send" => {
+                let peer = p("peer").unwrap_or_default();
+                let name = fake_peers()["paired"].as_array().into_iter().flatten().find(|x| x["fingerprint"].as_str() == Some(&peer)).and_then(|x| x["name"].as_str().map(str::to_string)).unwrap_or_default();
+                json!({ "id": "sh_sent0001", "direction": "outgoing", "peer": peer, "peer_name": name, "state": "offered", "sent_at": ago(0) })
+            }
+            "share.accept" | "share.decline" => {
+                let id = p("id").unwrap_or_default();
+                let mut it = fake_inbox()["items"].as_array().into_iter().flatten().find(|x| x["id"].as_str() == Some(&id)).cloned().unwrap_or(json!({ "id": id }));
+                it["state"] = json!(if method == "share.accept" { "accepted" } else { "declined" });
+                it
+            }
             "notify.media" => {
                 // The repo's copies of midna's own sounds, so previews play in dev.
                 let twilight = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../midnad/assets/sounds/twilight");
@@ -572,7 +1036,20 @@ impl Backend for FakeBackend {
                 json!({ "sounds": sounds, "images": [], "dir": "/tmp/midna-fake/notify" })
             }
             "rule.list" => Value::Array(st.rules.clone()),
-            "trigger.list" => serde_json::to_value(fake_triggers())?,
+            "trigger.list" => serde_json::to_value(fake_triggers().into_iter().filter(|t| t.id != "t_lci" || fake_streams_state().is_some()).collect::<Vec<_>>())?,
+            "streams.list" => fake_streams(),
+            "streams.events" => fake_stream_events(&p("stream").unwrap_or_default()).0,
+            "streams.restart" | "streams.set_enabled" | "streams.remove" => json!({"ok": true}),
+            "events.list" => {
+                let kinds = params.pointer("/filter/kinds/0").and_then(Value::as_str).unwrap_or_default();
+                let name = kinds.strip_prefix("stream.").map(|r| r.trim_end_matches('.')).unwrap_or_default();
+                Value::Array(fake_stream_events(name).1)
+            }
+            // A local firing of the Slack trigger a second after its newest event.
+            "trigger.deliveries" if fake_streams_state().is_some() => json!([
+                {"id": "d_s1", "source": "local", "event": "stream.slack.message", "delivery_guid": "local-1", "received_at": rfc3339_from_unix(midna_proto::time::now_unix() - 119),
+                 "verdict": "verified", "trigger_id": "t_lci", "summary": "build angel", "event_seq": 900},
+            ]),
             "insights.summary" => {
                 json!({"range": "today", "totals": {"turns": 38, "messages": 52, "spend_usd": 4.12, "triggers_fired": 2}})
             }
@@ -624,6 +1101,28 @@ impl Backend for FakeBackend {
                 }
             }
             "script.click" => json!([{"text": "Deployed", "tone": "ok", "icon": "check", "tooltip": "Preview is live"}]),
+            "themes.list" => {
+                let mut all = midna_proto::themes::builtins();
+                if self.mac.is_some() {
+                    all.push(mac_only_theme());
+                }
+                let (dark, light) = (midna_proto::themes::DEFAULT_DARK.to_string(), midna_proto::themes::DEFAULT_LIGHT.to_string());
+                serde_json::to_value(midna_proto::ThemesListResult {
+                    themes: all.iter().map(|t| t.info()).collect(),
+                    errors: vec![],
+                    dir: "(fake)".into(),
+                    setting: "system".into(),
+                    dark,
+                    light,
+                    showing: None,
+                    format: String::new(),
+                })?
+            }
+            "settings.get" => {
+                let key = p("key").ok_or_else(|| anyhow!("key required"))?;
+                let Some(s) = st.settings.iter().find(|s| s.key == key) else { bail!("rpc error 3: unknown setting") };
+                json!({"key": key, "value": s.value})
+            }
             "settings.set" => {
                 let key = p("key").ok_or_else(|| anyhow!("key required"))?;
                 let value = params.get("value").cloned().unwrap_or(Value::Null);
@@ -636,6 +1135,13 @@ impl Backend for FakeBackend {
                 let id = p("id").ok_or_else(|| anyhow!("id required"))?;
                 let res: Resolution = serde_json::from_value(params.get("resolution").cloned().unwrap_or(Value::Null))?;
                 let Some(i) = st.needs.iter().position(|n| n.id == id) else { bail!("rpc error 3: not found") };
+                // As midnad over a drive link: approving what's local-only there is turned down.
+                if let Some((mac, _)) = &self.mac
+                    && st.needs[i].local_only
+                    && matches!(res, Resolution::Approve { .. })
+                {
+                    bail!("rpc error 2: Do this at {}: approving this can't be done from another Mac", mac.name);
+                }
                 let item = st.needs.remove(i);
                 st.emit("needs_you.resolved", item.session_id.as_deref(), json!({"id": id, "resolution": res}));
                 if let Some(sid) = &item.session_id {
@@ -776,6 +1282,56 @@ impl Backend for FakeBackend {
                 }
                 out
             }
+            "needs_you.raise" => {
+                st.next_id += 1;
+                let mut item = params.clone();
+                item["id"] = json!(format!("ny_raised{:05x}", st.next_id));
+                item["created_at"] = json!(now_rfc3339());
+                let need: NeedsYou = serde_json::from_value(item)?;
+                st.needs.push(need.clone());
+                st.emit("needs_you.raised", need.session_id.as_deref(), serde_json::to_value(&need)?);
+                json!({ "id": need.id })
+            }
+            // A post as midnad words it (`notify.posted`), `id` naming it for `notify.withdraw`.
+            "notify.send" => {
+                let mut posted = json!({ "category": "attention", "title": "", "via": "app" });
+                for (k, v) in params.as_object().into_iter().flatten().filter(|(k, _)| k.as_str() != "session_id") {
+                    posted[k.as_str()] = v.clone();
+                }
+                st.emit("notify.posted", p("session_id").as_deref(), posted);
+                json!({ "ok": true })
+            }
+            // What you did with a notification, and what was last done with one.
+            "notify.respond" => {
+                let id = p("id").unwrap_or_default();
+                st.responses.push((id.clone(), params["response"].clone()));
+                json!({ "id": id, "response": params["response"] })
+            }
+            "notify.response" => {
+                let id = p("id").unwrap_or_default();
+                let response = st.responses.iter().rev().find(|(i, _)| *i == id).map_or(Value::Null, |(_, r)| r.clone());
+                json!({ "id": id, "response": response })
+            }
+            "notify.withdraw" => {
+                st.emit("notify.withdrawn", None, json!({ "id": p("id") }));
+                json!({ "ok": true })
+            }
+            // Tests: this Mac's link to another as midnad would tell it (`connected`,
+            // `reconnecting`, `offline`, or `refused`: that Mac turned driving off).
+            "fake.link" => {
+                use midna_proto::nearby::DriveState;
+                let name = self.mac.as_ref().map(|(m, _)| m.name.clone()).unwrap_or_default();
+                let link = |state, reason: Option<String>| ConnState::Link(super::LinkProgress { state, stage: None, reason });
+                let conn = match p("state").as_deref() {
+                    Some("connected") => ConnState::Connected,
+                    Some("reconnecting") => link(DriveState::Reconnecting, Some("the network dropped".into())),
+                    Some("offline") => link(DriveState::Offline, Some("timed out".into())),
+                    Some("refused") => link(DriveState::Reconnecting, Some(format!("{name} stopped letting this Mac drive it"))),
+                    other => bail!("fake.link: no state {other:?}"),
+                };
+                st.subs.retain(|tx| tx.try_send(BackendEvent::Conn(conn.clone())).is_ok());
+                json!({ "ok": true })
+            }
             "window.command" => {
                 let cmd = params.clone();
                 st.subs.retain(|tx| tx.try_send(BackendEvent::WindowCommand(cmd.clone())).is_ok());
@@ -786,7 +1342,31 @@ impl Backend for FakeBackend {
     }
 
     fn subscribe(&self, tx: async_channel::Sender<BackendEvent>) {
+        use midna_proto::nearby::{DriveStage, DriveState};
+        let stage = match fake_link().as_deref() {
+            Some("finding") => Some(DriveStage::Finding),
+            Some("proving") => Some(DriveStage::Proving),
+            _ => None,
+        };
+        if let Some(stage) = stage.filter(|_| self.mac.is_some()) {
+            let p = super::LinkProgress { state: DriveState::Connecting, stage: Some(stage), reason: None };
+            let _ = tx.try_send(BackendEvent::Conn(ConnState::Link(p)));
+            return;
+        }
         let _ = tx.try_send(BackendEvent::Conn(ConnState::Connected));
+        // `reconnecting` / `offline`: another Mac's link drops once its terminals have shown.
+        let down = match fake_link().as_deref() {
+            Some("reconnecting") => Some(DriveState::Reconnecting),
+            Some("offline") => Some(DriveState::Offline),
+            _ => None,
+        };
+        if let Some(state) = down.filter(|_| self.mac.is_some()) {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(3000));
+                let _ = tx.try_send(BackendEvent::Conn(ConnState::Link(super::LinkProgress { state, stage: None, reason: None })));
+            });
+        }
         self.st.lock().unwrap().subs.push(tx);
     }
 
@@ -1088,6 +1668,7 @@ pub fn fake_question() -> NeedsYouQuestion {
             o("Regenerate on CI's version", "Update the goldens to 3.24.1; yours break until you downgrade"),
             o("Only fix the shimmer", "Pause the animation in tests and leave the version question for later"),
         ],
+        more: vec![],
     }
 }
 
@@ -1214,8 +1795,35 @@ fn fake_insights_detail(range: &str, sessions: &[Session], projects: &[Project])
     }
 }
 
-/// Closed terminals for the Summary (`ui/summary.rs`): taskboard's (all closed) and midna's.
+/// `MIDNA_FAKE_LINK`: the connecting card's step another Mac's window stays on, or how its link
+/// drops.
+fn fake_link() -> Option<String> {
+    crate::dev::var("MIDNA_FAKE_LINK").ok()
+}
+
+/// `MIDNA_FAKE_MANY`: how many extra projects of each kind.
+fn many() -> usize {
+    crate::dev::var("MIDNA_FAKE_MANY").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+/// Closed terminals for the Summary (`ui/summary.rs`): taskboard's (all closed) and midna's,
+/// and four for each `MIDNA_FAKE_MANY` project with only Summary records.
 fn fake_summary() -> Vec<Value> {
+    let mut out = fake_summary_base();
+    for i in 0..many() {
+        for j in 0..4 {
+            out.push(json!({
+                "id": format!("cm{i:03}{j:03}"), "project_id": format!("p_gone{i:03}"), "name": format!("task {j}"), "kind": "agent", "agent": "claude",
+                "cwd": "/tmp", "opened_at": ago(300 + 60 * j as i64), "closed_at": ago(20 + i as i64 * 7 + 60 * j as i64), "how": "close",
+                "by": {"kind": "human"}, "state": "done", "turns": 2,
+            }));
+        }
+    }
+    out.sort_by(|a, b| b["closed_at"].as_str().cmp(&a["closed_at"].as_str()));
+    out
+}
+
+fn fake_summary_base() -> Vec<Value> {
     let tb = |task: &str, title: &str, state: &str, color: &str| {
         json!({ "taskboard": {
             "app": "Taskboard", "title": format!("{task} {title}"), "url": format!("taskboard://task/{task}"),
@@ -1260,4 +1868,30 @@ fn fake_summary() -> Vec<Value> {
             "state": "done", "turns": 1, "cost_usd": 0.84, "prompts": prompts(&[("tb release cut v0.1.0-beta.37", 399)]),
         }),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(b: &dyn Backend, method: &str) -> Vec<String> {
+        b.call(method, json!({})).unwrap().as_array().unwrap().iter().map(|v| v["id"].as_str().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn the_other_mac_has_its_own_terminals_and_needs() {
+        let here: Arc<dyn Backend> = Arc::new(FakeBackend::new());
+        let mini = crate::backend::for_mac(&here, Mac { peer: "f".repeat(64), name: "Morgan's Mac mini".into() });
+        assert_eq!(mini.mac().map(|m| m.name.as_str()), Some("Morgan's Mac mini"));
+        assert!(Arc::ptr_eq(&mini, &crate::backend::for_mac(&here, mini.mac().unwrap().clone())), "one backend per Mac");
+        let (a, b) = (ids(&*here, "session.list"), ids(&*mini, "session.list"));
+        assert!(!b.is_empty() && b.len() < a.len());
+        assert!(b.iter().all(|id| !a.contains(id)), "no session id shared between the two Macs: {b:?}");
+        let (na, nb) = (ids(&*here, "needs_you.list"), ids(&*mini, "needs_you.list"));
+        assert!(!nb.is_empty() && nb.iter().all(|id| !na.contains(id)), "{nb:?}");
+        let needs = mini.call("needs_you.list", json!({})).unwrap();
+        for n in needs.as_array().unwrap() {
+            assert!(b.iter().any(|id| n["session_id"] == id.as_str()), "{n}");
+        }
+    }
 }

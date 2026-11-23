@@ -17,7 +17,10 @@ pub(super) fn blurb(key: &str) -> Option<&'static str> {
         "ide.app" => "Used when no per-folder rule matches.",
         "ide.rules" => "Pick an IDE from a terminal's header to add a rule.",
         "summary.keep_days" => "Days a project's Summary keeps the terminals that closed in it.",
-        "windows.close_with_terminals" => "When you close one main window while another is open.",
+        "windows.close_with_terminals" => "Closing a main window with terminals while another is open.",
+        "nearby.visibility" => "Everyone lasts 10 minutes, then it's paired devices only again.",
+        "nearby.name" => "Empty uses this Mac's computer name.",
+        "nearby.downloads" => "Where files you accept are saved; empty is ~/Downloads/Midna.",
         "finder.quick_action" => "Right-click a folder in Finder to open it in midna.",
         // Appearance
         "theme" => "Colors for the app and its terminals.",
@@ -82,7 +85,9 @@ pub(super) fn blurb(key: &str) -> Option<&'static str> {
         "guard.build_slots" => "Across every terminal, the rest wait in line; 0 = no limit",
         "guard.model_slots" => "mflux, MLX, ollama and model downloads; the rest wait in line; 0 = no limit",
         "system.busy_memory" => "macOS's memory pressure (yellow or red) that holds new heavy work back.",
+        "guard.hold_agents_at" => "Agents others open wait their turn; yours start anyway; 0 = never",
         "guard.panic_hold" => "Triggers and other agents can't start agents until you dismiss the notice.",
+        "guard.memory_alert" => "Agents still wait while memory is short; this only drops the notice.",
         "guard.overload_alert" => "Show whether terminals or other apps are using the CPU.",
         "guard.overload_secs" => "How long the Mac must stay busy first.",
         "guard.loop_max_hours" => "Stop polling loops agents left running; 0 = never.",
@@ -126,6 +131,7 @@ pub(super) fn blurb(key: &str) -> Option<&'static str> {
         "notify.attention" => "An agent raises a note or says it's blocked.",
         "notify.failed" => "A command fails or an agent's turn ends in an error.",
         "notify.turn_done" => "An agent finishes a long turn.",
+        "notify.nearby" => "An agent on a nearby Mac answers you.",
         "notify.agent" => "Notifications agents send on purpose.",
         "notify.from_trigger" => "Notifications your triggers send.",
         "notify.requests" => "A trigger to enable, a secret to set, a rule to remove.",
@@ -152,6 +158,8 @@ pub(super) fn blurb(key: &str) -> Option<&'static str> {
 /// A shortcut row's name: its catalog description, shortened where that runs long.
 pub(super) fn shortcut_title(setting: &str) -> String {
     let short = match setting {
+        "keys.next_needs_you" => "Newest needs-you on this window's Mac",
+        "keys.next_needs_you_anywhere" => "Newest needs-you on any Mac",
         "keys.new_agent" => "New agent terminal in this project",
         "keys.new_terminal" => "New terminal in this project",
         "keys.new_agent_root" => "New agent terminal in your home folder",

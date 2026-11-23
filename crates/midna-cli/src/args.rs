@@ -10,11 +10,15 @@ const VALUE_FLAGS: &[&str] = &[
     "featured", "id", "image", "why", "jump", "for", "as", "volume", "turn", "stay", "description", "set",
     // local triggers
     "in-project", "for-agent", "idle-for", "cron", "between", "starts", "ends", "max-runs", "match", "send", "send-no-enter", "set-status", "color", "base", "clear-on", "cooldown",
-    "action-json", "filter-json", "notify", "notify-body", "notify-kind", "notify-open", "notify-id", "permission-mode", "allow-tool",
+    "action-json", "filter-json", "notify", "notify-body", "notify-kind", "notify-open", "notify-id", "permission-mode", "allow-tool", "to",
     // notify send
     "open", "wait", "on",
     // links actions register
     "owner", "file",
+    // links patterns set
+    "rule",
+    // stream publish / add, triggers test --stream, stream events --replay
+    "data", "stream", "replay", "secret",
 ];
 
 /// Flags that take a value only when one follows (`read --screen` vs `commands add --screen S`).
@@ -44,6 +48,11 @@ impl Args {
 
     /// `parse`, with `extra` also taking a value (flags one verb uses differently, e.g. `queue --idle 10m`).
     pub fn parse_with(raw: impl IntoIterator<Item = String>, extra: &[&str]) -> Result<Args, ArgError> {
+        Args::parse_flags(raw, extra, &[])
+    }
+
+    /// `parse_with`, with `boolean` taking no value (`share send --agent` vs `open --agent claude`).
+    pub fn parse_flags(raw: impl IntoIterator<Item = String>, extra: &[&str], boolean: &[&str]) -> Result<Args, ArgError> {
         let raw: Vec<String> = raw.into_iter().collect();
         let mut a = Args { raw: raw.clone(), ..Args::default() };
         let mut it = raw.into_iter().peekable();
@@ -60,7 +69,7 @@ impl Args {
                 let optional = OPTIONAL_VALUE_FLAGS.contains(&name.as_str());
                 let v = if optional && inline.is_none() {
                     it.next_if(|next| !next.starts_with('-'))
-                } else if VALUE_FLAGS.contains(&name.as_str()) || extra.contains(&name.as_str()) {
+                } else if (VALUE_FLAGS.contains(&name.as_str()) || extra.contains(&name.as_str())) && !boolean.contains(&name.as_str()) {
                     Some(match inline {
                         Some(v) => v,
                         None => it.next().ok_or_else(|| ArgError(format!("--{name} needs a value")))?,
@@ -187,6 +196,13 @@ mod tests {
         assert!(Args::parse(["--lines".to_string()]).is_err());
         let a = Args::parse(["links", "actions", "register", "--owner", "tb", "--file", "m.json"].map(String::from)).unwrap();
         assert_eq!((a.get("owner"), a.get("file"), a.pos.len()), (Some("tb"), Some("m.json"), 3));
+    }
+
+    #[test]
+    fn rule_takes_a_value() {
+        let a = Args::parse(["links", "patterns", "set", "tb", "--rule", "T(\\d+) = tb://t/$1", "--rule=B(\\d+) = tb://b/$1"].map(String::from)).unwrap();
+        assert_eq!(a.all("rule"), ["T(\\d+) = tb://t/$1", "B(\\d+) = tb://b/$1"]);
+        assert_eq!(a.pos, ["links", "patterns", "set", "tb"]);
     }
 
     #[test]

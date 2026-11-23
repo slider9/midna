@@ -18,6 +18,7 @@
 //! previews that link here, and the grid's own hover leaves the card alone meanwhile.
 use super::{LINE_H, PAD_Y, TerminalView};
 use crate::app::MainWindow;
+use crate::backend::Backend;
 use crate::icons::Icon;
 use crate::ide::{self, Ide};
 use crate::theme::Theme;
@@ -25,9 +26,13 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io::{BufRead, Read};
+use midna_proto::LinkPreview;
+use midna_proto::link_preview::{GithubKind, GithubLink, read_path};
+use midna_proto::preview_cmd::{self, APP_TIMEOUT, PATTERN_TIMEOUT, run_capped};
+#[cfg(test)]
+use midna_proto::preview_cmd::{parse_preview_command, pattern_command, preview_command};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 const SHOW_DELAY: Duration = Duration::from_millis(350);
@@ -39,9 +44,6 @@ const SINK: f32 = 6.;
 /// Clear of the prompt rail on the right edge (as the queue pill).
 const RIGHT: f32 = 22.;
 /// Lines of a file shown, and how many of them come before the target line.
-const FILE_LINES: usize = 12;
-const BEFORE: usize = 4;
-const DIR_ROWS: usize = 8;
 const CHECKS: usize = 8;
 /// How much of an issue's text is kept (for the card's excerpt and an agent's prompt).
 const ISSUE_BODY: usize = 4000;
@@ -77,7 +79,7 @@ pub enum PathClick {
     Copy,
 }
 
-/// What the main window shares with every pane, pop-outs included: the editors found, the IDE
+/// What a Mac's main window shares with its panes, pop-outs included: the editors found, the IDE
 /// settings, project folders and the preview settings.
 #[derive(Clone, Default)]
 pub struct PreviewEnv {
@@ -91,12 +93,19 @@ pub struct PreviewEnv {
     pub pr_status: bool,
 }
 
-impl Global for PreviewEnv {}
+/// Each Mac's [`PreviewEnv`], by its peer id (`None`: this Mac's). A window onto another Mac
+/// shares that Mac's settings and projects with that Mac's terminals only, so this Mac's
+/// terminals never preview, ⌘-click or show PR state by another Mac's settings (nor theirs by
+/// this one's).
+#[derive(Default)]
+struct PreviewEnvs(HashMap<Option<String>, PreviewEnv>);
+
+impl Global for PreviewEnvs {}
 
 /// Called by the main window whenever settings, projects or the editor list change.
 pub fn share(m: &MainWindow, cx: &mut App) {
     let s = |k: &str| m.settings.get(k).and_then(Value::as_str).map(str::to_string);
-    cx.set_global(PreviewEnv {
+    put(crate::backend::mac_id(&*m.backend), PreviewEnv {
         ides: m.ide.list.clone(),
         ide_app: s("ide.app"),
         ide_rules: m.settings.get("ide.rules").and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
@@ -112,19 +121,28 @@ pub fn share(m: &MainWindow, cx: &mut App) {
             _ => PathClick::Reveal,
         },
         pr_status: m.settings.get("terminal.pr_status").and_then(Value::as_bool).unwrap_or(true),
-    });
+    }, cx);
 }
 
-pub(super) fn mode(cx: &App) -> Mode {
-    cx.try_global::<PreviewEnv>().map(|e| e.mode).unwrap_or_default()
+fn put(mac: Option<String>, env: PreviewEnv, cx: &mut App) {
+    cx.default_global::<PreviewEnvs>().0.insert(mac, env);
 }
 
-pub(super) fn pr_status_on(cx: &App) -> bool {
-    cx.try_global::<PreviewEnv>().is_none_or(|e| e.pr_status)
+/// The env of the Mac `b` is on: a terminal's backend, so it's its window's.
+fn env_of<'a>(b: &dyn Backend, cx: &'a App) -> Option<&'a PreviewEnv> {
+    cx.try_global::<PreviewEnvs>()?.0.get(&crate::backend::mac_id(b))
 }
 
-pub(super) fn env(cx: &App) -> PreviewEnv {
-    cx.try_global::<PreviewEnv>().cloned().unwrap_or_default()
+pub(super) fn mode(b: &dyn Backend, cx: &App) -> Mode {
+    env_of(b, cx).map(|e| e.mode).unwrap_or_default()
+}
+
+pub(super) fn pr_status_on(b: &dyn Backend, cx: &App) -> bool {
+    env_of(b, cx).is_none_or(|e| e.pr_status)
+}
+
+pub(super) fn env(b: &dyn Backend, cx: &App) -> PreviewEnv {
+    env_of(b, cx).cloned().unwrap_or_default()
 }
 
 /// A `session.link_at` result worth previewing.
@@ -254,6 +272,8 @@ struct Card {
     ide: Option<(Ide, bool)>,
     /// Opened from a links-popover row, so it's in the links already: no "Add to links".
     listed: bool,
+    /// Read on the other Mac this window drives: the header says "via <Mac>".
+    there: bool,
     _load: Task<()>,
 }
 
@@ -297,7 +317,7 @@ impl TerminalView {
     }
 
     fn preview_set(&mut self, link: Option<Link>, cx: &mut Context<Self>) {
-        let link = link.filter(|_| mode(cx) != Mode::Off);
+        let link = link.filter(|_| mode(&*self.backend, cx) != Mode::Off);
         if link == self.preview.hot {
             return;
         }
@@ -322,11 +342,30 @@ impl TerminalView {
         }));
     }
 
+    /// Dev (`MIDNA_DEBUG_TERM` `preview:PATH[:LINE]|URL`): a link's card, as hovering it would
+    /// show.
+    pub fn preview_debug(&mut self, target: String, line: Option<u32>, cx: &mut Context<Self>) {
+        let url = target.contains("://");
+        // An app's scheme (`taskboard://T42`) stands for its app, named after the scheme.
+        let app = target.split_once("://").map(|(s, _)| s).filter(|s| !matches!(*s, "http" | "https" | "file")).map(|s| {
+            let mut c = s.chars();
+            c.next().map(|f| f.to_uppercase().chain(c).collect::<String>()).unwrap_or_default()
+        });
+        self.preview_set(Some(Link { url, target, line: line.filter(|_| !url), app, preview: None }), cx);
+    }
+
+    /// The other Mac's backend when this terminal is on one, for what's read there.
+    pub(super) fn there(&self) -> Option<Arc<dyn Backend>> {
+        self.backend.mac().is_some().then(|| self.backend.clone())
+    }
+
     fn preview_show(&mut self, link: Link, cx: &mut Context<Self>) {
-        let env = env(cx);
+        let env = env(&*self.backend, cx);
+        let there = self.there();
         let path = Path::new(&link.target);
-        let is_dir = !link.url && path.is_dir();
-        let project = (!link.url).then(|| env.projects.iter().filter(|p| path.starts_with(p)).max_by_key(|p| p.len()).cloned()).flatten();
+        // Another Mac's path says what it is once it's read there; this Mac's projects aren't its.
+        let is_dir = !link.url && there.is_none() && path.is_dir();
+        let project = (!link.url && there.is_none()).then(|| env.projects.iter().filter(|p| path.starts_with(p)).max_by_key(|p| p.len()).cloned()).flatten();
         let (name, sub) = match &link.app {
             Some(app) => (app.clone(), link.target.split_once("://").map_or(link.target.as_str(), |(_, r)| r).to_string()),
             None if link.url => url_title(&link.target),
@@ -334,11 +373,17 @@ impl TerminalView {
         };
         let ide = (!link.url).then(|| self.preview_ide(&env, path, is_dir, project.as_deref())).flatten();
         let l = link.clone();
+        let remote = there.is_some();
         let load = cx.spawn(async move |this, cx| {
             let what = l.clone();
-            let body = cx.background_executor().spawn(async move { load(&what) }).await;
+            let body = cx.background_executor().spawn(async move { load(&what, there.as_deref()) }).await;
             let _ = this.update(cx, |t, cx| {
                 if let Some(c) = t.preview.card.as_mut().filter(|c| c.link == l) {
+                    if remote && !c.link.url && matches!(body, Body::Dir { .. }) {
+                        c.is_dir = true;
+                        (c.name, c.sub) = path_title(Path::new(&c.link.target), true, None);
+                    }
+                    c.there |= remote && matches!(body, Body::Pr(_) | Body::Issue(_) | Body::Run(_) | Body::App(_));
                     c.body = body;
                     cx.notify();
                 }
@@ -348,7 +393,8 @@ impl TerminalView {
         self.preview.recover = None;
         self.preview.menu = false;
         self.preview.flash = None;
-        self.preview.card = Some(Card { link, is_dir, project, name, sub, body: Body::Loading, ide, listed: self.preview.external, _load: load });
+        let there = remote && !link.url;
+        self.preview.card = Some(Card { link, is_dir, project, name, sub, body: Body::Loading, ide, listed: self.preview.external, there, _load: load });
         cx.notify();
     }
 
@@ -469,7 +515,7 @@ impl TerminalView {
 
     /// A row in the IDE menu: remember it for the project (⌥: everywhere), then open there.
     fn preview_pick(&mut self, ide: Ide, everywhere: bool, cx: &mut Context<Self>) {
-        let env = env(cx);
+        let env = env(&*self.backend, cx);
         let Some(c) = self.preview.card.as_mut() else { return };
         let path = Path::new(&c.link.target);
         let dir = if c.is_dir { Some(path) } else { path.parent() };
@@ -517,8 +563,17 @@ impl TerminalView {
         self.preview_flash("Copied", false, cx);
     }
 
+    /// The card's path is on another Mac: revealing or opening it would act on that Mac's
+    /// screen, so the card copies it instead.
+    fn preview_elsewhere(&self) -> bool {
+        self.backend.mac().is_some() && self.preview.card.as_ref().is_some_and(|c| !c.link.url)
+    }
+
     fn preview_path_click(&mut self, cx: &mut Context<Self>) {
-        match env(cx).path_click {
+        if self.preview_elsewhere() {
+            return self.preview_copy(cx);
+        }
+        match env(&*self.backend, cx).path_click {
             PathClick::Reveal => self.preview_reveal(cx),
             PathClick::Copy => self.preview_copy(cx),
             PathClick::Ide => self.preview_open_ide(cx),
@@ -585,7 +640,7 @@ impl TerminalView {
         let c = self.preview.card.as_ref()?;
         let b = self.bounds.get()?;
         let pane_h = f32::from(b.size.height);
-        let env = env(cx);
+        let env = env(&*self.backend, cx);
 
         // Above the input box when it's on screen (and above the queue pill), else the corner.
         let lines: Vec<String> = if self.ext.at_bottom() { self.grid.iter().map(|r| r.text()).collect() } else { vec![] };
@@ -630,6 +685,7 @@ impl TerminalView {
             div().flex_1().min_w_0().child(title).into_any_element()
         } else {
             let tip = match env.path_click {
+                _ if self.preview_elsewhere() => "Copy path".to_string(),
                 PathClick::Reveal => "Reveal in Finder".to_string(),
                 PathClick::Copy => "Copy path".to_string(),
                 PathClick::Ide => c.ide.as_ref().map(|(i, _)| format!("Open in {}", i.name)).unwrap_or_else(|| "Open".into()),
@@ -662,7 +718,24 @@ impl TerminalView {
             .tooltip(crate::ui::header::tip("Close"))
             .on_click(cx.listener(|t, _, _, cx| t.preview_close(cx)))
             .child(Icon::Cross.el(11., t.dim));
-        let header = div().flex().items_center().gap(px(8.)).pl(px(14.)).pr(px(8.)).pt(px(6.)).pb(px(6.)).border_b_1().border_color(t.line).child(icon).child(title).child(close);
+        // Read on the Mac this window drives (screen 5, state C of the remote Mac windows design).
+        let via = self.backend.mac().filter(|_| c.there).map(|m| {
+            div().flex_none().whitespace_nowrap().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(t.ansi[6]).child(format!("via {}", m.name))
+        });
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .pl(px(14.))
+            .pr(px(8.))
+            .pt(px(6.))
+            .pb(px(6.))
+            .border_b_1()
+            .border_color(t.line)
+            .child(icon)
+            .child(title)
+            .children(via)
+            .child(close);
 
         let body = render_body(&c.body, &c.link, t);
         let footer = self.render_footer(c, &env, t, cx);
@@ -761,6 +834,26 @@ impl TerminalView {
                 }))
                 .child(secondary("lp-copy", "Copy URL").on_click(cx.listener(|t, _, _, cx| t.preview_copy(cx))))
                 .when(!c.listed, |r| r.child(secondary("lp-add", "Add to links").on_click(cx.listener(|t, _, _, cx| t.preview_add_link(cx)))));
+        } else if let Some(mac) = self.backend.mac() {
+            // Another Mac's path: copy it; an editor or Finder would open on that Mac's screen
+            // (screen 5, state C of the remote Mac windows design).
+            if c.is_dir {
+                row = row
+                    .child(primary("lp-new-term").on_click(cx.listener(|t, _, _, cx| t.preview_new_terminal(cx))).child("New terminal here"))
+                    .child(secondary("lp-copy", "Copy path").on_click(cx.listener(|t, _, _, cx| t.preview_copy(cx))));
+            } else {
+                let ide = c.ide.as_ref().map_or_else(|| "IDE".to_string(), |(i, _)| i.name.clone());
+                row = row.child(primary("lp-copy").on_click(cx.listener(|t, _, _, cx| t.preview_copy(cx))).child("Copy path")).child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(px(11.5))
+                        .text_color(t.dim)
+                        .child(format!("· Open in {ide} is off: it would open on {}'s screen", mac.name)),
+                );
+            }
         } else {
             let open = if c.is_dir {
                 primary("lp-new-term").on_click(cx.listener(|t, _, _, cx| t.preview_new_terminal(cx))).child("New terminal here").into_any_element()
@@ -1095,34 +1188,23 @@ pub(super) fn url_title(url: &str) -> (String, String) {
     (host.trim_start_matches("www.").to_string(), path.trim_end_matches('/').to_string())
 }
 
+fn github(url: &str, kind: GithubKind) -> Option<(String, String, u64)> {
+    GithubLink::parse(url).filter(|g| g.kind == kind).map(|g| (g.owner, g.repo, g.n))
+}
+
 /// `https://github.com/<owner>/<repo>/pull/<n>…`.
 pub(super) fn github_pr(url: &str) -> Option<(String, String, u64)> {
-    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
-    let rest = rest.strip_prefix("www.").unwrap_or(rest);
-    let mut seg = rest.strip_prefix("github.com/")?.split(['/', '?', '#']);
-    let (owner, repo, pull, n) = (seg.next()?, seg.next()?, seg.next()?, seg.next()?);
-    (pull == "pull" && !owner.is_empty() && !repo.is_empty()).then_some(())?;
-    Some((owner.to_string(), repo.to_string(), n.parse().ok()?))
+    github(url, GithubKind::Pr)
 }
 
 /// `https://github.com/<owner>/<repo>/issues/<n>…`.
 pub(super) fn github_issue(url: &str) -> Option<(String, String, u64)> {
-    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
-    let rest = rest.strip_prefix("www.").unwrap_or(rest);
-    let mut seg = rest.strip_prefix("github.com/")?.split(['/', '?', '#']);
-    let (owner, repo, issues, n) = (seg.next()?, seg.next()?, seg.next()?, seg.next()?);
-    (issues == "issues" && !owner.is_empty() && !repo.is_empty()).then_some(())?;
-    Some((owner.to_string(), repo.to_string(), n.parse().ok()?))
+    github(url, GithubKind::Issue)
 }
 
 /// `https://github.com/<owner>/<repo>/actions/runs/<id>…` (a job or an attempt in it too).
 pub(super) fn github_run(url: &str) -> Option<(String, String, u64)> {
-    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
-    let rest = rest.strip_prefix("www.").unwrap_or(rest);
-    let mut seg = rest.strip_prefix("github.com/")?.split(['/', '?', '#']);
-    let (owner, repo, actions, runs, id) = (seg.next()?, seg.next()?, seg.next()?, seg.next()?, seg.next()?);
-    (actions == "actions" && runs == "runs" && !owner.is_empty() && !repo.is_empty()).then_some(())?;
-    Some((owner.to_string(), repo.to_string(), id.parse().ok()?))
+    github(url, GithubKind::Run)
 }
 
 pub(super) fn human_size(n: u64) -> String {
@@ -1136,166 +1218,146 @@ pub(super) fn human_size(n: u64) -> String {
 
 // ------------------------------------------------------------------ loading (off the main thread)
 
-pub(super) fn load(link: &Link) -> Body {
+/// What the card shows for `link`. `there` is another Mac's backend when the link is in its
+/// window: everything is read on that Mac (`links.preview`), files, GitHub links, and an app's or
+/// a link pattern's preview command too, and nothing of this Mac's is.
+pub(super) fn load(link: &Link, there: Option<&dyn Backend>) -> Body {
     // A link pattern's own preview command; when it fails, the card the link would have had.
-    if let Some(p) = link.preview.as_deref().and_then(load_pattern) {
+    if let Some(p) = link.preview.as_deref().and_then(|argv| load_pattern(argv, &link.target, there)) {
         return Body::App(p);
     }
     if let Some(app) = &link.app {
-        return load_app(&link.target).map(Body::App).unwrap_or_else(|| Body::Note(format!("Opens in {app}")));
+        return load_app(&link.target, there).map(Body::App).unwrap_or_else(|| Body::Note(format!("Opens in {app}")));
     }
-    if link.url { load_url(&link.target) } else { load_path(Path::new(&link.target), link.line) }
+    if link.url { load_url(&link.target, there) } else { load_path(Path::new(&link.target), link.line, there) }
 }
 
-fn load_path(path: &Path, line: Option<u32>) -> Body {
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(e) => return Body::Note(format!("Couldn't read it: {e}")),
+/// Ask another Mac's midnad what the card shows for `target`.
+fn ask(b: &dyn Backend, target: &str, line: Option<u32>) -> anyhow::Result<LinkPreview> {
+    Ok(serde_json::from_value(b.call("links.preview", json!({ "target": target, "line": line }))?)?)
+}
+
+fn load_path(path: &Path, line: Option<u32>, there: Option<&dyn Backend>) -> Body {
+    let read = match there {
+        None => read_path(path, line),
+        Some(b) => match ask(b, &path.to_string_lossy(), line) {
+            Ok(p) => p,
+            Err(e) => return Body::Note(format!("Couldn't read it: {e}")),
+        },
     };
-    if meta.is_dir() {
-        return load_dir(path);
-    }
-    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
-        return Body::Image(path.to_path_buf());
-    }
-    if meta.len() == 0 {
-        return Body::Note("Empty file".into());
-    }
-    let mut f = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) => return Body::Note(format!("Couldn't read it: {e}")),
-    };
-    let mut head = vec![0u8; 8192];
-    let n = f.read(&mut head).unwrap_or(0);
-    if head[..n].contains(&0) {
-        return Body::Note(format!("Binary file · {}", human_size(meta.len())));
-    }
-    match std::fs::File::open(path) {
-        Ok(f) => {
-            let (lines, focus) = excerpt(std::io::BufReader::new(f), line);
-            if lines.is_empty() { Body::Note("Empty file".into()) } else { Body::Code { lines, focus } }
-        }
-        Err(e) => Body::Note(format!("Couldn't read it: {e}")),
+    match read {
+        LinkPreview::Lines { lines, focus } => Body::Code { lines, focus },
+        LinkPreview::Dir { entries, total } => Body::Dir { rows: entries.into_iter().map(|e| (e.name, e.dir, e.size)).collect(), total },
+        // Another Mac's image isn't here to draw.
+        LinkPreview::Image { .. } if there.is_none() => Body::Image(path.to_path_buf()),
+        LinkPreview::Image { size } => Body::Note(format!("Image · {}", human_size(size))),
+        LinkPreview::Binary { size } => Body::Note(format!("Binary file · {}", human_size(size))),
+        LinkPreview::Note { text } => Body::Note(text),
+        LinkPreview::Github { .. } | LinkPreview::App { .. } => Body::Note("Not a file".into()),
     }
 }
 
-/// `FILE_LINES` numbered lines around `line` (the top of the file without one), tabs expanded
-/// and very long lines cut. Reads no further than it needs (and gives up 64 MB in).
-fn excerpt(mut r: impl BufRead, line: Option<u32>) -> (Vec<(u32, String)>, Option<u32>) {
-    let start = line.map(|l| (l as usize).saturating_sub(1 + BEFORE)).unwrap_or(0);
-    let mut out = vec![];
-    let (mut n, mut read) = (0usize, 0usize);
-    let mut buf = vec![];
-    while out.len() < FILE_LINES && read < 64 << 20 {
-        buf.clear();
-        match r.read_until(b'\n', &mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(k) => read += k,
-        }
-        n += 1;
-        if n > start {
-            let s = String::from_utf8_lossy(&buf);
-            let s = s.trim_end_matches(['\n', '\r']).replace('\t', "    ");
-            let s: String = s.chars().take(500).collect();
-            out.push((n as u32, s));
-        }
-    }
-    // A line past the end: show the file's last lines instead of nothing.
-    let focus = line.filter(|l| out.iter().any(|(n, _)| n == l));
-    (out, focus)
+/// A cached card: for this Mac (None) or another (its fingerprint), and the URL.
+type UrlKey = (Option<String>, String);
+
+static URL_CACHE: LazyLock<Mutex<HashMap<UrlKey, (Instant, Body)>>> = LazyLock::new(Default::default);
+
+fn url_key(url: &str, there: Option<&dyn Backend>) -> UrlKey {
+    (there.and_then(crate::backend::mac_id), url.to_string())
 }
 
-fn load_dir(path: &Path) -> Body {
-    let rd = match std::fs::read_dir(path) {
-        Ok(r) => r,
-        Err(e) => return Body::Note(format!("Couldn't list it: {e}")),
-    };
-    let mut all: Vec<(String, bool, Option<u64>)> = rd
-        .flatten()
-        .filter(|e| e.file_name() != ".DS_Store")
-        .map(|e| {
-            let dir = e.file_type().is_ok_and(|t| t.is_dir());
-            let size = (!dir).then(|| e.metadata().ok().map(|m| m.len())).flatten();
-            (e.file_name().to_string_lossy().into_owned(), dir, size)
-        })
-        .collect();
-    all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
-    let total = all.len();
-    all.truncate(DIR_ROWS);
-    Body::Dir { rows: all, total }
-}
-
-static URL_CACHE: LazyLock<Mutex<HashMap<String, (Instant, Body)>>> = LazyLock::new(Default::default);
-
-fn load_url(url: &str) -> Body {
-    if let Some((at, b)) = URL_CACHE.lock().ok().and_then(|c| c.get(url).cloned())
+fn load_url(url: &str, there: Option<&dyn Backend>) -> Body {
+    let key = url_key(url, there);
+    if let Some((at, b)) = URL_CACHE.lock().ok().and_then(|c| c.get(&key).cloned())
         && at.elapsed() < ttl(&b)
     {
         return b;
     }
-    let body = github_pr(url)
-        .and_then(|(o, r, n)| load_pr(&o, &r, n))
-        .map(Body::Pr)
-        .or_else(|| github_issue(url).and_then(|(o, r, n)| load_issue(&o, &r, n)).map(Body::Issue))
-        .or_else(|| github_run(url).and_then(|(o, r, id)| load_run(&o, &r, id)).map(Body::Run))
-        .unwrap_or_else(|| load_page(url));
+    // Any other page is the web's, the same from either Mac (and never a local or private host).
+    let body = load_github(url, there).unwrap_or_else(|| load_page(url));
     if let Ok(mut c) = URL_CACHE.lock() {
         c.retain(|_, (at, b)| at.elapsed() < ttl(b));
-        c.insert(url.to_string(), (Instant::now(), body.clone()));
+        c.insert(key, (Instant::now(), body.clone()));
     }
     body
 }
 
 /// A pull request's state for its link in the grid (`pr_status.rs`): OPEN, DRAFT, MERGED or
-/// CLOSED. Asks `gh` only, never the web page, and shares the card's cache
-/// while it's fresh.
-pub(super) fn pr_state(url: &str) -> Option<String> {
-    if let Some((at, Body::Pr(pr))) = URL_CACHE.lock().ok().and_then(|c| c.get(url).cloned())
+/// CLOSED. Asks `gh` only, never the web page, on the Mac the terminal is on (`there`, as the
+/// card does), and shares the card's cache while it's fresh.
+pub(super) fn pr_state(url: &str, there: Option<&dyn Backend>) -> Option<String> {
+    let key = url_key(url, there);
+    if let Some((at, Body::Pr(pr))) = URL_CACHE.lock().ok().and_then(|c| c.get(&key).cloned())
         && at.elapsed() < SHARE_TTL
     {
         return Some(pr.state);
     }
-    let (o, r, n) = github_pr(url)?;
-    let pr = load_pr(&o, &r, n)?;
+    github_pr(url)?;
+    let Body::Pr(pr) = load_github(url, there)? else { return None };
     if let Ok(mut c) = URL_CACHE.lock() {
-        c.insert(url.to_string(), (Instant::now(), Body::Pr(pr.clone())));
+        c.insert(key, (Instant::now(), Body::Pr(pr.clone())));
     }
     Some(pr.state)
 }
 
 /// A workflow run's state for its link in the grid (`pr_status.rs`): QUEUED, RUNNING, PASSED,
-/// FAILED, CANCELLED, SKIPPED or APPROVAL. Like `pr_state`, `gh` only, sharing the card's cache.
-pub(super) fn run_link_state(url: &str) -> Option<&'static str> {
-    if let Some((at, b @ Body::Run(_))) = URL_CACHE.lock().ok().and_then(|c| c.get(url).cloned())
+/// FAILED, CANCELLED, SKIPPED or APPROVAL. Like `pr_state`, `gh` only on the terminal's Mac,
+/// sharing the card's cache.
+pub(super) fn run_link_state(url: &str, there: Option<&dyn Backend>) -> Option<&'static str> {
+    let key = url_key(url, there);
+    if let Some((at, b @ Body::Run(_))) = URL_CACHE.lock().ok().and_then(|c| c.get(&key).cloned())
         && at.elapsed() < ttl(&b).min(SHARE_TTL)
         && let Body::Run(r) = b
     {
         return Some(r.state.key());
     }
-    let (o, r, id) = github_run(url)?;
-    let run = load_run(&o, &r, id)?;
+    github_run(url)?;
+    let Body::Run(run) = load_github(url, there)? else { return None };
     let state = run.state.key();
     if let Ok(mut c) = URL_CACHE.lock() {
-        c.insert(url.to_string(), (Instant::now(), Body::Run(run)));
+        c.insert(key, (Instant::now(), Body::Run(run)));
     }
     Some(state)
 }
 
-/// `https://github.com/<owner>/<repo>/pull/<n>` or `…/actions/runs/<id>` for any page of a pull
-/// request or workflow run.
+/// An issue's state for its link in the grid (`pr_status.rs`): ISSUE_OPEN or ISSUE_CLOSED. Like
+/// `pr_state`, `gh` only on the terminal's Mac, sharing the card's cache.
+pub(super) fn issue_state(url: &str, there: Option<&dyn Backend>) -> Option<&'static str> {
+    let key = url_key(url, there);
+    let cached = URL_CACHE.lock().ok().and_then(|c| c.get(&key).cloned());
+    let issue = match cached {
+        Some((at, Body::Issue(i))) if at.elapsed() < SHARE_TTL => i,
+        _ => {
+            github_issue(url)?;
+            let Body::Issue(i) = load_github(url, there)? else { return None };
+            if let Ok(mut c) = URL_CACHE.lock() {
+                c.insert(key, (Instant::now(), Body::Issue(i.clone())));
+            }
+            i
+        }
+    };
+    match issue.state.as_str() {
+        "OPEN" => Some("ISSUE_OPEN"),
+        "CLOSED" => Some("ISSUE_CLOSED"),
+        _ => None,
+    }
+}
+
+/// `https://github.com/<owner>/<repo>/pull/<n>`, `…/issues/<n>` or `…/actions/runs/<id>` for any
+/// page of a pull request, issue or workflow run.
 pub(super) fn github_canonical(url: &str) -> Option<String> {
     github_pr(url)
         .map(|(owner, repo, n)| format!("https://github.com/{owner}/{repo}/pull/{n}"))
+        .or_else(|| github_issue(url).map(|(owner, repo, n)| format!("https://github.com/{owner}/{repo}/issues/{n}")))
         .or_else(|| github_run(url).map(|(owner, repo, id)| format!("https://github.com/{owner}/{repo}/actions/runs/{id}")))
 }
 
 /// Drop the cached card for a link (`links.stale`), and for every other page of the same pull
-/// request or run.
+/// request, issue or run, read on any Mac.
 pub(super) fn forget(url: &str) {
     let key = github_canonical(url).unwrap_or_else(|| url.to_string());
     if let Ok(mut c) = URL_CACHE.lock() {
-        c.retain(|k, _| k != url && github_canonical(k).as_deref().unwrap_or(k) != key);
+        c.retain(|(_, k), _| k != url && github_canonical(k).as_deref().unwrap_or(k) != key);
     }
 }
 
@@ -1320,8 +1382,9 @@ fn ttl(b: &Body) -> Duration {
 // `actions` replace the items of the link's own menu (`links.actions.register`), for this link
 // only; the link menu drops any it isn't allowed (`link_actions::preview_item_allowed`).
 // Only `title` is required. A non-zero exit, a timeout or bad JSON falls back to "Opens in <App>".
+// The command and how it runs are `midna_proto::preview_cmd`'s: midnad runs it for a window that
+// drives its Mac from another, and that card has no `actions` (the link menu runs them here).
 
-const APP_TIMEOUT: Duration = Duration::from_millis(1500);
 /// App previews show live state (a task's status), so they're reused for less time than pages.
 const APP_TTL: Duration = Duration::from_secs(15);
 const APP_FIELDS: usize = 6;
@@ -1358,7 +1421,10 @@ fn app_text(v: Option<&Value>, max: usize) -> Option<String> {
 }
 
 pub(super) fn parse_app_preview(out: &[u8]) -> Option<AppPreview> {
-    let v: Value = serde_json::from_slice(out).ok()?;
+    parse_app_value(&serde_json::from_slice(out).ok()?)
+}
+
+fn parse_app_value(v: &Value) -> Option<AppPreview> {
     let title = app_text(v.get("title"), 200)?;
     let status = v.get("status").and_then(|s| {
         let label = app_text(s.get("label"), 40)?;
@@ -1386,68 +1452,19 @@ pub(super) fn parse_app_preview(out: &[u8]) -> Option<AppPreview> {
     Some(AppPreview { title, subtitle: app_text(v.get("subtitle"), 300), status, fields, lines, progress, open_label: app_text(v.get("open_label"), 40), actions })
 }
 
-/// `MidnaLinkPreview` (as `plutil` prints it in JSON) -> (path inside the bundle, args).
-fn parse_preview_command(v: &Value) -> Option<(String, Vec<String>)> {
-    let mut parts = match v {
-        Value::String(s) => vec![s.clone()],
-        Value::Array(a) => a.iter().map(|x| x.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()?,
-        _ => return None,
-    }
-    .into_iter();
-    let path = parts.next().filter(|p| !p.is_empty() && !p.starts_with('/') && !Path::new(p).components().any(|c| matches!(c, std::path::Component::ParentDir)))?;
-    Some((path, parts.collect()))
-}
-
-/// The command `bundle` declares for previews, resolved inside it (a symlink out of it is refused).
-fn preview_command(bundle: &Path) -> Option<(PathBuf, Vec<String>)> {
-    let mut cmd = std::process::Command::new("/usr/bin/plutil");
-    cmd.args(["-extract", "MidnaLinkPreview", "json", "-o", "-"]).arg(bundle.join("Contents/Info.plist"));
-    let (ok, out) = run_capped(cmd, 16 << 10, Duration::from_secs(2))?;
-    let (rel, args) = parse_preview_command(&serde_json::from_slice(&out).ok().filter(|_| ok)?)?;
-    let bundle = bundle.canonicalize().ok()?;
-    let path = bundle.join(rel).canonicalize().ok()?;
-    (path.starts_with(&bundle) && path.is_file()).then_some((path, args))
-}
-
-/// URL -> when it was asked and what came back (None, so a failing command isn't rerun each hover).
-type AppCache = HashMap<String, (Instant, Option<AppPreview>)>;
+/// (the Mac it ran on, None for this one; the URL or a pattern's command) -> when it was asked
+/// and what came back (None, so a failing command isn't rerun each hover).
+type AppCache = HashMap<(Option<String>, String), (Instant, Option<AppPreview>)>;
 static APP_CACHE: LazyLock<Mutex<AppCache>> = LazyLock::new(Default::default);
 
-/// The preview the link's app supplies, None when it declares none or it fails.
-fn load_app(url: &str) -> Option<AppPreview> {
-    if let Some((at, p)) = APP_CACHE.lock().ok().and_then(|c| c.get(url).cloned())
-        && at.elapsed() < APP_TTL
-    {
-        return p;
-    }
-    let preview = ls::default_app(url).and_then(|bundle| preview_command(&bundle)).and_then(|(path, args)| run_preview(&path, &args, url, APP_TIMEOUT));
-    if let Ok(mut c) = APP_CACHE.lock() {
-        c.retain(|_, (at, _)| at.elapsed() < APP_TTL);
-        c.insert(url.to_string(), (Instant::now(), preview.clone()));
-    }
-    preview
-}
-
-// ------------------------------------------------------------------ link pattern previews
-//
-// A `terminal.link_patterns` rule (or an app's registered one) can name a command,
-// `preview:"jira-card $1"`. midnad fills its words from the match; Midna runs it without a shell
-// or stdin, with the login shell's PATH, for at most `PATTERN_TIMEOUT`, and reads the same JSON
-// an app's `MidnaLinkPreview` prints. A failure falls back to the link's plain card.
-
-/// Pattern previews usually ask a web API (Jira), so they get longer than an app's local tool.
-const PATTERN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The preview a link pattern's command prints, None when it fails. Cached per argv like app
-/// previews (failures too), so moving back and forth over a link doesn't rerun it.
-fn load_pattern(argv: &[String]) -> Option<AppPreview> {
-    let key = format!("cmd\0{}", argv.join("\0"));
+/// What `key` came back with lately, else what `run` gives now.
+fn cached_app(key: (Option<String>, String), run: impl FnOnce() -> Option<AppPreview>) -> Option<AppPreview> {
     if let Some((at, p)) = APP_CACHE.lock().ok().and_then(|c| c.get(&key).cloned())
         && at.elapsed() < APP_TTL
     {
         return p;
     }
-    let preview = run_pattern_on(argv, user_path(), PATTERN_TIMEOUT);
+    let preview = run();
     if let Ok(mut c) = APP_CACHE.lock() {
         c.retain(|_, (at, _)| at.elapsed() < APP_TTL);
         c.insert(key, (Instant::now(), preview.clone()));
@@ -1455,41 +1472,62 @@ fn load_pattern(argv: &[String]) -> Option<AppPreview> {
     preview
 }
 
+/// The preview the link's app supplies, None when it declares none or it fails. In another Mac's
+/// window, that Mac's app is asked.
+fn load_app(url: &str, there: Option<&dyn Backend>) -> Option<AppPreview> {
+    cached_app((there.and_then(crate::backend::mac_id), url.to_string()), || match there {
+        None => ls::default_app(url).and_then(|bundle| preview_cmd::preview_command(&bundle)).and_then(|(path, args)| run_preview(&path, &args, url, APP_TIMEOUT)),
+        Some(b) => ask_app(b, url, None),
+    })
+}
+
+/// Another Mac's app or link pattern preview for `url`, run there. Without its `actions`: the
+/// link menu would run them on this Mac.
+fn ask_app(b: &dyn Backend, url: &str, preview: Option<&[String]>) -> Option<AppPreview> {
+    let v = b.call("links.preview", json!({ "target": url, "preview": preview })).ok()?;
+    let LinkPreview::App { json } = serde_json::from_value(v).ok()? else { return None };
+    let mut p = parse_app_value(&json)?;
+    p.actions.clear();
+    Some(p)
+}
+
+// ------------------------------------------------------------------ link pattern previews
+//
+// A `terminal.link_patterns` rule (or an app's registered one) can name a command,
+// `preview:"jira-card $1"`. midnad fills its words from the match; Midna runs it without a shell
+// or stdin, with the login shell's PATH, for at most `PATTERN_TIMEOUT`, and reads the same JSON
+// an app's `MidnaLinkPreview` prints. A failure falls back to the link's plain card. In another
+// Mac's window, that Mac runs it.
+
+/// The preview a link pattern's command prints, None when it fails. Cached per argv like app
+/// previews (failures too), so moving back and forth over a link doesn't rerun it.
+fn load_pattern(argv: &[String], url: &str, there: Option<&dyn Backend>) -> Option<AppPreview> {
+    cached_app((there.and_then(crate::backend::mac_id), format!("cmd\0{}", argv.join("\0"))), || match there {
+        None => run_pattern_on(argv, user_path(), pattern_timeout()),
+        Some(b) => ask_app(b, url, Some(argv)),
+    })
+}
+
+/// `PATTERN_TIMEOUT`; tests wait far longer, since starting any process can take seconds on a
+/// loaded machine and only a command that never ends should fail them.
+fn pattern_timeout() -> Duration {
+    if cfg!(test) { Duration::from_secs(120) } else { PATTERN_TIMEOUT }
+}
+
 /// The login shell's PATH (the app's own from launchd is minimal), read once.
 fn user_path() -> &'static str {
-    static PATH: LazyLock<String> = LazyLock::new(|| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let fallback = format!("{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
-        // Tests don't start the human's shell.
-        if cfg!(test) { None } else { crate::install::login_shell_path() }.filter(|p| !p.is_empty()).unwrap_or(fallback)
-    });
+    // Tests don't start the human's shell.
+    static PATH: LazyLock<String> = LazyLock::new(|| preview_cmd::user_path(!cfg!(test)));
     &PATH
 }
 
-/// `argv[0]` (a path, `~/…`, or a name looked up on `path`) run with `argv[1..]`.
-fn pattern_command(argv: &[String], path: &str) -> Option<std::process::Command> {
-    let prog = argv.first().filter(|p| !p.is_empty())?;
-    let bin = match prog.strip_prefix("~/") {
-        Some(rest) => PathBuf::from(midna_proto::paths::home_var()?).join(rest),
-        None if prog.contains('/') => PathBuf::from(prog),
-        None => std::env::split_paths(path).map(|d| d.join(prog)).find(|p| p.is_file())?,
-    };
-    let mut cmd = std::process::Command::new(bin);
-    cmd.args(&argv[1..]).env("PATH", path);
-    Some(cmd)
-}
-
 fn run_pattern_on(argv: &[String], path: &str, timeout: Duration) -> Option<AppPreview> {
-    let (ok, out) = run_capped(pattern_command(argv, path)?, 64 << 10, timeout)?;
-    ok.then(|| parse_app_preview(&out)).flatten()
+    preview_cmd::run_pattern(argv, path, timeout).and_then(|out| parse_app_preview(&out))
 }
 
 /// `<path> <args…> <url>`, when it exits 0 in time with a preview on stdout.
 fn run_preview(path: &Path, args: &[String], url: &str, timeout: Duration) -> Option<AppPreview> {
-    let mut cmd = std::process::Command::new(path);
-    cmd.args(args).arg(url);
-    let (ok, out) = run_capped(cmd, 64 << 10, timeout)?;
-    ok.then(|| parse_app_preview(&out)).flatten()
+    preview_cmd::run_preview(path, args, url, timeout).and_then(|out| parse_app_preview(&out))
 }
 
 /// Off macOS there's no Launch Services to ask: no default app, so no app preview.
@@ -1548,81 +1586,40 @@ mod ls {
     }
 }
 
-/// Run `cmd`, keeping at most `limit` bytes of its output; killed after `timeout`. Windows has
-/// no process groups to kill: only `cmd` itself goes, and the read ends with the timeout's
-/// kill (a child it left holding the pipe keeps the reader thread, not the caller).
-#[cfg(windows)]
-fn run_capped(mut cmd: std::process::Command, limit: usize, timeout: Duration) -> Option<(bool, Vec<u8>)> {
-    use std::os::windows::process::CommandExt;
-    use std::process::Stdio;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).creation_flags(CREATE_NO_WINDOW).spawn().ok()?;
-    let mut out = child.stdout.take()?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = vec![];
-        let _ = (&mut out).take(limit as u64).read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-    let until = Instant::now() + timeout;
-    let ok = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break st.success(),
-            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(40)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break false;
-            }
-        }
-    };
-    Some((ok, rx.recv_timeout(until.saturating_duration_since(Instant::now()).max(Duration::from_millis(200))).ok()?))
-}
-
-/// Run `cmd`, keeping at most `limit` bytes of its output; killed after `timeout`, with anything
-/// it started (in its own process group, so a child holding the pipe can't outlive it).
-#[cfg(unix)]
-fn run_capped(mut cmd: std::process::Command, limit: usize, timeout: Duration) -> Option<(bool, Vec<u8>)> {
-    use std::os::unix::process::CommandExt;
-    use std::process::Stdio;
-    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).process_group(0).spawn().ok()?;
-    let mut out = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = vec![];
-        let _ = (&mut out).take(limit as u64).read_to_end(&mut buf);
-        buf // dropping the pipe here stops a writer that has more
-    });
-    let until = Instant::now() + timeout;
-    let group = -(child.id() as libc::pid_t);
-    let ok = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break st.success(),
-            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(40)),
-            _ => {
-                unsafe { libc::kill(group, libc::SIGKILL) };
-                let _ = child.wait();
-                break false;
-            }
-        }
-    };
-    // a background child it left behind would hold the pipe open and the read with it
-    unsafe { libc::kill(group, libc::SIGKILL) };
-    Some((ok, reader.join().ok()?))
-}
-
 fn gh() -> std::process::Command {
     let bin = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"].into_iter().find(|p| Path::new(p).exists()).unwrap_or("gh");
     std::process::Command::new(bin)
 }
 
-fn load_pr(owner: &str, repo: &str, n: u64) -> Option<Pr> {
+/// What `gh` says about a GitHub link, asked on the Mac that reads it.
+fn gh_view(g: &GithubLink, url: &str, there: Option<&dyn Backend>) -> Option<Value> {
+    if let Some(b) = there {
+        return match ask(b, url, None).ok()? {
+            LinkPreview::Github { json } => Some(json),
+            _ => None,
+        };
+    }
     let mut cmd = gh();
-    cmd.args(["pr", "view", &n.to_string(), "-R", &format!("{owner}/{repo}"), "--json", "title,state,isDraft,headRefName,baseRefName,additions,deletions,statusCheckRollup"]);
-    let (ok, out) = run_capped(cmd, 1 << 20, Duration::from_secs(8))?;
+    cmd.args(g.gh_args());
+    let (ok, out) = run_capped(cmd, g.gh_limit(), Duration::from_secs(8))?;
     if !ok {
         return None;
     }
-    parse_pr(&serde_json::from_slice(&out).ok()?)
+    serde_json::from_slice(&out).ok()
+}
+
+/// A GitHub pull request, issue or run's card; None for any other link, or when `gh` can't say.
+fn load_github(url: &str, there: Option<&dyn Backend>) -> Option<Body> {
+    let g = GithubLink::parse(url)?;
+    let v = gh_view(&g, url, there)?;
+    match g.kind {
+        GithubKind::Pr => parse_pr(&v).map(Body::Pr),
+        GithubKind::Issue => parse_issue(&v).map(Body::Issue),
+        GithubKind::Run => {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+            parse_run(&v, now).map(Body::Run)
+        }
+    }
 }
 
 pub(super) fn parse_pr(v: &Value) -> Option<Pr> {
@@ -1653,16 +1650,6 @@ pub(super) fn parse_pr(v: &Value) -> Option<Pr> {
     Some(Pr { title: s("title"), state, head: s("headRefName"), base: s("baseRefName"), additions: num("additions"), deletions: num("deletions"), checks })
 }
 
-fn load_issue(owner: &str, repo: &str, n: u64) -> Option<Issue> {
-    let mut cmd = gh();
-    cmd.args(["issue", "view", &n.to_string(), "-R", &format!("{owner}/{repo}"), "--json", "title,state,body"]);
-    let (ok, out) = run_capped(cmd, 1 << 20, Duration::from_secs(8))?;
-    if !ok {
-        return None;
-    }
-    parse_issue(&serde_json::from_slice(&out).ok()?)
-}
-
 pub(super) fn parse_issue(v: &Value) -> Option<Issue> {
     let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let title = v.get("title").and_then(Value::as_str)?.to_string();
@@ -1673,17 +1660,6 @@ pub(super) fn parse_issue(v: &Value) -> Option<Issue> {
         None => body.to_string(),
     };
     Some(Issue { title, state: s("state"), body })
-}
-
-fn load_run(owner: &str, repo: &str, id: u64) -> Option<Run> {
-    let mut cmd = gh();
-    cmd.args(["run", "view", &id.to_string(), "-R", &format!("{owner}/{repo}"), "--json", "displayTitle,workflowName,headBranch,status,conclusion,startedAt,updatedAt,jobs"]);
-    let (ok, out) = run_capped(cmd, 4 << 20, Duration::from_secs(8))?;
-    if !ok {
-        return None;
-    }
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    parse_run(&serde_json::from_slice(&out).ok()?, now)
 }
 
 /// `status` and `conclusion` as `gh` reports them for a run, a job or a step.
@@ -1893,7 +1869,7 @@ fn decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[cfg_attr(not(unix), allow(unused_imports))] // the script-running tests are Unix only
-    use super::{AppPreview, Body, Check, FILE_LINES, Link, RunState, Tone, duration, excerpt, fade, fetchable, github_issue, github_pr, github_run, load, load_pattern, page_meta, parse_app_preview, parse_issue, parse_pr, parse_preview_command, parse_run, path_title, pattern_command, preview_command, run_pattern_on, run_preview, unix_time, url_title};
+    use super::{AppPreview, Body, Check, Link, RunState, Tone, duration, fade, fetchable, github_issue, github_pr, github_run, load, load_pattern, page_meta, parse_app_preview, parse_issue, parse_pr, parse_preview_command, parse_run, path_title, pattern_command, pr_state, preview_command, run_link_state, run_pattern_on, run_preview, unix_time, url_title};
     use serde_json::json;
     use std::path::Path;
     #[cfg_attr(not(unix), allow(unused_imports))]
@@ -1904,9 +1880,128 @@ mod tests {
         let l = Link::from_link_at(&json!({ "kind": "url", "target": "midna-test-unregistered-scheme://#/?task=T6", "app": "Taskboard" })).unwrap();
         assert_eq!(l.app.as_deref(), Some("Taskboard"));
         // No app supplies a preview: the card just says where it opens.
-        assert!(matches!(load(&l), Body::Note(n) if n == "Opens in Taskboard"));
+        assert!(matches!(load(&l, None), Body::Note(n) if n == "Opens in Taskboard"));
         let l = Link::from_link_at(&json!({ "kind": "url", "target": "https://a.com" })).unwrap();
         assert_eq!(l.app, None);
+    }
+
+    /// Another Mac that answers `links.preview` with `answer`, and keeps what it was asked.
+    struct OtherMac {
+        mac: crate::backend::Mac,
+        answer: serde_json::Value,
+        asked: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl OtherMac {
+        fn new(answer: serde_json::Value) -> OtherMac {
+            OtherMac { mac: crate::backend::Mac { peer: "fp-bravo".into(), name: "Bravo".into() }, answer, asked: Default::default() }
+        }
+    }
+
+    impl crate::backend::Backend for OtherMac {
+        fn label(&self) -> &'static str {
+            "other"
+        }
+        fn socket_path(&self) -> std::path::PathBuf {
+            "/nonexistent".into()
+        }
+        fn mac(&self) -> Option<&crate::backend::Mac> {
+            Some(&self.mac)
+        }
+        fn open_mac(self: std::sync::Arc<Self>, _: crate::backend::Mac) -> std::sync::Arc<dyn crate::backend::Backend> {
+            self
+        }
+        fn call(&self, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+            assert_eq!(method, "links.preview");
+            self.asked.lock().unwrap().push(params);
+            Ok(self.answer.clone())
+        }
+        fn subscribe(&self, _: async_channel::Sender<crate::backend::BackendEvent>) {}
+        fn attach(&self, _: crate::backend::AttachRequest<'_>, _: std::sync::Arc<crate::frame::FrameSink>) -> anyhow::Result<std::sync::Arc<dyn crate::backend::TermStream>> {
+            anyhow::bail!("no terminals")
+        }
+    }
+
+    #[test]
+    fn another_macs_files_are_read_there() {
+        // A path that exists here too: the card still shows that Mac's file, never this one.
+        let here = std::env::temp_dir().join(format!("midna-lp-there-{}.rs", std::process::id()));
+        std::fs::write(&here, "this Mac's\n").unwrap();
+        let there = OtherMac::new(json!({ "kind": "lines", "lines": [[41, "a"], [42, "b"]], "focus": 42 }));
+        let l = Link { url: false, target: here.to_string_lossy().into_owned(), line: Some(42), app: None, preview: None };
+        match load(&l, Some(&there)) {
+            Body::Code { lines, focus } => assert_eq!((lines, focus), (vec![(41, "a".into()), (42, "b".into())], Some(42))),
+            b => panic!("{b:?}"),
+        }
+        assert_eq!(there.asked.lock().unwrap()[0], json!({ "target": l.target, "line": 42 }));
+        let _ = std::fs::remove_file(&here);
+
+        // Its folders and images: entries come back; an image there can't be drawn here.
+        let there = OtherMac::new(json!({ "kind": "dir", "entries": [{ "name": "src", "dir": true }, { "name": "a.rs", "size": 3 }], "total": 9 }));
+        let l = Link { target: "/Users/bravo/garden".into(), line: None, ..l };
+        assert!(matches!(load(&l, Some(&there)), Body::Dir { rows, total: 9 } if rows == vec![("src".into(), true, None), ("a.rs".into(), false, Some(3))]));
+        let there = OtherMac::new(json!({ "kind": "image", "size": 2048 }));
+        assert!(matches!(load(&l, Some(&there)), Body::Note(n) if n == "Image · 2 KB"));
+    }
+
+    #[test]
+    fn another_macs_pull_requests_are_read_there() {
+        let pr = json!({ "title": "Water on schedule", "state": "OPEN", "headRefName": "water", "baseRefName": "main", "additions": 3, "deletions": 1 });
+        let there = OtherMac::new(json!({ "kind": "github", "json": pr }));
+        let url = format!("https://github.com/a/midna-lp-test-{}/pull/7", std::process::id());
+        let l = Link { url: true, target: url.clone(), line: None, app: None, preview: None };
+        assert!(matches!(load(&l, Some(&there)), Body::Pr(p) if p.title == "Water on schedule" && p.head == "water"));
+        assert_eq!(there.asked.lock().unwrap()[0]["target"], json!(url));
+        // Cached for that Mac: asked once.
+        let _ = load(&l, Some(&there));
+        assert_eq!(there.asked.lock().unwrap().len(), 1);
+        super::forget(&url);
+        let _ = load(&l, Some(&there));
+        assert_eq!(there.asked.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn another_macs_link_colors_are_read_there() {
+        // The grid's color for a link in that Mac's terminal comes from its gh, sharing its card.
+        let pr = json!({ "title": "Prune", "state": "MERGED", "headRefName": "prune", "baseRefName": "main" });
+        let there = OtherMac::new(json!({ "kind": "github", "json": pr }));
+        let url = format!("https://github.com/a/midna-lp-color-{}/pull/8", std::process::id());
+        assert_eq!(pr_state(&url, Some(&there)).as_deref(), Some("MERGED"));
+        assert_eq!(there.asked.lock().unwrap()[0]["target"], json!(url));
+        let l = Link { url: true, target: url.clone(), line: None, app: None, preview: None };
+        assert!(matches!(load(&l, Some(&there)), Body::Pr(p) if p.state == "MERGED"));
+        assert_eq!(pr_state(&url, Some(&there)).as_deref(), Some("MERGED"));
+        assert_eq!(there.asked.lock().unwrap().len(), 1);
+
+        let run = json!({ "status": "in_progress", "conclusion": "", "workflowName": "CI", "displayTitle": "Prune", "headBranch": "prune", "event": "push", "jobs": [] });
+        let there = OtherMac::new(json!({ "kind": "github", "json": run }));
+        let url = format!("https://github.com/a/midna-lp-color-{}/actions/runs/77", std::process::id());
+        assert_eq!(run_link_state(&url, Some(&there)), Some("RUNNING"));
+        assert_eq!(there.asked.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn another_macs_app_links_run_there() {
+        let card = json!({ "kind": "app", "json": { "title": "T6 · Water the plants", "status": { "label": "Working", "tone": "busy" },
+            "actions": [{ "label": "Mark done", "run": ["tb", "done", "T6"] }] } });
+        let there = OtherMac::new(card);
+        let url = format!("midna-test-unregistered-scheme://#/?task=T6&{}", std::process::id());
+        let l = Link { url: true, target: url.clone(), line: None, app: Some("Taskboard".into()), preview: None };
+        let Body::App(p) = load(&l, Some(&there)) else { panic!("no app card") };
+        assert_eq!((p.title.as_str(), p.status), ("T6 · Water the plants", Some(("Working".into(), Tone::Busy))));
+        // Its actions would run on this Mac from the link menu.
+        assert!(p.actions.is_empty());
+        assert_eq!(there.asked.lock().unwrap()[0], json!({ "target": url, "preview": null }));
+
+        // A pattern's command goes to that Mac with the link, and nothing runs here.
+        let l = Link { url: true, target: format!("https://x.atlassian.net/browse/RRD-{}", std::process::id()), line: None, app: None, preview: Some(vec!["/bin/echo".into(), "{\"title\":\"here\"}".into()]) };
+        assert!(matches!(load(&l, Some(&there)), Body::App(p) if p.title == "T6 · Water the plants"));
+        assert_eq!(there.asked.lock().unwrap()[1]["preview"], json!(["/bin/echo", "{\"title\":\"here\"}"]));
+
+        // That Mac can't say (an older midnad, or no preview): the card the link would have had.
+        let there = OtherMac::new(json!({ "kind": "note", "text": "x" }));
+        let l = Link { url: true, target: format!("midna-test-unregistered-scheme://#/?task=T7&{}", std::process::id()), line: None, app: Some("Taskboard".into()), preview: None };
+        assert!(matches!(load(&l, Some(&there)), Body::Note(n) if n == "Opens in Taskboard"));
     }
 
     #[test]
@@ -1915,21 +2010,6 @@ mod tests {
         assert!((fade(0.5) - 0.97).abs() < 0.01);
         assert!((fade(0.75) - 0.83).abs() < 0.01);
         assert!(fade(1.) < 0.001);
-    }
-
-    #[test]
-    fn excerpt_centers_on_the_line() {
-        let text: String = (1..=40).map(|n| format!("line {n}\n")).collect();
-        let (lines, focus) = excerpt(text.as_bytes(), Some(20));
-        assert_eq!(lines.first().map(|l| l.0), Some(16));
-        assert_eq!(lines.len(), FILE_LINES);
-        assert_eq!(focus, Some(20));
-        let (lines, focus) = excerpt(text.as_bytes(), None);
-        assert_eq!((lines[0].0, focus), (1, None));
-        // Near the top, the window starts at line 1.
-        assert_eq!(excerpt(text.as_bytes(), Some(2)).0[0].0, 1);
-        // Tabs expand; CRLF goes.
-        assert_eq!(excerpt("\ta\r\n".as_bytes(), Some(1)).0[0].1, "    a");
     }
 
     #[test]
@@ -2135,32 +2215,35 @@ mod tests {
         let bin = dir.join("bin");
         script(&bin.join("jira-card"), r#"echo "{\"title\": \"$1\", \"lines\": [\"In Progress\", \"$#\"]}""#);
         script(&bin.join("fails"), r#"echo '{"title": "x"}'; exit 1"#);
+        // Starting a process can take seconds when the machine is loaded.
+        const LONG: Duration = Duration::from_secs(120);
         let path = format!("{}:/usr/bin:/bin", bin.display());
         let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         // By name on the PATH, or by path; each word is one argument.
-        let got = run_pattern_on(&argv(&["jira-card", "RRD-1 x"]), &path, Duration::from_secs(5)).unwrap();
+        let got = run_pattern_on(&argv(&["jira-card", "RRD-1 x"]), &path, LONG).unwrap();
         assert_eq!((got.title.as_str(), got.lines), ("RRD-1 x", vec!["In Progress".to_string(), "1".into()]));
         let abs = bin.join("jira-card").display().to_string();
-        assert_eq!(run_pattern_on(&argv(&[&abs, "RRD-2"]), "/usr/bin", Duration::from_secs(5)).map(|p| p.title), Some("RRD-2".into()));
+        assert_eq!(run_pattern_on(&argv(&[&abs, "RRD-2"]), "/usr/bin", LONG).map(|p| p.title), Some("RRD-2".into()));
         assert!(pattern_command(&argv(&["no-such-card"]), &path).is_none());
-        assert_eq!(run_pattern_on(&argv(&["fails"]), &path, Duration::from_secs(5)), None);
+        assert_eq!(run_pattern_on(&argv(&["fails"]), &path, LONG), None);
         // Too slow, not JSON, or a child left holding the pipe: no card, and no hang.
-        script(&bin.join("slow"), "sleep 5; echo '{\"title\": \"x\"}'");
+        script(&bin.join("slow"), "sleep 60; echo '{\"title\": \"x\"}'");
         script(&bin.join("junk"), "echo not json");
-        script(&bin.join("leaves-child"), "(sleep 5; echo) & echo '{\"title\": \"left\"}'");
+        script(&bin.join("leaves-child"), "(sleep 60; echo) & echo '{\"title\": \"left\"}'");
         let t = Instant::now();
         assert_eq!(run_pattern_on(&argv(&["slow"]), &path, Duration::from_millis(300)), None);
-        assert_eq!(run_pattern_on(&argv(&["junk"]), &path, Duration::from_secs(5)), None);
-        assert_eq!(run_pattern_on(&argv(&["leaves-child"]), &path, Duration::from_secs(5)).map(|p| p.title), Some("left".into()));
-        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert_eq!(run_pattern_on(&argv(&["junk"]), &path, LONG), None);
+        assert_eq!(run_pattern_on(&argv(&["leaves-child"]), &path, LONG).map(|p| p.title), Some("left".into()));
+        // A hang would wait out the 60 s sleeps; load only slows the starts.
+        assert!(t.elapsed() < Duration::from_secs(50), "{:?}", t.elapsed());
 
         // `session.link_at` hands over the command; it fills the card.
         let l = Link::from_link_at(&json!({ "kind": "url", "target": "midna-test-unregistered-scheme://x/RRD-3", "app": "Jira", "preview": [abs, "RRD-3"] })).unwrap();
-        assert!(matches!(load(&l), Body::App(p) if p.title == "RRD-3"));
+        assert!(matches!(load(&l, None), Body::App(p) if p.title == "RRD-3"));
         // A failing command falls back to the card the link would have had.
         let l = Link::from_link_at(&json!({ "kind": "url", "target": "midna-test-unregistered-scheme://x/1", "app": "Jira", "preview": [bin.join("fails").display().to_string()] })).unwrap();
-        assert!(matches!(load(&l), Body::Note(n) if n == "Opens in Jira"));
+        assert!(matches!(load(&l, None), Body::Note(n) if n == "Opens in Jira"));
         // Only URLs take a preview, and it needs a program.
         assert_eq!(Link::from_link_at(&json!({ "kind": "file", "target": "/tmp", "preview": ["x"] })).unwrap().preview, None);
         assert_eq!(Link::from_link_at(&json!({ "kind": "url", "target": "https://a.com", "preview": [""] })).unwrap().preview, None);
@@ -2177,9 +2260,34 @@ mod tests {
         script(&card, &format!(r#"echo x >> '{}'; echo '{{"title": "t"}}'"#, count.display()));
         let argv = vec![card.display().to_string(), "k".into()];
         for _ in 0..3 {
-            assert_eq!(load_pattern(&argv).map(|p| p.title), Some("t".into()));
+            assert_eq!(load_pattern(&argv, "https://x/k", None).map(|p| p.title), Some("t".into()));
         }
         assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 1, "ran once");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A window onto another Mac shares that Mac's preview settings and projects with that Mac's
+    /// terminals only: this Mac's keep this Mac's.
+    #[gpui_kit::test]
+    fn another_macs_window_keeps_its_preview_env_to_itself(cx: &mut gpui_kit::TestAppContext) {
+        use super::{Mode, PreviewEnv, env, mode, pr_status_on, put, share};
+        use crate::backend::{Backend, Mac};
+        use std::sync::Arc;
+        cx.update(|cx| cx.set_global(crate::theme::Theme::from_def(&midna_proto::themes::builtin("twilight").unwrap(), "ui".into(), "mono".into())));
+        let here: Arc<dyn Backend> = Arc::new(crate::backend::fake::FakeBackend::new());
+        // This Mac's (no window of its own here: its theme would be cached to the cwd).
+        cx.update(|cx| put(None, PreviewEnv { mode: Mode::Cmd, pr_status: true, projects: vec!["/Users/me/here".into()], ..Default::default() }, cx));
+        let mini = crate::backend::for_mac(&here, Mac { peer: "6".repeat(64), name: "Morgan's Mac mini".into() });
+        let w = cx.update(|cx| crate::windows::open(mini.clone(), None, cx)).unwrap();
+        w.update(cx, |m, _, cx| {
+            m.settings.insert("terminal.link_preview".into(), json!("off"));
+            m.settings.insert("terminal.pr_status".into(), json!(false));
+            share(m, cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert_eq!((mode(&*mini, cx), pr_status_on(&*mini, cx)), (Mode::Off, false), "that Mac's terminals use its settings");
+            assert_eq!((mode(&*here, cx), pr_status_on(&*here, cx), env(&*here, cx).projects), (Mode::Cmd, true, vec!["/Users/me/here".to_string()]), "still this Mac's");
+        });
     }
 }

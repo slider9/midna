@@ -227,6 +227,8 @@ mod win {
         // An interactive one is adopted in cmd too.
         let sid = d.cmd(&mut h, "claude hi");
         wait_for(15, "adopted", || call(&mut h, "session.get", json!({ "id": sid }))["adopted"]["pid"].as_i64());
+        // The shim reports the adoption before the fake claude logs its launch.
+        wait_for(15, "launched", || (d.launches().len() == 2).then_some(()));
         assert!(d.launches()[1].ends_with(" hi"), "{:?}", d.launches());
         std::fs::write(d.fake.join("quit"), "").unwrap();
         wait_for(15, "released", || call(&mut h, "session.get", json!({ "id": sid }))["adopted"].is_null().then_some(()));

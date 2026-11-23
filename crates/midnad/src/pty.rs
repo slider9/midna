@@ -2,7 +2,7 @@
 //! with a `pre_exec` that makes the slave the controlling terminal of a new session. Windows
 //! uses a pseudoconsole instead (`pty_windows.rs`), behind the same [`Master`] / [`Spawned`] API.
 #[cfg(unix)]
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(unix)]
@@ -51,6 +51,10 @@ pub(crate) const ENV_SCRUB: &[&str] = &[
     "CODEX_THREAD_ID",
     "CODEX_SANDBOX",
     "CODEX_SANDBOX_NETWORK_DISABLED",
+    // Set only on what a trigger starts; inherited by midnad, they'd mute every terminal's
+    // stream publishes.
+    "MIDNA_TRIGGER",
+    "MIDNA_DELIVERY",
     "SAGGAR",
     "SAGGAR_SESSION",
     "SAGGAR_CLI_DIR",
@@ -150,8 +154,33 @@ fn set_cloexec(fd: RawFd) {
     }
 }
 
+/// Waits between tries when the daemon is out of file handles: handles that are closing (a
+/// terminal ending, a CLI call finishing) free up in that time.
+#[cfg(unix)]
+const EXHAUSTED_RETRIES: [Duration; 3] = [Duration::from_millis(100), Duration::from_millis(300), Duration::from_millis(1000)];
+
+/// Start `argv` on a new PTY. Out of file handles (EMFILE/ENFILE), it tries again a few times,
+/// then says so in the error rather than a bare "Too many open files".
 #[cfg(unix)]
 pub fn spawn(argv: &[String], cwd: &str, env: &[(String, String)], cols: u16, rows: u16) -> std::io::Result<Spawned> {
+    let mut waits = EXHAUSTED_RETRIES.iter();
+    loop {
+        match spawn_once(argv, cwd, env, cols, rows) {
+            Err(e) if crate::fd_limit::exhausted(&e) => match waits.next() {
+                Some(w) => std::thread::sleep(*w),
+                None => {
+                    let e = crate::fd_limit::explain(e);
+                    eprintln!("midnad: could not start {}: {e}", argv.first().map_or("", String::as_str));
+                    return Err(e);
+                }
+            },
+            r => return r,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn spawn_once(argv: &[String], cwd: &str, env: &[(String, String)], cols: u16, rows: u16) -> std::io::Result<Spawned> {
     let Some((prog, args)) = argv.split_first() else {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"));
     };
@@ -163,6 +192,9 @@ pub fn spawn(argv: &[String], cwd: &str, env: &[(String, String)], cols: u16, ro
     }
     set_cloexec(m);
     set_cloexec(s);
+    // Owned until the child is running, so every early return (a failed dup when out of handles)
+    // closes both ends.
+    let master = unsafe { OwnedFd::from_raw_fd(m) };
     // Command dup2s these onto 0/1/2 (dup2 clears CLOEXEC on the copies).
     let slave = unsafe { OwnedFd::from_raw_fd(s) };
     let mut cmd = Command::new(prog);
@@ -188,15 +220,10 @@ pub fn spawn(argv: &[String], cwd: &str, env: &[(String, String)], cols: u16, ro
             Ok(())
         });
     }
-    match cmd.spawn() {
-        // The reaper waits on the pid (not the Child), so adopted sessions after an upgrade
-        // work the same way. Dropping a Child neither waits nor kills.
-        Ok(child) => Ok(Spawned { master: Master(m), pid: child.id() as i32 }),
-        Err(e) => {
-            unsafe { libc::close(m) };
-            Err(e)
-        }
-    }
+    let child = cmd.spawn()?;
+    // The reaper waits on the pid (not the Child), so adopted sessions after an upgrade work the
+    // same way. Dropping a Child neither waits nor kills.
+    Ok(Spawned { master: Master(master.into_raw_fd()), pid: child.id() as i32 })
 }
 
 #[cfg(unix)]

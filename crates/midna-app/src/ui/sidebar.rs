@@ -139,7 +139,7 @@ impl SidebarView {
 impl Render for SidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let anim = self.anim;
-        let t = cx.global::<Theme>().clone();
+        let t = crate::theme::of(window, cx).clone();
         self.main.update(cx, |m, cx| render(m, &t, anim, window, cx)).unwrap_or_else(|_| div().into_any_element())
     }
 }
@@ -189,12 +189,14 @@ fn drag_out_move(m: &mut MainWindow, ev: &DragMoveEvent<DraggedRow>, window: &mu
     let pos = ev.event.position;
     m.drag_out = Some((drag_ids(m, &dragged), pos));
     let bounds = window.bounds();
-    let over = crate::windows::window_at(bounds.origin + pos, m.id, bounds, cx).filter(|w| *w != m.id);
+    // Another Mac's window isn't a place to drop: a terminal stays on its Mac.
+    let over = crate::windows::window_at(bounds.origin + pos, m.id, bounds, cx).filter(|w| *w != m.id && crate::windows::same_mac(m.id, *w, cx));
     crate::windows::set_drop_hint(over, cx);
 }
 
-/// Released: over another main window, the rows move there; outside every window, they get
-/// a new one under the cursor. Inside this window the drag was a reorder (already done).
+/// Released: over another main window of the same Mac, the rows move there; outside every
+/// window, they get a new one under the cursor (the same Mac's). Over another Mac's window the
+/// drop is refused. Inside this window the drag was a reorder (already done).
 fn drag_out_end(m: &mut MainWindow, pos: Point<Pixels>, window: &mut Window, cx: &mut Context<MainWindow>) {
     let Some((ids, _)) = m.drag_out.take() else { return };
     crate::windows::set_drop_hint(None, cx);
@@ -207,18 +209,24 @@ fn drag_out_end(m: &mut MainWindow, pos: Point<Pixels>, window: &mut Window, cx:
     if target == Some(m.id) {
         return;
     }
+    if target.is_some_and(|t| !crate::windows::same_mac(m.id, t, cx)) {
+        return m.toast(REFUSE_OTHER_MAC.to_string(), cx);
+    }
     m.hand_off(&ids, window, cx);
-    let backend = m.backend.clone();
+    let (backend, from) = (m.backend.clone(), m.id);
     cx.defer(move |cx| {
         let target = target.or_else(|| {
             let at = Bounds::new(screen - point(px(80.), px(20.)), bounds.size);
             crate::windows::open(backend, Some(at), cx).and_then(|h| crate::windows::id_of(h, cx))
         });
         if let Some(t) = target {
-            crate::windows::give(ids, t, cx);
+            crate::windows::give(ids, from, t, cx);
         }
     });
 }
+
+/// A row dropped on another Mac's window: it stays where it is.
+pub const REFUSE_OTHER_MAC: &str = "A terminal stays on its Mac: it can't move to another Mac's window";
 
 /// `sb_anim`: ⌘B collapsing or expanding it: each line's text wipes back toward its status dot
 /// (the top line first), or writes itself back in, clipped without reflowing.
@@ -236,7 +244,9 @@ fn full(m: &MainWindow, t: &Theme, sb_anim: Option<Frame>, window: &mut Window, 
     };
     let mut line = 1;
 
-    let top = wipe(0, 0., titlebar_strip().flex().items_center().justify_end().pr(px(8.)).child(collapse_button(t, false)).into_any_element());
+    // Clear of the traffic lights on the left.
+    let top = titlebar_strip().flex().items_center().justify_end().gap(px(4.)).pl(px(78.)).pr(px(8.));
+    let top = wipe(0, 0., top.children(m.shown_name().map(|n| super::mac_switcher::plate(m, n, t, cx))).child(collapse_button(t, false)).into_any_element());
 
     if m.need_anim.moving() || m.close_anim.moving() || m.row_close.moving() {
         window.request_animation_frame();
@@ -281,10 +291,19 @@ fn full(m: &MainWindow, t: &Theme, sb_anim: Option<Frame>, window: &mut Window, 
         .flex_col()
         .flex_1()
         .min_h_0()
-        .py(px(4.))
+        .py(px(LIST_PAD))
         .overflow_y_scroll()
+        .track_scroll(&m.sidebar_scroll)
         .on_scroll_wheel(cx.listener(|m, _, _, cx| crate::ui::fold_peek::close(m, cx)));
+    // Another Mac's link down: its rows stay, greyed, as of when it dropped (`link_down`).
+    let stale = m.remote_down();
+    if let Some(down) = stale {
+        let label = crate::ui::link_down::stale_label(down, &crate::ui::link_down::when(m)).to_uppercase();
+        list = list.child(div().mt(px(8.)).mx(px(10.)).px(px(4.)).text_size(px(11.)).font_weight(FontWeight::BOLD).text_color(t.dim).child(label));
+    }
     let split_focused = crate::ui::split::focused(m, window, cx);
+    let gap = if compact { 2. } else { 8. };
+    let mut far = Far::new(m, gap, sb_anim.is_some() || cx.has_active_drag());
     for (gi, g) in m.groups().into_iter().enumerate() {
         let pid = g.project.map(|p| p.id.clone());
         let n = m.needs_in_project(pid.as_deref());
@@ -303,8 +322,19 @@ fn full(m: &MainWindow, t: &Theme, sb_anim: Option<Frame>, window: &mut Window, 
         let n_rows = g.sessions.iter().filter(|s| m.selected.as_deref() != Some(&s.id)).count();
         let anim = pid.as_ref().and_then(|p| m.fold_anim.get(p)).map(|at| at.elapsed());
         let lift = anim.filter(|_| collapsed).map_or(0., |_| crate::ui::badge::cascade_len(n_rows, true).as_secs_f32() * 1000.);
+        let folding = anim.is_some_and(|e| e.as_secs_f32() * 1000. < (lift + FOLD_MS).max(crate::ui::badge::cascade_len(n_rows, false).as_secs_f32() * 1000.));
+        let key = pid.clone().unwrap_or_else(|| "root".into());
+        let keep = folding
+            || menu_open
+            || new_menu_open
+            || g.sessions.iter().any(|s| m.selected.as_deref() == Some(&s.id) || m.renaming.as_ref().is_some_and(|r| r.session == s.id))
+            || m.fold_shown.borrow().contains_key(&key);
+        if let Some(h) = far.skip(m, &key, keep) {
+            list = list.child(div().flex_none().h(px(h)));
+            continue;
+        }
         let (fold, turn) = match anim {
-            Some(e) if e.as_secs_f32() * 1000. < (lift + FOLD_MS).max(crate::ui::badge::cascade_len(n_rows, false).as_secs_f32() * 1000.) => {
+            Some(e) if folding => {
                 window.request_animation_frame();
                 let ms = e.as_secs_f32() * 1000.;
                 if collapsed { (ease((ms - lift).max(0.)), ease(ms)) } else { (1. - ease(ms), 1. - ease(ms)) }
@@ -342,7 +372,7 @@ fn full(m: &MainWindow, t: &Theme, sb_anim: Option<Frame>, window: &mut Window, 
             .child(caps_label(t, &g.name).min_w_0().truncate())
             .when(pinned, |d| d.child(Icon::PushPin.el(11., t.dim)))
             .child(div().flex_1())
-            .when(n > 0, |d| {
+            .when(n > 0 && stale.is_none(), |d| {
                 d.child(
                     div()
                         .min_w(px(18.))
@@ -384,7 +414,10 @@ fn full(m: &MainWindow, t: &Theme, sb_anim: Option<Frame>, window: &mut Window, 
                         // New terminal opens in the current project, so its keys belong on this menu only there
                         let keys = (m.current_project_id() == pid).then(|| m.key_label("keys.new_terminal")).filter(|k| !k.is_empty());
                         let summary = pid.as_deref().map(|p| (m.summary.records(p).next().is_some(), m.key_label("keys.project_summary")));
-                        d.child(project_menu(t, pid.clone(), pinned, keys, summary, cx))
+                        // Ask an agent on a nearby Mac: from the selected terminal here, else the newest running one.
+                        let running = g.sessions.iter().filter(|s| s.status.state != crate::model::StatusState::Exited);
+                        let ask = running.clone().find(|s| m.selected.as_deref() == Some(&s.id)).or_else(|| running.max_by(|a, b| a.created_at.cmp(&b.created_at))).map(|s| s.id.clone());
+                        d.child(project_menu(t, pid.clone(), pinned, keys, summary, ask, cx))
                     }),
             );
         let header = wipe(line, 0., header.into_any_element());
@@ -398,30 +431,9 @@ fn full(m: &MainWindow, t: &Theme, sb_anim: Option<Frame>, window: &mut Window, 
             crate::ui::fold_peek::forget(m, p);
         }
         line += usize::from(g.project.is_some());
-        // Its Summary just closed: the row folds away, or the whole group does.
+        // Its last terminal just closed (unpinned): the whole group folds away. Its Summary row
+        // is in the Summaries section (`ui::shelf`), never here.
         let summary_leave = pid.as_deref().and_then(|p| m.close_anim.summary_leaving(p));
-        let summary_row = pid.as_deref().filter(|_| fold < 1.).and_then(|p| {
-            let row = |cx: &mut Context<MainWindow>| measured(m, &crate::ui::close_anim::summary_key(p), crate::ui::summary::sidebar_row(m, t, p, compact, cx));
-            let el = match summary_leave {
-                // In a project left with no terminals it unfolds with the ghost row (below).
-                _ if crate::ui::summary::row_wanted(m, p, empty) => match m.close_anim.arrival(&crate::ui::close_anim::summary_key(p)).filter(|_| !empty) {
-                    Some(a) => arrive(a, row(cx)),
-                    None => row(cx),
-                },
-                Some(l) if l.whole && l.row => row(cx),
-                // Its last terminal closed and it keeps no row: the group folds away without one.
-                Some(l) if l.whole => return None,
-                Some(l) => fold_away(m, l, t, row(cx)),
-                None => return None,
-            };
-            // Its room folds with the group's (as the rows' runs do), its content fading.
-            let el = div().flex_none().opacity(1. - fold).child(el).into_any_element();
-            let el = fold_run(vec![el], format!("{p}/summary"), fold, m)?;
-            let el = wipe(line, 26., el.into_any_element());
-            line += 1;
-            Some(el)
-        });
-        let (summary_top, summary_end) = if empty { (summary_row, None) } else { (None, summary_row) };
         // Folded, the ghost row goes with the fold (as the rows do).
         // A project folding away whole with its last terminal leaves without one.
         let going = summary_leave.is_some_and(|l| l.whole && !l.row);
@@ -432,17 +444,16 @@ fn full(m: &MainWindow, t: &Theme, sb_anim: Option<Frame>, window: &mut Window, 
             line += 1;
             el
         });
-        // Its last terminal just closed: the Summary row and the ghost row unfold together once
-        // the closed row has folded away (`close_anim::start`).
-        let top: Vec<AnyElement> = match pid.as_deref().filter(|_| empty).and_then(|p| m.close_anim.arrival(&crate::ui::close_anim::summary_key(p))) {
-            Some(a) => vec![arrive(a, div().flex().flex_col().children(summary_top).children(new_row).into_any_element())],
-            None => summary_top.into_iter().chain(new_row).collect(),
+        // Its last terminal just closed: the ghost row unfolds once the closed row has folded
+        // away (`close_anim::start`).
+        let top: Option<AnyElement> = match pid.as_deref().filter(|_| empty).and_then(|p| m.close_anim.arrival(&crate::ui::close_anim::summary_key(p))) {
+            Some(a) => new_row.map(|r| arrive(a, r)),
+            None => new_row,
         };
         // Root terminals belong to no project: no heading, just rows.
-        let mut group = div().flex().flex_col().mb(px(if compact { 2. } else { 8. })).when(g.project.is_some(), |d| d.child(header)).children(fold_bar).children(top).when(g.project.is_none(), |d| d.pt(px(4.)));
+        let mut group = div().flex().flex_col().mb(px(gap)).when(g.project.is_some(), |d| d.child(header)).children(fold_bar).children(top).when(g.project.is_none(), |d| d.pt(px(4.)));
         // A folded group keeps only the selected terminal, so the open one never disappears:
         // the rows around it fold as separate runs.
-        let key = pid.clone().unwrap_or_else(|| "root".into());
         let (mut run, mut ri, mut k) = (vec![], 0, 0);
         // Closed rows folding away sit where they were (only while the group isn't folding).
         let ghosts = |next: Option<&str>, cx: &mut Context<MainWindow>| -> Vec<AnyElement> {
@@ -482,9 +493,9 @@ fn full(m: &MainWindow, t: &Theme, sb_anim: Option<Frame>, window: &mut Window, 
             }
         }
         run.extend(ghosts(None, cx));
-        group = group.children(fold_run(run, format!("{key}/{ri}"), fold, m)).children(summary_end);
+        group = group.children(fold_run(run, format!("{key}/{ri}"), fold, m));
         // A project that just turned up (an agent opened its first terminal) unfolds whole, and
-        // one that went with its Summary row folds away whole.
+        // one whose last terminal closed folds away whole.
         let group = measured(m, &crate::ui::close_anim::group_key(&key), group.into_any_element());
         list = list.child(match (m.close_anim.arrival(&key), summary_leave.filter(|l| l.whole)) {
             (Some(a), _) => arrive(a, group),
@@ -492,7 +503,14 @@ fn full(m: &MainWindow, t: &Theme, sb_anim: Option<Frame>, window: &mut Window, 
             _ => group,
         });
     }
-    if m.sessions.is_empty() && m.conn == crate::backend::ConnState::Connected {
+    // Projects with no terminals that keep their Summary: one section at the end (`ui::shelf`).
+    if let Some(shelf) = crate::ui::shelf::section(m, t, compact, window, cx) {
+        list = list.child(wipe(line, 0., shelf));
+    }
+    // Another Mac's window before its first list: placeholder rows (design 3 Connecting).
+    if m.remote_loading() {
+        list = list.child(placeholder_rows(t));
+    } else if m.sessions.is_empty() && m.conn == crate::backend::ConnState::Connected {
         list = list
             .child(div().px(px(10.)).pt(px(8.)).child(open_project_button(m, t, "sidebar-open-project", cx)))
             .child(div().px(px(14.)).py(px(10.)).text_size(px(12.)).text_color(t.dim).child(format!("Or {} for a terminal at root.", m.key_label("keys.new_terminal"))));
@@ -513,11 +531,61 @@ fn full(m: &MainWindow, t: &Theme, sb_anim: Option<Frame>, window: &mut Window, 
         .on_mouse_move(cx.listener(|m, ev: &MouseMoveEvent, _, cx| crate::ui::fold_peek::moved(m, ev.position, cx)))
         .children(crate::ui::fold_peek::card(m, t, window, cx))
         .child(top)
-        .when(btn_look.shown, |d| d.child(need_btn))
-        .child(list)
+        .when(btn_look.shown && !m.remote_loading() && stale.is_none(), |d| d.child(need_btn))
+        .child(div().relative().flex().flex_col().flex_1().min_h_0().child(list).children(crate::ui::shelf::stuck(m, t, cx)))
         .children(background.map(|b| wipe(line, 0., b.into_any_element())))
         .child(wipe(line, 0., footer.into_any_element()))
         .into_any_element()
+}
+
+/// Grey bars where another Mac's rows go until its list arrives: a heading, two rows, a gap,
+/// another heading and a row.
+fn placeholder_rows(t: &Theme) -> Div {
+    let bar = |w: f32, gap: f32| div().h(px(10.)).w(relative(w)).mt(px(gap)).rounded(px(5.)).bg(t.line);
+    div().flex().flex_col().gap(px(10.)).px(px(14.)).py(px(12.)).children([bar(0.4, 0.), bar(0.75, 0.), bar(0.6, 0.), bar(0.35, 10.), bar(0.7, 0.)])
+}
+
+/// The project list's padding above its first group and below its last.
+const LIST_PAD: f32 = 4.;
+
+/// Which groups the project list lays out: those within a screen of the part that shows. GPUI
+/// lays out the whole list on every scroll tick, which made a long one stutter, so a group further
+/// away keeps its room as blank space of its last measured height (`CloseAnim::rows`). Every
+/// group is laid out while anything in the sidebar moves, and on the first frames, before the
+/// list and its groups have been measured.
+struct Far {
+    /// The next group's top, from the top of the list's content.
+    top: f32,
+    /// The part of the content laid out: the visible part and a screen either side.
+    from: f32,
+    to: f32,
+    /// The room under each group.
+    gap: f32,
+    on: bool,
+}
+
+impl Far {
+    fn new(m: &MainWindow, gap: f32, busy: bool) -> Self {
+        let view = f32::from(m.sidebar_scroll.bounds().size.height);
+        let at = -f32::from(m.sidebar_scroll.offset().y);
+        let moving = m.close_anim.moving() || m.row_close.moving() || m.need_anim.moving();
+        Far { top: LIST_PAD, from: at - view, to: at + 2. * view, gap, on: view > 0. && !busy && !moving }
+    }
+
+    /// The room the group `key` takes when it's left out (`keep`: never), and steps past it.
+    fn skip(&mut self, m: &MainWindow, key: &str, keep: bool) -> Option<f32> {
+        if !self.on {
+            return None;
+        }
+        // An unmeasured group puts every group below it at an unknown height.
+        let Some(h) = m.close_anim.rows.borrow().get(&crate::ui::close_anim::group_key(key)).map(|r| r.1 + self.gap) else {
+            self.on = false;
+            return None;
+        };
+        let top = self.top;
+        self.top += h;
+        (!keep && (top + h < self.from || top > self.to)).then_some(h)
+    }
 }
 
 /// Key of the Background group in `fold_anim` / `fold_heights` (project ids start with `p_`).
@@ -643,6 +711,7 @@ fn titlebar_strip() -> Stateful<Div> {
     })
 }
 
+/// The Mac this window shows, at the top of the sidebar (see `MainWindow::shown_name`).
 fn collapse_button(t: &Theme, collapsed: bool) -> Stateful<Div> {
     div()
         .id("sidebar-toggle")
@@ -733,7 +802,7 @@ fn rail(m: &MainWindow, t: &Theme, anim: Option<Frame>, cx: &mut Context<MainWin
         .border_color(t.line)
         .child(titlebar_strip())
         .child(div().flex().justify_center().pb(px(6.)).child(collapse_button(t, true)))
-        .when(need_n > 0, |d| {
+        .when(need_n > 0 && m.remote_down().is_none(), |d| {
             d.child(
                 div().flex().justify_center().pb(px(6.)).child(
                     div()
@@ -822,7 +891,7 @@ fn click_marks(m: &mut MainWindow, id: &str, ev: &ClickEvent, w: &mut Window, cx
 
 /// A run of rows under a group heading, clipped to `1 - fold` of its natural height (measured
 /// every prepaint, so a fold starts from the real height). Gone once fully folded.
-fn fold_run(rows: Vec<AnyElement>, key: String, fold: f32, m: &MainWindow) -> Option<Div> {
+pub(crate) fn fold_run(rows: Vec<AnyElement>, key: String, fold: f32, m: &MainWindow) -> Option<Div> {
     if rows.is_empty() || fold >= 1. {
         return None;
     }
@@ -874,6 +943,20 @@ fn drag_over(m: &mut MainWindow, dragged: &str, target: &str, y: Pixels, bounds:
 /// Each terminal row's hover group: its ✕ shows while the pointer is on the row.
 const ROW_GROUP: &str = "sidebar-row";
 
+/// A needs-you or failed row's second line. The terminal's status reason only says why it
+/// needs you when that status is what the row shows: an item raised on a busy terminal (the
+/// memory alert on the terminal using the most) leaves it Working with a hook's reason
+/// ("prompt", "tool Bash"), so the item's title goes there instead.
+fn attention_text(status: &Status, state: StatusState, need_title: Option<&str>) -> String {
+    status
+        .reason
+        .clone()
+        .filter(|r| !r.is_empty() && status.state == state)
+        .or_else(|| need_title.map(str::to_string).filter(|_| state == StatusState::NeedsYou))
+        .or_else(|| status.exit_code.map(|c| format!("exit {c}")))
+        .unwrap_or_else(|| if status.state == StatusState::Failed { "failed".into() } else { "needs you".into() })
+}
+
 fn row(m: &MainWindow, s: &Session, group: &str, t: &Theme, compact: bool, cx: &mut Context<MainWindow>) -> impl IntoElement + use<> {
     let selected = m.selected.as_deref() == Some(&s.id);
     // Part of a multi-selection but not the terminal on screen.
@@ -885,29 +968,24 @@ fn row(m: &MainWindow, s: &Session, group: &str, t: &Theme, compact: bool, cx: &
     let custom = super::status_label(m, s);
     // A trigger's custom status (or a ui.status.looks label) replaces the built-in second
     // line: its label in its color.
+    // Another Mac's link down: no ages ("· 3m"), they'd count from a state that's gone stale.
+    let stale = m.remote_down().is_some();
     let custom_line = custom.as_ref().filter(|_| !compact).map(|c| {
-        let since = c.since.as_deref().map(since_short).unwrap_or_default();
+        let since = c.since.as_deref().filter(|_| !stale).map(since_short).unwrap_or_default();
         let mut text = if since.is_empty() { c.label.clone() } else { format!("{} · {since}", c.label) };
         // paused · 3m · 34 processes held
         if let Some(held) = c.detail.as_ref().filter(|_| s.paused.is_some()) {
             text = format!("{text} · {held}");
         }
-        (text, t.status_color(&c.color))
+        (text, if stale { t.dim } else { t.status_color(&c.color) })
     });
     let custom_icon = custom.as_ref().and_then(|c| c.icon.as_deref()).and_then(Icon::from_name);
     let line2 = custom_line.or_else(|| (!compact && attention).then(|| {
         let need = m.need_for_session(&s.id);
-        let text = s
-            .status
-            .reason
-            .clone()
-            .filter(|r| !r.is_empty())
-            .or_else(|| need.map(|n| n.title.clone()).filter(|_| state == StatusState::NeedsYou))
-            .or_else(|| s.status.exit_code.map(|c| format!("exit {c}")))
-            .unwrap_or_else(|| if s.status.state == StatusState::Failed { "failed".into() } else { "needs you".into() });
+        let text = attention_text(&s.status, state, need.map(|n| n.title.as_str()));
         let since = need.filter(|_| state == StatusState::NeedsYou).map(|n| since_short(&n.created_at)).or_else(|| s.status.since.as_deref().map(since_short)).unwrap_or_default();
-        let text = if since.is_empty() { text } else { format!("{text} · {since}") };
-        (text, if state == StatusState::Failed { t.err } else { t.need })
+        let text = if since.is_empty() || stale { text } else { format!("{text} · {since}") };
+        (text, if stale { t.dim } else if state == StatusState::Failed { t.err } else { t.need })
     }));
     let look = m.need_anim.row(&s.id, state == StatusState::NeedsYou);
     // Handled: the reason line says what you did while it folds away.
@@ -971,7 +1049,10 @@ fn row(m: &MainWindow, s: &Session, group: &str, t: &Theme, compact: bool, cx: &
                 .flex()
                 .items_center()
                 .gap(px(9.))
-                .child(div().w(px(12.)).flex_none().flex().items_center().child(super::terminal_dot(m, t, s, 8.)))
+                .child(div().w(px(12.)).flex_none().flex().items_center().child(match stale {
+                    true => div().size(px(8.)).flex_none().rounded_full().bg(t.dim),
+                    false => super::terminal_dot(m, t, s, 8.),
+                }))
                 .child(
                     div()
                         .flex()
@@ -1090,7 +1171,7 @@ fn ghost(m: &MainWindow, g: &crate::ui::close_anim::Ghost, t: &Theme, compact: b
 /// (`ui::close_anim::summary`): like a closed row's ghost, its content lifts and fades while
 /// its room closes. The highlight leaving the row for one further down is drawn here, so the
 /// rows below draw over it. It takes no clicks.
-fn fold_away(m: &MainWindow, l: &crate::ui::close_anim::SummaryLeave, t: &Theme, el: AnyElement) -> AnyElement {
+pub(crate) fn fold_away(m: &MainWindow, l: &crate::ui::close_anim::SummaryLeave, t: &Theme, el: AnyElement) -> AnyElement {
     let (fold, lift) = l.progress();
     let full = l.height();
     let measure = l.measure();
@@ -1118,7 +1199,7 @@ fn fold_away(m: &MainWindow, l: &crate::ui::close_anim::SummaryLeave, t: &Theme,
 
 /// `el`, a row, noting where it's laid out (`CloseAnim::rows`): ⌥⌘↑ / ⌥⌘↓ glide the highlight
 /// between rows from there.
-fn measured(m: &MainWindow, id: &str, el: AnyElement) -> AnyElement {
+pub(crate) fn measured(m: &MainWindow, id: &str, el: AnyElement) -> AnyElement {
     let (rows, id) = (m.close_anim.rows.clone(), id.to_string());
     div()
         .flex()
@@ -1158,7 +1239,7 @@ fn unfold(o: &crate::ui::close_anim::Opening, el: AnyElement, t: &Theme) -> AnyE
 
 /// A row or project group that turned up on its own (`ui::close_anim::arrive`): it unfolds
 /// like a row just opened, with no highlight (the selection stays where it was).
-fn arrive(a: &crate::ui::close_anim::Arrival, el: AnyElement) -> AnyElement {
+pub(crate) fn arrive(a: &crate::ui::close_anim::Arrival, el: AnyElement) -> AnyElement {
     grow_in(a.progress(), a.height(), a.measure(), el).into_any_element()
 }
 
@@ -1337,7 +1418,17 @@ fn new_menu(t: &Theme, pid: Option<String>, cx: &mut Context<MainWindow>) -> imp
 }
 
 /// `summary`: whether the project's Summary has records, and its shortcut's keys (root has none).
-fn project_menu(t: &Theme, pid: Option<String>, pinned: bool, terminal_keys: Option<String>, summary: Option<(bool, String)>, cx: &mut Context<MainWindow>) -> impl IntoElement + use<> {
+/// `ask`: a terminal of the project to start an agent on a nearby Mac from.
+#[allow(clippy::too_many_arguments)]
+fn project_menu(
+    t: &Theme,
+    pid: Option<String>,
+    pinned: bool,
+    terminal_keys: Option<String>,
+    summary: Option<(bool, String)>,
+    ask: Option<String>,
+    cx: &mut Context<MainWindow>,
+) -> impl IntoElement + use<> {
     let p1 = pid.clone();
     let p2 = pid.clone();
     let p3 = pid.clone();
@@ -1372,6 +1463,17 @@ fn project_menu(t: &Theme, pid: Option<String>, pinned: bool, terminal_keys: Opt
                         cx.notify();
                     }),
                 ))
+                .when_some(ask, |d, sid| {
+                    let tab = sid.clone();
+                    d.child(menu_item(t, "ask-nearby", "Ask an agent on a nearby Mac…", "", cx.listener(move |m, _, w, cx| {
+                        m.menu = Menu::None;
+                        crate::ui::share::open_agent_start(m, Some(sid.clone()), w, cx);
+                    })))
+                    .child(menu_item(t, "send-tab-nearby", "Send tab to a nearby Mac…", "", cx.listener(move |m, _, w, cx| {
+                        m.menu = Menu::None;
+                        crate::ui::share::open_tab(m, Some(tab.clone()), w, cx);
+                    })))
+                })
                 .when_some(summary, |d, (any, keys)| {
                     d.child(
                         menu_item(t, "summary", "Show summary", "", cx.listener(move |m, _, w, cx| {
@@ -1383,11 +1485,11 @@ fn project_menu(t: &Theme, pid: Option<String>, pinned: bool, terminal_keys: Opt
                         .when(!keys.is_empty(), |d| d.child(super::header::key_chip(t, keys.into()))),
                     )
                     .when(any, |d| {
-                        d.child(menu_item(t, "summary-clear", "Clear summary", "", cx.listener(move |m, _, _, cx| {
+                        // Takes the Summary out of the sidebar, as its ✕ does; the records stay.
+                        d.child(menu_item(t, "summary-clear", "Clear Summary", "", cx.listener(move |m, _, w, cx| {
                             m.menu = Menu::None;
                             if let Some(p) = p5.clone() {
-                                m.summary.closed.retain(|c| c.project_id != p);
-                                m.rpc("summary.remove", serde_json::json!({ "project_id": p }), cx, |_, _, _, _| {});
+                                crate::ui::summary::close_row(m, &p, w, cx);
                             }
                             cx.notify();
                         })))
@@ -1517,3 +1619,34 @@ pub fn menu_item(t: &Theme, id: &str, label: &str, hint: &str, on: impl Fn(&Clic
         .when(!hint.is_empty(), |d| d.child(div().text_size(px(11.5)).text_color(t.dim).child(hint.to_string())))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::attention_text;
+    use crate::model::{Status, StatusState};
+
+    fn status(state: StatusState, reason: &str) -> Status {
+        Status { state, reason: Some(reason.into()), ..Default::default() }
+    }
+
+    #[test]
+    fn an_item_on_a_busy_terminal_shows_its_title_not_the_hook_reason() {
+        let title = "The Mac is short of memory (pressure warn)";
+        assert_eq!(attention_text(&status(StatusState::Working, "prompt"), StatusState::NeedsYou, Some(title)), title);
+        assert_eq!(attention_text(&status(StatusState::Working, "tool Bash"), StatusState::NeedsYou, Some(title)), title);
+    }
+
+    #[test]
+    fn a_terminal_that_needs_you_itself_keeps_its_reason() {
+        let s = status(StatusState::NeedsYou, "Bash: cargo test");
+        assert_eq!(attention_text(&s, StatusState::NeedsYou, Some("Claude needs your permission")), "Bash: cargo test");
+        assert_eq!(attention_text(&status(StatusState::Failed, "exited with code 1"), StatusState::Failed, None), "exited with code 1");
+    }
+
+    #[test]
+    fn falls_back_without_a_reason_or_title() {
+        assert_eq!(attention_text(&status(StatusState::Working, "prompt"), StatusState::NeedsYou, None), "needs you");
+        let failed = Status { state: StatusState::Failed, exit_code: Some(2), ..Default::default() };
+        assert_eq!(attention_text(&failed, StatusState::Failed, None), "exit 2");
+    }
+}

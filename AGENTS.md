@@ -12,7 +12,7 @@ Production is:
 - `~/.local/bin/midna` and the Finder Quick Action `~/Library/Services/Open in Midna.workflow`
 - its Finder extension `com.mrgnhnt.midna.finder-sync` (never `pluginkit -e` it; Midna Dev's is `com.mrgnhnt.midna.dev.finder-sync`)
 
-Agents must never build into it, install over it, launch, quit, restart or signal it, upgrade or stop its daemon, `launchctl` its label, or write its files. Reading its logs and settings is fine. Never run `scripts/reinstall.sh`; it's for the human only. Never `pkill`/`killall` anything named midna; stop test daemons by PID (see `README.md`). Production only changes through real releases, or when the human does it themselves.
+Agents must never build into it, install over it, launch, quit, restart or signal it, upgrade or stop its daemon, `launchctl` its label, or write its files. Reading its logs and settings is fine. Never run `scripts/reinstall.sh`; it's for the human only. Never `pkill`/`killall` anything named midna; stop a test daemon by its PID with `kill -INT <pid>`. A plain `kill` sends SIGTERM, which makes midnad restart itself in place rather than exit, unless it was started with `MIDNA_SIGTERM=stop`. Production only changes through real releases, or when the human does it themselves.
 
 Using the `midna` CLI from a production terminal the way any agent would (`midna attention`, `midna open`, `midna read` and so on) is fine. Controlling its daemon (`midna daemon stop|restart|upgrade`) is not.
 
@@ -24,6 +24,17 @@ Using the `midna` CLI from a production terminal the way any agent would (`midna
 - **Windows:** `scripts/dev-app-windows.sh` installs Midna Dev to `%LOCALAPPDATA%\Programs\Midna Dev` (home `%LOCALAPPDATA%\com.mrgnhnt.midna.dev`, login entry "Midna Dev"). It ships Microsoft's newer ConPTY, so it needs `.toolchain/conpty` (`scripts/setup-conpty.sh`). Windows production is `%LOCALAPPDATA%\Programs\Midna`, `%LOCALAPPDATA%\com.mrgnhnt.midna`, `~\.local\bin\midna.exe`, the Start menu's `Midna.lnk` and the "Midna" value under `HKCU\…\CurrentVersion\Run`; the same rules apply. Inside the Claude desktop app, AppData and HKCU writes are redirected into its package, so use temp homes under `%TEMP%` (see `docs/STATUS-windows.md`, "Installing").
 
 Claude Code enforces these rules with `.claude/hooks/protect-production.py`. Other agents must follow them by hand.
+
+## Look at the app
+
+To see or check a UI change, shoot or drive this checkout's app hidden with Slate. Its window opens below the desktop, never takes focus, and midna never becomes the frontmost app, so nothing appears on the human's screen and their keys stay theirs:
+
+```sh
+scripts/slate.sh shoot --out shot.png --size 1280x800 --wait 2500
+scripts/slate.sh drive --steps steps.json --out shots/ --size 1280x800 --wait 2500
+```
+
+It runs the fake backend unless `--home <temp MIDNA_HOME>` comes first, and passes the `MIDNA_DEBUG_*` / `MIDNA_FAKE_*` screenshot variables through. A steps file lists keys (`{"key": "cmd-k"}`), typing, clicks at window points, scrolls, waits and `{"shot": "name"}` steps; see Slate's README. Only the first main window is hidden: a drive that opens Settings, a pop-out or another window shows that one on screen. Slate's repo is private, so the workspace builds a stand-in that never hides (`crates/slate-stub`); only `scripts/slate.sh` builds the real one, and it needs your GitHub access to slate.
 
 ## Test what you touched
 

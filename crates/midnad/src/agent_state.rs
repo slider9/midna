@@ -31,23 +31,25 @@ pub fn prompt_label(p: &Value) -> String {
     format!("permission {}", tool_label(p))
 }
 
-/// The first question of an AskUserQuestion `PermissionRequest`, in full, with its options.
+/// An AskUserQuestion `PermissionRequest`'s questions, in full, with their options: the first,
+/// the rest in its `more`. None when the first has no text.
 pub fn question(p: &Value) -> Option<NeedsYouQuestion> {
     if s(p, "tool_name") != "AskUserQuestion" {
         return None;
     }
-    let q = p.pointer("/tool_input/questions/0")?;
-    let text = s(q, "question").trim();
-    if text.is_empty() {
-        return None;
-    }
-    let options = q.get("options").and_then(Value::as_array).into_iter().flatten();
-    Some(NeedsYouQuestion {
-        text: text.to_string(),
-        header: s(q, "header").to_string(),
-        multi_select: q.get("multiSelect").and_then(Value::as_bool).unwrap_or(false),
-        options: options.map(|o| QuestionOption { label: s(o, "label").to_string(), description: s(o, "description").to_string() }).filter(|o| !o.label.is_empty()).collect(),
-    })
+    let mut all = p.pointer("/tool_input/questions")?.as_array()?.iter().map(|q| {
+        let options = q.get("options").and_then(Value::as_array).into_iter().flatten();
+        NeedsYouQuestion {
+            text: s(q, "question").trim().to_string(),
+            header: s(q, "header").to_string(),
+            multi_select: q.get("multiSelect").and_then(Value::as_bool).unwrap_or(false),
+            options: options.map(|o| QuestionOption { label: s(o, "label").to_string(), description: s(o, "description").to_string() }).filter(|o| !o.label.is_empty()).collect(),
+            more: vec![],
+        }
+    });
+    let mut first = all.next().filter(|q| !q.text.is_empty())?;
+    first.more = all.collect();
+    Some(first)
 }
 
 /// Pure transition: (current state, hook event, payload) -> next (state, reason). None = no change.
@@ -222,12 +224,18 @@ pub fn trust_keys(t: &TrustDialog, approve: bool) -> Vec<crate::term::Key> {
     keys
 }
 
-/// Claude's question dialog (AskUserQuestion), from its footer at the bottom of the screen.
+/// Claude's question dialog (AskUserQuestion), from its footer at the bottom of the screen, or
+/// its "Review your answers" screen (no footer; `1. Submit answers` / `2. Cancel` at the bottom).
 /// Kept apart from `screen_shows_prompt`: Enter there picks the highlighted answer, not "Yes".
 pub fn screen_shows_question(lines: &[String]) -> bool {
     let tail: Vec<&str> = lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
     let tail = &tail[tail.len().saturating_sub(4)..];
-    tail.iter().any(|l| l.starts_with("Enter to select") && l.contains("Esc to cancel"))
+    let footer = tail.iter().any(|l| l.starts_with("Enter to select") && l.contains("Esc to cancel"));
+    let review = || {
+        tail.iter().any(|l| l.trim_start_matches(['❯', ' ']) == "2. Cancel")
+            && matches!(crate::question::parse(lines), crate::question::Screen::Review(_))
+    };
+    footer || review()
 }
 
 /// The screen shows something only the human should answer: a permission prompt, a question
@@ -271,6 +279,15 @@ mod tests {
         assert!(!screen_shows_prompt(&screen("claude-2.1.292-question.screen.txt")), "Enter there picks an answer");
         assert!(screen_shows_question(&screen("claude-2.1.292-question.screen.txt")));
         assert!(screen_waits_on_human(&screen("claude-2.1.292-question.screen.txt")));
+        // The review screen after the last question has no footer; Enter there submits.
+        let review = screen("claude-2.1.301-question-review.screen.txt");
+        assert!(screen_shows_question(&review));
+        assert!(!screen_shows_prompt(&review), "Enter there submits the answers");
+        assert!(screen_waits_on_human(&review));
+        // The same review scrolled up the transcript, under a fresh input box: not live.
+        let mut gone = review.clone();
+        gone.extend(["⏺ User answered Claude's questions:", "", "─────", "❯ ", "─────", "  ? for shortcuts"].map(str::to_string));
+        assert!(!screen_shows_question(&gone));
         for f in ["claude-2.1.288-permission.screen.txt", "claude-2.1.288-interrupted.screen.txt", "claude-2.1.288-trust-folder.screen.txt", "codex-0.160.0-idle.screen.txt"] {
             assert!(!screen_shows_question(&screen(f)), "{f}");
         }
@@ -351,6 +368,10 @@ mod tests {
         let q = question(&p).unwrap();
         assert_eq!((q.text.len(), q.header.as_str(), q.multi_select), (300, "Bell opens", true));
         assert_eq!(q.options, [QuestionOption { label: "Popover".into(), description: "A small list".into() }, QuestionOption { label: "Full screen".into(), description: String::new() }]);
+        // The rest ride along, so a card can answer them all.
+        assert_eq!(q.count(), 2);
+        assert_eq!(q.more[0].text, "Second?");
+        assert_eq!(q.all().map(|q| q.text.len()).collect::<Vec<_>>(), [300, 7]);
         assert_eq!(question(&json!({"tool_name": "Bash", "tool_input": {"questions": [{"question": "x"}]}})), None);
     }
 

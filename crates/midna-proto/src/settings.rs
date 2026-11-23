@@ -160,6 +160,12 @@ impl SettingSpec {
                     if self.key == "theme.colors" {
                         crate::themes::check_override(m, val).map_err(|e| format!("{}: `{i}`: {e}", self.key))?;
                     }
+                    if self.key == "nearby.mac_themes" {
+                        check_mac_theme(m, val).map_err(|e| format!("{}: `{i}`: {e}", self.key))?;
+                        if out.iter().any(|r| r.split_once(" = ").is_some_and(|(n, _)| n.starts_with(m) || m.starts_with(n))) {
+                            return Err(format!("{}: two rules for device `{m}`", self.key));
+                        }
+                    }
                     if self.key == "keys.when" {
                         check_key_when(m, val).map_err(|e| format!("{}: `{i}`: {e}", self.key))?;
                         if out.iter().any(|r| r.split_once(" = ").is_some_and(|(n, _)| n == m)) {
@@ -432,6 +438,24 @@ fn check_insights_layout(value: &str) -> Result<(), String> {
 /// A `keys.when` value that drops a shortcut's when clause: it works anywhere in the app.
 pub const WHEN_ANYWHERE: &str = "*";
 
+/// A `nearby.mac_themes` rule: `<device id> = <theme id>`. The device id is a paired Mac's
+/// fingerprint, or its first 8 or more characters (`midna peers` shows them).
+fn check_mac_theme(m: &str, val: &str) -> Result<(), String> {
+    if m.len() < 8 || m.len() > 64 || !m.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+        return Err(format!("`{m}` is not a device id (8 to 64 lowercase hex characters from `midna peers`)"));
+    }
+    if !crate::themes::valid_id(val) {
+        return Err(format!("`{val}` is not a theme id (`midna themes`)"));
+    }
+    Ok(())
+}
+
+/// The theme `nearby.mac_themes` (`rules`) picks for paired Mac `fingerprint`'s windows on this
+/// Mac, if any.
+pub fn mac_theme<'a>(rules: &'a [String], fingerprint: &str) -> Option<&'a str> {
+    rules.iter().filter_map(|r| r.split_once(" = ")).find(|(m, _)| m.len() >= 8 && fingerprint.starts_with(m)).map(|(_, v)| v)
+}
+
 /// A `keys.when` rule: `<keys.* setting> = <when expression>`.
 fn check_key_when(m: &str, val: &str) -> Result<(), String> {
     if !setting(m).is_some_and(|s| matches!(s.ty, SettingKind::Keybinding)) {
@@ -624,7 +648,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         "The color for agents blocked on you in Insights charts: a theme color (accent, work, need, ok, err, fg, dim) or #RRGGBB."),
     s!("updates.channel", en(&["stable", "beta"]), S("stable"), "general", false, "Which update channel midna follows."),
     s!("windows.close_with_terminals", en(&["ask", "close", "move"]), S("ask"), "general", false,
-        "Closing a main window that still has terminals while another is open: ask, close its terminals, or move them to the window you used last."),
+        "Closing a main window that still has terminals while another window of the same Mac is open: ask, close its terminals, or move them to that Mac's window you used last."),
     s!("projects.empty_opens", en(&["terminal", "agent"]), S("agent"), "general", false,
         "What clicking a pinned project with no terminals opens (its heading, its New row, its ⌘1–9, or opening it from ⌘K, where ⌥↩ opens the other kind): terminal, a shell; or agent, the agent last started in that project (Claude if none)."),
     s!("projects.new_terminal_in", en(&["project", "main"]), S("project"), "general", false,
@@ -697,12 +721,22 @@ pub static SETTINGS: &[SettingSpec] = &[
         "In with_work mode, keep holding this many minutes after the last work, so the next queued message, hook or reply still finds the Mac awake.") },
     s!("keep_awake.wake", SettingKind::Bool, B(false), "agents", false,
         "Wake the Mac from sleep for work scheduled inside the keep-awake hours (a schedule trigger, a message queued for a time, an agent's wakeup): midnad asks macOS for a wake 2 minutes before it, then keeps the Mac awake until the work has run. A schedule trigger with wake on (`--wake`) is woken for at any hour, outside the keep-awake hours too, and kept awake while the work it started goes on. Needs a one-time admin grant (`midna keep-awake wake setup`). Closing the lid still keeps a laptop asleep."),
+    s!("nearby.visibility", en(&["off", "paired", "everyone"]), S("paired"), "general", true,
+        "Nearby: who on this network can find this Mac to send it things. off: Nearby is off; midna neither shows itself nor looks for other Midnas. paired: only devices you paired with can find it (midna still looks for others). everyone: every Midna on the network can find it, for 10 minutes, then back to paired. `midna peers` shows what midna sees. Human only."),
+    s!("nearby.name", SettingKind::String, S(""), "general", false,
+        "Nearby: the name other Midnas see for this Mac. Empty = the Mac's computer name. Display only: devices are told apart by their key, never by name."),
+    s!("nearby.mac_themes", SettingKind::RuleList, L(&[]), "appearance", false,
+        "Nearby: the theme another of my Macs' windows show on this Mac, kept on this Mac (that Mac never sees it): `<device id> = <theme id>`, the device id from `midna peers` (its first 12 characters will do), the theme any theme on this Mac (`midna themes`), with this Mac's theme.colors. A Mac with no rule shows its own theme and look settings. E.g. `0a1b2c3d4e5f = gruvbox`."),
+    s!("nearby.downloads", SettingKind::String, S(""), "general", true,
+        "Nearby: the folder accepted files and folders are saved in (an absolute path or ~/…). Empty = ~/Downloads/Midna. Each lands under its own name there (with a number added if the name is taken), marked as downloaded so macOS checks it before it opens. Human only: what other devices send never lands where an agent points it."),
     SettingSpec { range: Some((50, 2000)), ..s!("system.busy_load", SettingKind::Int, I(200), "general", false,
         "When midna counts the Mac as busy: the 1-minute load average per core, in percent (100 = every core busy, 200 = twice as much work as cores). macOS's load average counts more than CPU work (processes waiting on the disk too), so a Mac running normally often reads 100% or more; overload and the busy gate go by system.busy_cpu instead. A busy load postpones a daemon upgrade or restart (under heavy load the handoff can time out and hang up every terminal); the app asks once whether to wait or update anyway, then updates by itself when the load drops. `midna system` shows the load.") },
     SettingSpec { range: Some((30, 100)), ..s!("system.busy_cpu", SettingKind::Int, I(90), "general", false,
         "When midna counts the Mac's CPU as busy: the CPU in use across all cores, in percent (100 = every core busy). Sustained for guard.overload_secs, it shows the overload window. Only when midna's terminals use at least half of that CPU do the busy gate (guard.busy_gate) and background mode (guard.background_agents) hold agents back; when other apps keep the Mac busy, holding agents back would free nothing. `midna system` shows it.") },
     s!("system.busy_memory", en(&["warning", "critical", "off"]), S("warning"), "general", false,
-        "When midna counts the Mac as short of memory: macOS's memory pressure (Activity Monitor's yellow = warning, red = critical). At or above it, the busy gate (guard.busy_gate) holds new builds, tests, installs, model runs and subagents back whoever is using the memory, and a needs-you names the terminal using the most, with Pause. Local models on Apple silicon are mostly GPU and memory, so the CPU can look calm while the Mac runs out; past critical it can hang and kernel-panic. off = memory never holds anything back. `midna system` shows it."),
+        "When midna counts the Mac as short of memory: macOS's memory pressure (Activity Monitor's yellow = warning, red = critical). At or above it, the busy gate (guard.busy_gate) holds new builds, tests, installs, model runs and subagents back whoever is using the memory, and a needs-you names the terminal using the most, with Pause (guard.memory_alert). Local models on Apple silicon are mostly GPU and memory, so the CPU can look calm while the Mac runs out; past critical it can hang and kernel-panic. off = memory never holds anything back. `midna system` shows it."),
+    s!("guard.memory_alert", SettingKind::Bool, B(true), "general", false,
+        "When macOS's memory pressure reaches system.busy_memory, raise a needs-you naming the terminal using the most memory, with Pause. Off = no needs-you; agents still wait while memory is short (system.busy_memory, guard.busy_gate), and event system.memory_pressure fires either way."),
     s!("guard.overload_alert", SettingKind::Bool, B(true), "general", false,
         "When the Mac's CPU stays busy (system.busy_cpu) for guard.overload_secs, show whether midna's terminals or other apps are using it, with Pause and Resume for the terminals. Event system.overloaded fires either way."),
     SettingSpec { range: Some((10, 3600)), ..s!("guard.overload_secs", SettingKind::Int, I(120), "general", false,
@@ -721,6 +755,8 @@ pub static SETTINGS: &[SettingSpec] = &[
         "Most local model runs (mflux, MLX tools like mlx_lm and mlx_audio, ollama run/pull, llama.cpp, Hugging Face downloads, Python loading a model) that run at once across every terminal, in their own line apart from guard.build_slots. Each can take many GB of memory, and two at once can run a Mac out of it. Another one waits in line before it starts. 0 = no limit.") },
     s!("guard.panic_hold", SettingKind::Bool, B(true), "general", true,
         "When the Mac comes back from a kernel panic, raise a needs-you saying what each terminal was running before it went down, and until you dismiss it, don't let agents start on their own: triggers, other agents and apps like the task board can't open or restart an agent terminal. You still can. Human only."),
+    SettingSpec { range: Some((0, 5000)), ..s!("guard.hold_agents_at", SettingKind::Int, I(300), "general", true,
+        "While the Mac's load average is at least this far above its core count (load per core, in percent: 300 = three times as much work waiting as cores to run it) and its CPU is busy (system.busy_cpu), agent terminals that agents, triggers and apps like the task board open wait their turn: the terminal opens at once with the status Waiting for the Mac, and its agent starts once the load drops under 80% of this, one every 10 seconds, first opened first. Ctrl-C in the terminal starts it now. Agents you open start anyway, with a warning. 0 = never hold them. Human only.") },
     s!("cleanup.enabled", SettingKind::Bool, B(true), "agents", false,
         "When a terminal closes, have a cheap headless model (cleanup.model) clean up what it left behind: the items in cleanup.items. It removes only what is safe (merged, pushed, nothing uncommitted), never touches cleanup.keep, and says what it kept and why. `midna cleanup runs` lists what it did; `midna close --no-cleanup` skips it once."),
     s!("cleanup.sessions", en(&["agents", "all"]), S("agents"), "agents", false,
@@ -756,7 +792,7 @@ pub static SETTINGS: &[SettingSpec] = &[
     s!("terminal.pr_status", SettingKind::Bool, B(true), "terminal", false,
         "Show a GitHub pull request's state on its links in terminal output: the URL takes the state's color (green open, purple merged, red and struck through closed, grey dashed draft) and the state's icon follows it when there's room. GitHub Actions run links do the same for the run (blue running, green passed, red failed, grey queued, cancelled or skipped). The state comes from `gh pr view` and `gh run view`, so it needs gh signed in."),
     s!("terminal.link_patterns", SettingKind::RuleList, L(DEFAULT_LINK_PATTERNS), "terminal", false,
-        "Text in terminal output that becomes a link, like URLs (⌘-click opens it, hovering previews it): `<regex> = <url template>`, with $1, ${name} … from the regex's groups ($0 = the whole match). Add `agents` to limit a rule to agent terminals, `project:<name>` (repeatable) to some projects, and `preview:\"<command> $1\"` to fill the hover card: the command (no shell; $1 … filled from the match) prints JSON like `{\"title\": \"…\", \"lines\": [\"In Progress\", \"Morgan Hunt\"]}` and the card shows that instead of only the URL. It runs on the PATH of your login shell with a 5s limit, and its answer is kept for 15s; when it fails the card shows the plain URL. A match inside a URL or path, or glued to other text, isn't a link, and a URL whose scheme no app on this Mac opens stays text. Apps add their own alongside these (links.patterns.register), shown read-only under this setting. E.g. `\\bPROJ-(\\d+)\\b = https://acme.atlassian.net/browse/PROJ-$1 project:acme`, or `\\b(PROJ-\\d+)\\b = https://acme.atlassian.net/browse/$1 preview:\"jira-card $1\"`."),
+        "Text in terminal output that becomes a link, like URLs (⌘-click opens it, hovering previews it): `<regex> = <url template>`, with $1, ${name} … from the regex's groups ($0 = the whole match). Add `agents` to limit a rule to agent terminals, `project:<name>` (repeatable) to some projects, and `preview:\"<command> $1\"` to fill the hover card: the command (no shell; $1 … filled from the match) prints JSON like `{\"title\": \"…\", \"lines\": [\"In Progress\", \"Morgan Hunt\"]}` and the card shows that instead of only the URL. It runs on the PATH of your login shell with a 5s limit, and its answer is kept for 15s; when it fails the card shows the plain URL. An agent adding a preview command asks you first. A match inside a URL or path, or glued to other text, isn't a link, and a URL whose scheme no app on this Mac opens stays text. Apps add their own alongside these (links.patterns.register), shown read-only under this setting; their preview commands run once you approve them. E.g. `\\bPROJ-(\\d+)\\b = https://acme.atlassian.net/browse/PROJ-$1 project:acme`, or `\\b(PROJ-\\d+)\\b = https://acme.atlassian.net/browse/$1 preview:\"jira-card $1\"`."),
     s!("terminal.auto_name", en(&["agent", "prompt", "context", "off"]), S("agent"), "terminal", false,
         "Name terminals by themselves, from what they're doing. agent: the short summary Claude or Codex puts in the terminal title (no extra model call), falling back to prompt, then context, until it has one. prompt: the prompt shortened to a few words, filler dropped, without any model. context: the git branch (feat/auto-tab-names = Auto tab names) or worktree, else the folder; this one names shell terminals too. off: keep the names terminals were given. A name you set yourself always stays; rename a terminal back to its default (claude, codex, zsh, …) to let midna name it again."),
     s!("terminal.auto_name_updates", en(&["follow", "first"]), S("follow"), "terminal", false,
@@ -795,6 +831,8 @@ pub static SETTINGS: &[SettingSpec] = &[
     s!("notify.failed", SettingKind::Bool, B(true), "notifications", false, "Notify when a terminal's command fails or an agent's turn ends in an error."),
     s!("notify.turn_done", SettingKind::Bool, B(true), "notifications", false,
         "Notify when an agent finishes a turn that took at least notify.turn_done_min_secs."),
+    s!("notify.nearby", SettingKind::Bool, B(true), "notifications", false,
+        "Notify when an agent you started or asked on a nearby Mac sends its answer back (a banner too, notify.push.nearby)."),
     s!("notify.agent", SettingKind::Bool, B(true), "notifications", false, "Show notifications agents send on purpose (`midna notify send`)."),
     s!("notify.from_trigger", SettingKind::Bool, B(true), "notifications", false, "Show notifications triggers send (a trigger's `notify` action)."),
     s!("notify.requests", SettingKind::Bool, B(false), "notifications", false,
@@ -815,6 +853,7 @@ pub static SETTINGS: &[SettingSpec] = &[
     snd!("attention", "Call"), push!("attention", true), pushf!("attention"), vol!("attention"), pic!("attention"), ttl!("attention"), txt!("attention", "{{title}}, {{detail}} and {{kind}}. "), stay!("attention", 0), color!("attention", "need"), bell!("attention", true),
     snd!("failed", "Uh-oh"), push!("failed", false), pushf!("failed"), vol!("failed"), pic!("failed"), ttl!("failed"), txt!("failed", "{{title}}, {{detail}} and {{kind}} (a failed command), or {{reason}} (an agent turn that failed). "), stay!("failed", 0), color!("failed", "err"), bell!("failed", true),
     snd!("turn_done", "Strum"), push!("turn_done", false), pushf!("turn_done"), vol!("turn_done"), pic!("turn_done"), ttl!("turn_done"), txt!("turn_done", "{{elapsed}} (2m 5s), {{secs}}, {{reply}} (the first line of its reply) and {{message}} (all of it). "), stay!("turn_done", 6), color!("turn_done", "ok"), bell!("turn_done", false),
+    snd!("nearby", "Strum"), push!("nearby", true), pushf!("nearby"), vol!("nearby"), pic!("nearby"), ttl!("nearby"), txt!("nearby", "{{mac}} (the Mac that answered), {{reply}} (the first line of the answer) and {{message}} (all of it). "), stay!("nearby", 8), color!("nearby", "accent"), bell!("nearby", false),
     snd!("agent", "Hm"), push!("agent", false), pushf!("agent"), vol!("agent"), pic!("agent"), ttl!("agent"), txt!("agent", "{{title}} and {{body}} (what the agent sent). "), stay!("agent", 6), color!("agent", "accent"), bell!("agent", false),
     snd!("from_trigger", "Hm"), push!("from_trigger", false), pushf!("from_trigger"), vol!("from_trigger"), pic!("from_trigger"), ttl!("from_trigger"), txt!("from_trigger", "{{title}} and {{body}} (the trigger’s notify action). "), stay!("from_trigger", 6), color!("from_trigger", "work"), bell!("from_trigger", false),
     snd!("requests", "none"), push!("requests", false), pushf!("requests"), vol!("requests"), pic!("requests"), ttl!("requests"), txt!("requests", "{{title}}, {{detail}} and {{kind}}. "), stay!("requests", 0), color!("requests", "accent"), bell!("requests", true),
@@ -853,7 +892,10 @@ pub static SETTINGS: &[SettingSpec] = &[
     s!("notify.when_app_closed", SettingKind::Bool, B(true), "notifications", false,
         "When the midna app isn't running, midnad posts the notification itself (shown as a system notification; clicking it doesn't open midna)."),
     s!("keys.command_bar", KB, keys("cmd-k", "ctrl-shift-k"), "keys", false, "Open the command bar."),
-    s!("keys.next_needs_you", KB, keys("cmd-j", "ctrl-shift-j"), "keys", false, "Jump to the next needs-you item."),
+    s!("keys.next_needs_you", KB, keys("cmd-j", "ctrl-shift-j"), "keys", false,
+        "Jump to the newest needs-you item on the Mac whose window is in front (this Mac's, or the other Mac's in its window); in the needs-you cards, the next card."),
+    s!("keys.next_needs_you_anywhere", KB, keys("cmd-alt-j", "alt-shift-j"), "keys", false,
+        "Jump to the newest needs-you item on any of your Macs. On another Mac it brings that Mac's window forward on the item, opening one if none is open."),
     s!("keys.new_agent", KB, keys("cmd-t", "ctrl-shift-t"), "keys", false, "New agent terminal in the current project, running the agent last started there."),
     s!("keys.new_terminal", KB, keys("cmd-shift-t", "ctrl-alt-t"), "keys", false, "New terminal in the current project."),
     s!("keys.new_agent_root", KB, keys("cmd-alt-t", "alt-shift-t"), "keys", false, "New agent terminal at root (no project, starts in $HOME)."),
@@ -1041,6 +1083,20 @@ mod tests {
         assert!(s.coerce(&json!(["theme = MidnaMain"])).unwrap_err().contains("not a shortcut setting"));
         assert!(s.coerce(&json!(["keys.new_agent = MidnaMain &&"])).unwrap_err().contains("keys.new_agent"));
         assert!(s.coerce(&json!(["keys.new_agent = a", "keys.new_agent = b"])).unwrap_err().contains("two rules"));
+    }
+
+    #[test]
+    fn mac_themes_pick_a_theme_per_device() {
+        let s = setting("nearby.mac_themes").unwrap();
+        assert_eq!(s.coerce(&json!("0a1b2c3d4e5f=gruvbox, 99887766 = my-ember")), Ok(json!(["0a1b2c3d4e5f = gruvbox", "99887766 = my-ember"])));
+        assert!(s.coerce(&json!(["Bravo = nord"])).unwrap_err().contains("not a device id"), "a name isn't an id");
+        assert!(s.coerce(&json!(["0a1b2c3 = nord"])).unwrap_err().contains("not a device id"), "too short to tell Macs apart");
+        assert!(s.coerce(&json!(["0a1b2c3d = Nord!"])).unwrap_err().contains("not a theme id"));
+        assert!(s.coerce(&json!(["0a1b2c3d = nord", "0a1b2c3d4e5f = latte"])).unwrap_err().contains("two rules"));
+        let rules = vec!["0a1b2c3d4e5f = gruvbox".to_string(), "99887766 = latte".to_string()];
+        assert_eq!(mac_theme(&rules, "0a1b2c3d4e5f60718293a4b5c6d7e8f9"), Some("gruvbox"));
+        assert_eq!(mac_theme(&rules, "998877665544"), Some("latte"));
+        assert_eq!(mac_theme(&rules, "ffeeddcc"), None, "a Mac with no rule shows its own theme");
     }
 
     #[test]

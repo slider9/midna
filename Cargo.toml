@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/midna-proto", "crates/midnad", "crates/midna-cli", "crates/midna-app"]
 
 [workspace.package]
-version = "0.1.0-beta.46"
+version = "0.1.0-beta.58"
 edition = "2024"
 license = "MIT"
 
@@ -18,6 +18,11 @@ libc = "0.2"
 libghostty-vt = "0.2.2"
 schemars = "1.2"
 regex = "1"
+
+# Slate is private while midna is public, so builds use the stand-in in crates/slate-stub and never
+# fetch it. scripts/slate.sh patches the real crate back in for its own build.
+[patch."https://github.com/mrgnhnt96/slate"]
+slate = { path = "crates/slate-stub" }
 
 [profile.dev.package."*"]
 opt-level = 2

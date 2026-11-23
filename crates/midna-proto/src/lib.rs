@@ -11,14 +11,18 @@ pub mod ipc;
 pub mod frame;
 pub mod keep_awake;
 pub mod link_actions;
+pub mod link_preview;
 pub mod link_patterns;
 pub mod methods;
+pub mod nearby;
 pub mod notify;
 pub mod openrpc;
 pub mod paths;
+pub mod preview_cmd;
 pub mod prompts;
 pub mod secrets;
 pub mod settings;
+pub mod streams;
 pub mod summary;
 pub mod system;
 pub mod themes;
@@ -41,6 +45,11 @@ pub use summary::{
 pub use system::{
     HeavyTerminal, OtherProcess, Paused, RunAnywayParams, RunAnywayResult, SessionPauseParams, SessionPauseResult, StopProcessesParams, StopProcessesResult, StoppedProcess, SystemLoad,
     WorktreeFailure, WorktreeInfo, WorktreesCleanParams, WorktreesCleanResult, WorktreesList, WorktreesListParams,
+};
+pub use streams::{
+    StreamBrief, StreamCounts, StreamExit, StreamHealth, StreamPublishRecord, StreamRef, StreamSpec, StreamState, StreamStatus, StreamVerdict, StreamsAddParams,
+    StreamsEventsParams, StreamsEventsResult, StreamsHealth, StreamsNameParams, StreamsPublishParams, StreamsPublishResult, StreamsSetEnabledParams,
+    StreamsUpdateParams, TriggerCause,
 };
 pub use types::*;
 

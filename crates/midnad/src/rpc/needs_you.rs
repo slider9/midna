@@ -10,8 +10,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub fn list(d: &Daemon, p: NeedsYouListParams) -> R {
-    let core = d.core();
-    ok(core.state.needs_you.iter().filter(|n| p.session_id.is_none() || n.session_id == p.session_id).cloned().collect::<Vec<_>>())
+    let items: Vec<NeedsYou> = d.core().state.needs_you.iter().filter(|n| p.session_id.is_none() || n.session_id == p.session_id).cloned().collect();
+    ok(items.into_iter().map(|n| marked(d, n)).collect::<Vec<_>>())
+}
+
+/// `item` as `list` and `get` give it: `local_only` when approving it can only be done here.
+fn marked(d: &Daemon, mut item: NeedsYou) -> NeedsYou {
+    item.local_only = crate::nearby::local_only::approval(d, &item);
+    item
 }
 
 /// Most closed items `needs_you.get` remembers.
@@ -89,7 +95,7 @@ pub fn get(d: &Daemon, p: NeedsYouGetParams) -> R {
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
-            let r = NeedsYouGetResult { id: p.id, state: NeedsYouState::Open, item: Some(item), resolution: None, resolved_by: None, resolved_at: None, result: None, error: None };
+            let r = NeedsYouGetResult { id: p.id, state: NeedsYouState::Open, item: Some(marked(d, item)), resolution: None, resolved_by: None, resolved_at: None, result: None, error: None };
             return ok(r);
         }
         let answered = d.answered.lock().unwrap_or_else(|e| e.into_inner()).get(&p.id);
@@ -123,7 +129,8 @@ pub fn raise(d: &Daemon, ctx: &Ctx, p: NeedsYouRaiseParams) -> R {
 
 /// Kinds that never expire: requests the human acts on in their own time.
 fn lasts(k: NeedsYouKind) -> bool {
-    matches!(k, NeedsYouKind::RuleRemoval | NeedsYouKind::SecretNeeded | NeedsYouKind::TriggerWaiting)
+    // A failing stream's item resolves itself once the stream is healthy (or paused).
+    matches!(k, NeedsYouKind::RuleRemoval | NeedsYouKind::SecretNeeded | NeedsYouKind::TriggerWaiting | NeedsYouKind::StreamFailing)
 }
 
 /// The open items that may expire and have been open more than `hours` of awake time
@@ -204,6 +211,10 @@ fn authorize(d: &Daemon, ctx: &Ctx, item: &NeedsYou, res: &Resolution) -> Result
             Ok(())
         }
         Resolution::Done | Resolution::Deny if raised_by_me && matches!(item.kind, NeedsYouKind::Note | NeedsYouKind::Blocked | NeedsYouKind::Approval) => Ok(()),
+        // Dismiss records the human waving it off; the agent that raised it clears it as done.
+        Resolution::Dismiss if raised_by_me && matches!(item.kind, NeedsYouKind::Note | NeedsYouKind::Blocked | NeedsYouKind::Approval) => {
+            Err(RpcError::bad_params("you raised this item: clear it with resolution done (`midna approve <id> --done`), not dismiss"))
+        }
         _ => Err(RpcError::human_only("only the human can resolve this item this way")),
     }
 }
@@ -211,6 +222,11 @@ fn authorize(d: &Daemon, ctx: &Ctx, item: &NeedsYou, res: &Resolution) -> Result
 pub fn resolve(d: &Arc<Daemon>, ctx: &Ctx, p: NeedsYouResolveParams) -> R {
     let item = d.core().state.needs_you.iter().find(|n| n.id == p.id).cloned().ok_or_else(|| RpcError::not_found(format!("no needs-you item {}", p.id)))?;
     authorize(d, ctx, &item, &p.resolution)?;
+    // Deny and dismiss grant nothing, so they work from another Mac; approving what is local-only doesn't.
+    let driving = ctx.as_actor.as_ref().and_then(|a| a.drive_peer()).is_some();
+    if driving && matches!(p.resolution, Resolution::Approve { .. }) && crate::nearby::local_only::approval(d, &item) {
+        return Err(crate::nearby::local_only::refuse(d, "approving this can't be done from another Mac"));
+    }
     if p.value.is_some() && !(matches!(p.resolution, Resolution::Approve { .. }) && item.setting.is_some()) {
         return Err(RpcError::bad_params("value only applies to approving a setting change"));
     }
@@ -229,7 +245,7 @@ pub fn resolve(d: &Arc<Daemon>, ctx: &Ctx, p: NeedsYouResolveParams) -> R {
                     None => drop(super::run_deferred(d, def)?),
                 }
             } else {
-                rule = super::policy::rule_from_approval(d, &item, scope);
+                rule = super::policy::rule_from_approval(d, &item, scope, ctx.actor());
             }
         }
         (Resolution::Approve { .. }, NeedsYouKind::RuleRemoval) => {
@@ -306,8 +322,10 @@ mod expire_tests {
             bulk_safe: false,
             approval: None,
             trigger_id: None,
+            stream: None,
             question: None,
             setting: None,
+            local_only: false,
         }
     }
 

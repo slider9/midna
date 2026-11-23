@@ -522,7 +522,7 @@ fn model(d: &Daemon, project_id: &str, folder: &str, argv: &[String], prompt: &s
     cmd.env_remove("MIDNA_SESSION").env("TERM", "dumb").env("MIDNA_CLEANUP", "1").env("GH_PROMPT_DISABLED", "1").env("GIT_TERMINAL_PROMPT", "0");
     // Its own process group, so a timeout stops everything it started.
     crate::sys::new_group(&mut cmd);
-    let mut child = cmd.spawn().map_err(|e| format!("could not start claude: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("could not start claude: {}", crate::fd_limit::explain(e)))?;
     if let Some(mut w) = child.stdin.take() {
         let _ = w.write_all(prompt.as_bytes());
     }

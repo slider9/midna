@@ -31,8 +31,17 @@ fn q(v: &str) -> String {
     if short.is_empty() || short.contains(char::is_whitespace) || short.contains('"') { format!("{short:?}") } else { short }
 }
 
-/// One line saying what a trigger action does (`send: "/compact" → "{{last_prompt}}"`).
+/// One line saying what a trigger action does (`send: "/compact" → "{{last_prompt}}"`), and the
+/// terminal it names (`… on terminal build-angel`).
 pub fn action_text(a: &Value) -> String {
+    let what = what_text(a);
+    match a["to"].as_str() {
+        Some(to) => format!("{what} on terminal {}", q(to)),
+        None => what,
+    }
+}
+
+fn what_text(a: &Value) -> String {
     match a["kind"].as_str() {
         Some("start_agent") => format!("start {} in {}", s(a, "agent"), s(a, "project_id")),
         Some("run_command") => {
@@ -105,7 +114,14 @@ pub fn filter_text(f: &Value) -> String {
     }
     if let Some(m) = f["match"].as_object().filter(|m| !m.is_empty()) {
         // Sorted: map order depends on serde_json's preserve_order, which the workspace may turn on.
-        let mut pairs: Vec<String> = m.iter().map(|(k, v)| format!("{k}={}", q(v.as_str().unwrap_or("")))).collect();
+        // A list of globs (all must match) shows as one pair per glob, as `--match` takes them.
+        let globs = |v: &Value| -> Vec<String> {
+            match v {
+                Value::Array(a) => a.iter().map(|g| g.as_str().unwrap_or("").to_string()).collect(),
+                _ => vec![v.as_str().unwrap_or("").to_string()],
+            }
+        };
+        let mut pairs: Vec<String> = m.iter().flat_map(|(k, v)| globs(v).into_iter().map(move |g| format!("{k}={}", q(&g)))).collect();
         pairs.sort();
         out.push(format!("match {}", pairs.join(" ")));
     }
@@ -152,7 +168,9 @@ fn print_trigger(t: &Value) {
             println!("  when     {}", sc.describe(c));
             println!("  runs     {} (local time)", if runs.is_empty() { "never again".into() } else { format!("{}, …", runs.join(", ")) });
         } else {
-            println!("  cooldown {}s per terminal", t["cooldown_secs"].as_u64().unwrap_or(60));
+            let event = s(t, "event");
+            let secs = t["cooldown_secs"].as_u64().unwrap_or_else(|| midna_proto::types::default_cooldown_secs(&event));
+            println!("  cooldown {secs}s {}", midna_proto::types::cooldown_scope(&event));
         }
     } else {
         let secret = if t["secret_set"].as_bool() == Some(true) { format!("set {} ({})", s(t, "secret_set_at"), s(t, "secret_store")) } else { "not set".into() };
@@ -195,7 +213,7 @@ fn print_deliveries(v: &Value) {
     table(rows);
 }
 
-fn print_delivery(d: &Value) {
+pub(crate) fn print_delivery(d: &Value) {
     println!("{} {}  {}", s(d, "id"), s(d, "verdict"), s(d, "summary"));
     for e in d["eval"].as_array().into_iter().flatten() {
         println!("  {}", plain(e));
@@ -252,13 +270,43 @@ fn print_status(v: &Value) {
 }
 
 /// Event namespaces that can only be local (GitHub/Bitbucket never send these).
-const LOCAL_EVENT_PREFIXES: &[&str] = &["hook.", "agent.", "session.", "needs_you."];
+const LOCAL_EVENT_PREFIXES: &[&str] = &["hook.", "agent.", "session.", "needs_you.", "stream."];
 
 /// Flags that only make sense on a local trigger; any of them makes `add` default to `--source local`.
 const LOCAL_FLAGS: &[&str] = &[
     "session", "in-project", "for-agent", "idle-for", "cron", "between", "starts", "ends", "max-runs", "wake", "match", "send", "send-no-enter",
-    "set-status", "clear-status", "cooldown", "enable",
+    "set-status", "clear-status", "cooldown", "enable", "to",
 ];
+
+/// Actions that act on (or point at) a terminal, so they take `--to`.
+const TO_KINDS: &[&str] = &["send_to_session", "set_status", "clear_status", "attention", "notify"];
+
+/// `--to NAME|ID`: the terminal the action acts on instead of the one that fired (`""` clears
+/// it). On update, alone it changes the current action's, and a new action keeps the current
+/// one's unless it's `--action-json`.
+pub fn with_to(a: &Args, act: Option<Value>, cur: Option<&Value>) -> Result<Option<Value>, Fail> {
+    let keep = cur.and_then(|c| c.get("to")).filter(|t| t.is_string() && !a.has("action-json")).cloned();
+    let (act, to) = match (act, a.get("to")) {
+        (act, None) => {
+            let Some(mut act) = act else { return Ok(None) };
+            if let (Some(t), true) = (keep, act.get("to").is_none() && TO_KINDS.contains(&act["kind"].as_str().unwrap_or(""))) {
+                act["to"] = t;
+            }
+            return Ok(Some(act));
+        }
+        (act, Some(to)) => (act.or_else(|| cur.cloned()), to.trim()),
+    };
+    let Some(mut act) = act.filter(|x| TO_KINDS.contains(&x["kind"].as_str().unwrap_or(""))) else {
+        return Err(Fail::Usage("--to goes with --send, --set-status, --clear-status, --notify or --attention".into()));
+    };
+    match act.as_object_mut() {
+        Some(o) if to.is_empty() => {
+            o.remove("to");
+        }
+        _ => act["to"] = json!(to),
+    }
+    Ok(Some(act))
+}
 
 fn is_local_event(e: &str) -> bool {
     e == "idle" || e == "schedule" || LOCAL_EVENT_PREFIXES.iter().any(|p| e.starts_with(p))
@@ -535,12 +583,29 @@ fn filter_from(a: &Args, base: Value) -> Result<(Value, bool), Fail> {
     if !a.all("match").is_empty() {
         touched = true;
         let mut m = f.get("match").and_then(Value::as_object).cloned().unwrap_or_default();
+        // A path given here replaces what it had; given again, its globs collect into a list
+        // that must all match, in any order.
+        let mut given = std::collections::HashSet::new();
         for raw in a.all("match") {
             let (k, g) = parse_match(raw).map_err(Fail::Usage)?;
             if g.is_empty() {
                 m.remove(&k);
-            } else {
-                m.insert(k, json!(g));
+                given.remove(&k);
+                continue;
+            }
+            match m.get_mut(&k) {
+                Some(old) if given.contains(&k) => {
+                    let mut list = match old.take() {
+                        Value::Array(v) => v,
+                        one => vec![one],
+                    };
+                    list.push(json!(g));
+                    *old = Value::Array(list);
+                }
+                _ => {
+                    m.insert(k.clone(), json!(g));
+                    given.insert(k);
+                }
             }
         }
         f["match"] = Value::Object(m);
@@ -610,7 +675,7 @@ const ADD_FLAGS: &[&str] = &[
     "name", "source", "event", "repo", "branch", "action", "label", "agent", "prompt", "run", "attention", "project", "hook-id", "session-name",
     "session", "in-project", "for-agent", "idle-for", "cron", "between", "starts", "ends", "max-runs", "wake", "match", "send", "send-no-enter",
     "set-status", "color", "base", "clear-on", "icon", "clear-status", "cooldown", "enable", "action-json", "filter-json", "notify", "notify-body", "notify-kind", "notify-open", "notify-id", "silent",
-    "background", "headless", "timeout", "permission-mode", "allow-tool",
+    "background", "headless", "timeout", "permission-mode", "allow-tool", "to",
 ];
 
 /// Typing isn't echoed while this lives (the newline still is, on Unix); restored on drop.
@@ -730,7 +795,7 @@ pub fn triggers(a: &Args, out: OutFn) -> Res {
                 None if local_flag.is_some() || is_local_event(event) => "local",
                 None => "github",
             };
-            let action = action_from(a, a.get("project").map(str::to_string), None)?.ok_or_else(|| {
+            let action = with_to(a, action_from(a, a.get("project").map(str::to_string), None)?, None)?.ok_or_else(|| {
                 Fail::Usage(if source == "local" {
                     "pick an action: --send TEXT (repeatable), --set-status LABEL --color C --base B, --clear-status, --notify TITLE, \
                      --attention MSG, --run CMD --project P [--background|--headless], --agent claude|codex --prompt T --project P, or --action-json JSON"
@@ -769,7 +834,7 @@ pub fn triggers(a: &Args, out: OutFn) -> Res {
                 None
             });
             let mut p = json!({ "id": id, "name": a.get("name"), "event": event, "source": a.get("source"),
-                "action": action_from(a, project, Some(&cur["action"]))?, "github_hook_id": a.num::<u64>("hook-id")?,
+                "action": with_to(a, action_from(a, project, Some(&cur["action"]))?, Some(&cur["action"]))?, "github_hook_id": a.num::<u64>("hook-id")?,
                 "session_name_template": a.get("session-name"), "cooldown_secs": cooldown(a)? });
             if touched {
                 p["filter"] = filter;
@@ -808,8 +873,23 @@ pub fn triggers(a: &Args, out: OutFn) -> Res {
             out(&v, &print_delivery);
         }
         "test" => {
-            a.check(&["payload", "event", "session"])?;
+            a.check(&["payload", "event", "session", "stream", "kind", "id", "data"])?;
             let id = a.need(2, "trigger id")?;
+            if let Some(name) = a.get("stream") {
+                // A stream event, as `midna stream publish` would send it; nothing is published.
+                let kind = a.get("kind").ok_or_else(|| Fail::Usage("--stream needs --kind (e.g. --stream slack --kind message)".into()))?;
+                if a.get("payload").is_some() {
+                    return Err(Fail::Usage("with --stream, give the event's data with --data".into()));
+                }
+                let data = crate::stream::payload(a.get("data"), std::io::stdin().is_terminal())?;
+                let stream = json!({ "name": name, "kind": kind, "id": a.get("id") });
+                let v = call("trigger.test", json!({ "trigger_id": id, "payload": data, "stream": stream, "session": a.get("session") }))?;
+                out(&v, &print_delivery);
+                return Ok(());
+            }
+            if let Some(f) = ["kind", "id", "data"].into_iter().find(|f| a.get(f).is_some()) {
+                return Err(Fail::Usage(format!("--{f} goes with --stream (e.g. --stream slack --kind message --data '{{\"text\":\"…\"}}')")));
+            }
             let raw = match a.get("payload") {
                 Some(inline) if inline.trim_start().starts_with(['{', '[']) => inline.to_string(),
                 None if std::io::stdin().is_terminal() => "{}".into(),
@@ -923,7 +1003,7 @@ mod tests {
 
     #[test]
     fn local_events() {
-        for e in ["hook.Stop", "agent.prompt_blocked", "session.status", "needs_you.raised", "idle", "schedule", "hook.*"] {
+        for e in ["hook.Stop", "agent.prompt_blocked", "session.status", "needs_you.raised", "idle", "schedule", "hook.*", "stream.slack.*"] {
             assert!(is_local_event(e), "{e}");
         }
         for e in ["pull_request.opened", "push", "pullrequest:created", "project.created"] {
@@ -960,6 +1040,24 @@ mod tests {
         assert_eq!(edited["label"], "Prompt blocked");
         assert!(action_from(&args(&["t", "--color", "red"]), None, None).is_err());
         assert!(action_from(&args(&["t", "--color", "red", "--send", "x"]), None, Some(&act)).is_err());
+    }
+
+    #[test]
+    fn to_names_the_terminal() {
+        let to = |v: &[&str], cur: Option<&Value>| with_to(&args(v), action_from(&args(v), None, cur)?, cur);
+        let sent = ok(to(&["t", "--send", "rebuild", "--to", " build-angel "], None)).unwrap();
+        assert_eq!(sent, json!({ "kind": "send_to_session", "steps": [{ "text": "rebuild", "enter": true }], "to": "build-angel" }));
+        assert_eq!(action_text(&sent), "send: \"rebuild\" on terminal build-angel");
+        assert!(to(&["t", "--run", "make", "--to", "x"], None).is_err(), "run_command acts on no terminal");
+        assert!(to(&["t", "--to", "x"], None).is_err(), "add: --to needs an action");
+        // Update: alone it changes the current action's; empty clears it; a new action keeps it.
+        let moved = ok(to(&["t", "--to", "api"], Some(&sent))).unwrap();
+        assert_eq!((moved["to"].as_str(), &moved["steps"]), (Some("api"), &sent["steps"]));
+        assert_eq!(ok(to(&["t", "--to", ""], Some(&sent))).unwrap().get("to"), None);
+        assert_eq!(ok(to(&["t", "--clear-status"], Some(&sent))), Some(json!({ "kind": "clear_status", "to": "build-angel" })));
+        assert_eq!(ok(to(&["t", "--action-json", r#"{"kind":"clear_status"}"#], Some(&sent))), Some(json!({ "kind": "clear_status" })));
+        assert_eq!(ok(to(&["t", "--color", "red"], Some(&json!({ "kind": "set_status", "to": "a" })))).unwrap()["to"], "a");
+        assert!(to(&["t", "--to", "x"], Some(&json!({ "kind": "run_command", "command": "make" }))).is_err());
     }
 
     #[test]
@@ -1010,6 +1108,12 @@ mod tests {
         let (f2, _) = ok(filter_from(&a, f));
         assert_eq!(f2["match"], json!({ "message": "*Compact*", "prompt": "*deploy*" }));
         assert!(f2["session"].is_null());
+        // the same path twice: both globs, in any order; given again it's replaced
+        let (f6, _) = ok(filter_from(&args(&["t", "--match", "text=*failed*", "--match", "text=*master*"]), f2.clone()));
+        assert_eq!(f6["match"], json!({ "message": "*Compact*", "prompt": "*deploy*", "text": ["*failed*", "*master*"] }));
+        assert_eq!(filter_text(&json!({ "match": { "text": f6["match"]["text"].clone() } })), "match text=*failed* text=*master*");
+        let (f7, _) = ok(filter_from(&args(&["t", "--match", "text=*red*"]), f6));
+        assert_eq!(f7["match"]["text"], json!("*red*"));
         assert!(filter_from(&args(&["t", "--idle-for", "90s"]), json!({})).is_err());
         assert!(filter_from(&args(&["t", "--for-agent", "gpt"]), json!({})).is_err());
         let (f3, _) = ok(filter_from(&args(&["t", "--filter-json", r#"{"match":{"message":"*x y*"}}"#, "--idle-for", "55"]), json!({ "repo": "a/b" })));

@@ -43,6 +43,13 @@ pub enum Icon {
     Project,
     Play,
     Screen,
+    /// A Mac: a display on a stand (Settings ▸ Nearby's devices).
+    Mac,
+    /// Another Mac that can't be reached (asleep): the display with a lock (the needs-you
+    /// pill's tab, list header and card).
+    MacOff,
+    /// This Mac: a laptop (the needs-you list's header, beside another Mac's display).
+    Laptop,
     Check,
     Cross,
     Plus,
@@ -65,6 +72,8 @@ pub enum Icon {
     Server,
     Tag,
     Issue,
+    /// A closed issue (the terminal's issue links, `terminal/pr_status.rs`).
+    IssueClosed,
     /// Icons an app's link menu names (`links.actions.register`): a task, a bug.
     Checklist,
     Bug,
@@ -108,6 +117,10 @@ pub enum Icon {
     Summary,
     /// Copy to the clipboard (two overlapping sheets).
     Copy,
+    /// A ring with a solid quarter: spun by [`spinner`] while something loads.
+    Spinner,
+    /// An empty circle: a step still to come.
+    Ring,
 }
 
 impl Icon {
@@ -142,6 +155,9 @@ impl Icon {
             Icon::Project => "icons/project.svg",
             Icon::Play => "icons/play.svg",
             Icon::Screen => "icons/screen.svg",
+            Icon::Mac => "icons/mac.svg",
+            Icon::MacOff => "icons/mac-off.svg",
+            Icon::Laptop => "icons/laptop.svg",
             Icon::Check => "icons/check.svg",
             Icon::Cross => "icons/cross.svg",
             Icon::Plus => "icons/plus.svg",
@@ -159,6 +175,7 @@ impl Icon {
             Icon::Server => "icons/server.svg",
             Icon::Tag => "icons/tag.svg",
             Icon::Issue => "icons/issue.svg",
+            Icon::IssueClosed => "icons/issue-closed.svg",
             Icon::Checklist => "icons/checklist.svg",
             Icon::Bug => "icons/bug.svg",
             Icon::PushPin => "icons/pushpin.svg",
@@ -187,6 +204,8 @@ impl Icon {
             Icon::Chain => "icons/chain.svg",
             Icon::ChainBroken => "icons/chain-broken.svg",
             Icon::Copy => "icons/copy.svg",
+            Icon::Spinner => "icons/spinner.svg",
+            Icon::Ring => "icons/ring.svg",
         }
     }
 
@@ -242,6 +261,16 @@ impl Icon {
     pub fn el(self, size: f32, color: Hsla) -> Svg {
         svg().path(self.path()).size(px(size)).flex_none().text_color(color)
     }
+}
+
+/// A spinning ring (the design's `.spin`, one turn every 0.9s). `id` tells spinners on the
+/// same screen apart.
+pub fn spinner(id: impl Into<SharedString>, size: f32, color: Hsla) -> impl IntoElement {
+    Icon::Spinner.el(size, color).with_animation(
+        ElementId::Name(id.into()),
+        Animation::new(std::time::Duration::from_millis(900)).repeat(),
+        |el, d| el.with_transformation(Transformation::rotate(radians(d * std::f32::consts::TAU))),
+    )
 }
 
 fn source(path: &str) -> Option<&'static str> {
@@ -361,8 +390,23 @@ fn source(path: &str) -> Option<&'static str> {
         "icons/screen.svg" => {
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="1.4"><rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M1.5 6h13"/></svg>"##
         }
+        "icons/mac.svg" => {
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="9" rx="1.6"/><path d="M8 11.5v2.5M5.5 14h5"/></svg>"##
+        }
+        "icons/mac-off.svg" => {
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="#000" stroke-width="1.3" stroke-linecap="round"><rect x="0.9" y="1.5" width="8.4" height="6" rx="1"/><path d="M3.1 11.6h4M5.1 7.5v4.1"/><rect x="8.5" y="9.2" width="5.2" height="4.1" rx=".8" fill="#000" stroke="none"/><path d="M9.7 9.2V8.1a1.4 1.4 0 0 1 2.8 0v1.1" stroke-width="1.2" stroke-linecap="butt"/></svg>"##
+        }
+        "icons/laptop.svg" => {
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="#000" stroke-width="1.3" stroke-linecap="round"><rect x="2.4" y="2.6" width="9.2" height="6.6" rx="1"/><path d="M1 11.4h12"/></svg>"##
+        }
         "icons/copy.svg" => {
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="1.4" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.6"/><path d="M10.5 3.2V3a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 3v5A1.5 1.5 0 0 0 4 9.5h.2"/></svg>"##
+        }
+        "icons/spinner.svg" => {
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="2"><circle cx="8" cy="8" r="6" stroke-opacity=".3"/><path d="M8 2a6 6 0 0 1 6 6" stroke-linecap="round"/></svg>"##
+        }
+        "icons/ring.svg" => {
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="1.7"><circle cx="8" cy="8" r="5.3"/></svg>"##
         }
         "icons/check.svg" => {
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 6.5 12 13 4.5"/></svg>"##
@@ -416,6 +460,9 @@ fn source(path: &str) -> Option<&'static str> {
         }
         "icons/issue.svg" => {
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.5"/><path d="M8 7.4v1.2"/></svg>"##
+        }
+        "icons/issue-closed.svg" => {
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 8A6.5 6.5 0 1 1 11 2.2"/><path d="M5.6 8.1 7.4 9.9l6.6-6.6"/></svg>"##
         }
         "icons/pushpin.svg" => {
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="1.3" stroke-linejoin="round"><path d="M10.5 1.5 14.5 5.5 12 6.5 9.5 9l.5 3.5-1 1L6 10.5 2.5 14l-.5-.5L5.5 10 2.5 7l1-1L7 6.5 9.5 4z"/></svg>"##

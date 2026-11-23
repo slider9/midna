@@ -1,7 +1,10 @@
-//! Closing a main window that still has terminals while another main window is open asks
-//! whether to close its terminals or move them to the window you used last. Ticking "Don't
+//! Closing a main window that still has terminals while another window of the same Mac is open
+//! asks whether to close its terminals or move them to that Mac's window you used last. Another
+//! Mac's only window just closes: its terminals have nowhere to move and keep running there,
+//! so closing the window you drive or watch it from changes nothing on it. Ticking "Don't
 //! ask again" saves the answer in `windows.close_with_terminals` (Settings ▸ General changes
 //! it back). The last main window just closes: midna quits and the shells keep running in midnad.
+//! This Mac's last window, while another Mac's is open, hides instead (`windows::hide`).
 use crate::app::MainWindow;
 use crate::model::StatusState;
 use crate::theme::Theme;
@@ -30,8 +33,13 @@ fn own(m: &MainWindow) -> Vec<String> {
 /// The window is about to close (traffic light, ⌘W in an empty window, the menu). True =
 /// let it; false = it asked, or it's busy closing.
 pub fn should_close(m: &mut MainWindow, window: &mut Window, cx: &mut Context<MainWindow>) -> bool {
+    // This Mac's last window beside another Mac's: hidden, with its terminals (`windows::hide`).
+    if m.windows.borrow().hides_on_close(m.id) {
+        crate::windows::hide(m.id, window, cx);
+        return false;
+    }
     let ids = own(m);
-    if ids.is_empty() || !m.windows.borrow().has_other(m.id) {
+    if ids.is_empty() || !m.windows.borrow().mac_has_other(m.id) {
         if m.windows.borrow().has_other(m.id) {
             crate::windows::leaving(m.id, cx);
         }

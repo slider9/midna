@@ -10,7 +10,7 @@ use std::sync::Arc;
 pub fn hook(d: &Arc<Daemon>, ctx: &Ctx, p: AgentHookParams) -> R {
     let sid = p.session.clone().or(ctx.session.clone()).ok_or_else(|| RpcError::bad_params("no session: run inside a midna terminal or pass session"))?;
     let live = d.core().state.session(&sid).map(|s| (s.status.state, s.project_id.clone()));
-    let actor = Actor { kind: ActorKind::Agent, session: Some(sid.clone()), name: Some(p.agent.as_str().into()), trigger: None, via: None };
+    let actor = Actor { kind: ActorKind::Agent, session: Some(sid.clone()), name: Some(p.agent.as_str().into()), trigger: None, via: None, peer: None };
     let ev = p.event.as_str();
     let payload = &p.payload;
     let Some((cur, project)) = live else {
@@ -22,11 +22,15 @@ pub fn hook(d: &Arc<Daemon>, ctx: &Ctx, p: AgentHookParams) -> R {
         }
         return ok(AgentHookResult { ok: true, status: None });
     };
+    // A claude that the terminal's own agent started (a script's `claude -p` in its Bash tool)
+    // inherits MIDNA_SESSION. Its SessionEnd and Stop would show this terminal done mid-turn.
+    if let Some(pid) = ctx.pid.filter(|_| p.session.is_none())
+        && crate::guard::hook_from_nested_agent(d, &sid, pid)
+    {
+        return ok(AgentHookResult { ok: true, status: Some(cur) });
+    }
     if ev == "SessionEnd" {
         session_ended(d, &sid, &project, &actor, p.agent, payload, d.ends.take(&sid));
-    }
-    if let Some(pid) = ctx.pid.filter(|_| p.session.is_none()) {
-        crate::guard::note_hook_caller(d, &sid, pid);
     }
     note_hooked(d, &sid, ctx.pid);
     if !(p.agent == AgentKind::Codex && is_codex_title_turn(payload)) {
@@ -37,6 +41,9 @@ pub fn hook(d: &Arc<Daemon>, ctx: &Ctx, p: AgentHookParams) -> R {
     crate::guard::after_tool(d, &sid, ev, payload);
     if ev == "PreToolUse" {
         crate::crons::on_pre_tool(d, &sid, p.agent, payload);
+    }
+    if ev == "SessionStart" && matches!(payload.get("source").and_then(Value::as_str), Some("startup" | "resume")) {
+        crate::usage::forget_process(d, &sid);
     }
     match ev {
         "statusline" => {
@@ -61,6 +68,11 @@ pub fn hook(d: &Arc<Daemon>, ctx: &Ctx, p: AgentHookParams) -> R {
             crate::resume::on_turn_started(d, &sid);
         }
         "Stop" | "StopFailure" => {
+            // An agent started or asked from a paired Mac that wants its answer back. Before the
+            // turn ends here: once it has, the queue may type an agent ask's prompt, and this
+            // turn's message isn't that prompt's answer.
+            let failed = (ev == "StopFailure").then(|| payload.get("error").and_then(Value::as_str).unwrap_or("unknown error"));
+            crate::nearby::agent_start::turn_ended(d, &sid, payload.get("last_assistant_message").and_then(Value::as_str), failed);
             end_turn(d, &sid, &project, &actor, ev, payload.get("last_assistant_message").and_then(Value::as_str));
             if ev == "StopFailure" {
                 let s = |k: &str| payload.get(k).and_then(Value::as_str).unwrap_or("");
@@ -87,6 +99,7 @@ pub fn hook(d: &Arc<Daemon>, ctx: &Ctx, p: AgentHookParams) -> R {
             if !title_just_ended {
                 start_turn(d, &sid, &project, &actor);
             }
+            crate::nearby::agent_start::turn_ended(d, &sid, payload.get("last-assistant-message").and_then(Value::as_str), None);
             end_turn(d, &sid, &project, &actor, ev, payload.get("last-assistant-message").and_then(Value::as_str));
         }
         _ => {}
@@ -188,6 +201,18 @@ fn raise_prompt(d: &Daemon, sid: &str, actor: &Actor, reason: &str, question: Op
     d.core().agents.entry(sid.to_string()).or_default().prompt_raised_at = Some(std::time::Instant::now());
 }
 
+/// Codex's approval overlay, found on screen while it works. No hook reports it: Codex runs
+/// with `notify` only, which fires at the end of a turn, so the overlay ("Would you like to run
+/// the following command?") shows only on screen and in its title ("Action Required"). Raises
+/// the same needs-you item Claude's hooks do.
+pub fn raise_codex_prompt(d: &Daemon, sid: &str, screen: &[String]) {
+    let edits = screen.iter().any(|l| l.contains("Would you like to make the following edits"));
+    let reason = if edits { "Codex wants to make edits" } else { "Codex wants to run a command" }.to_string();
+    let actor = Actor { kind: ActorKind::Agent, session: Some(sid.to_string()), name: Some(AgentKind::Codex.as_str().into()), trigger: None, via: None, peer: None };
+    raise_prompt(d, sid, &actor, &reason, None);
+    d.set_status(sid, StatusState::NeedsYou, Some(reason), None, actor);
+}
+
 fn retitle_prompt(d: &Daemon, sid: &str, title: &str, question: Option<NeedsYouQuestion>) {
     let item = {
         let mut core = d.core();
@@ -221,6 +246,12 @@ fn end_turn(d: &Daemon, sid: &str, project: &str, actor: &Actor, reason: &str, m
         let mut data = json!({ "reason": reason });
         if let Some(m) = message.map(|m| m.chars().take(300).collect::<String>()).filter(|m| !m.trim().is_empty()) {
             data["message"] = json!(m);
+        }
+        // As the turn left them: by the time the notifier reads the event, a later turn may
+        // have started or ended its background tasks.
+        let background = d.core().state.session(sid).and_then(|s| s.agent_info.as_ref()).map_or(0, |i| crate::notify::running(i).count());
+        if background > 0 {
+            data["background"] = json!(background);
         }
         d.emit(kinds::AGENT_TURN_ENDED, actor.clone(), Some(project.into()), Some(sid.into()), data);
     }

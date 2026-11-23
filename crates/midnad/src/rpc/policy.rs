@@ -37,6 +37,11 @@ fn check_now(d: &Daemon, a: &PolicyAction) -> CheckResult {
 /// (no rule matched) are logged as `policy.decided`, so the Rules feed can show them too.
 fn evaluate_and_fire(d: &Daemon, a: &PolicyAction, actor: &Actor) -> CheckResult {
     let res = check_now(d, a);
+    fire(d, a, actor, &res);
+    res
+}
+
+fn fire(d: &Daemon, a: &PolicyAction, actor: &Actor, res: &CheckResult) {
     if res.rule.is_none() {
         let setting = d.core().state.setting_str("policy.default");
         // An unmatched tool call has no midna opinion: the agent's own permission flow decides.
@@ -65,7 +70,6 @@ fn evaluate_and_fire(d: &Daemon, a: &PolicyAction, actor: &Actor) -> CheckResult
             json!({ "rule_id": r.id, "effect": r.effect, "action": a }),
         );
     }
-    res
 }
 
 pub fn check(d: &Daemon, ctx: &Ctx, p: PolicyCheckParams) -> R {
@@ -118,6 +122,21 @@ pub fn ask_human(d: &Daemon, ctx: &Ctx, a: &PolicyAction, matched_rule: Option<I
         ActionKind::Tool => format!("Allow {}?", a.value),
         _ => format!("Allow `{}`?", a.value),
     };
+    ask_human_titled(d, ctx, a, title, matched_rule, detail, timeout_secs, target)
+}
+
+/// [`ask_human`] with its own title.
+#[allow(clippy::too_many_arguments)]
+fn ask_human_titled(
+    d: &Daemon,
+    ctx: &Ctx,
+    a: &PolicyAction,
+    title: String,
+    matched_rule: Option<Id>,
+    detail: Option<String>,
+    timeout_secs: u64,
+    target: Option<Id>,
+) -> PolicyRequestResult {
     let mut item = d.new_needs_you(NeedsYouKind::Approval, title, ctx.actor(), a.session.clone());
     item.project_id = item.project_id.or(a.project.clone());
     item.detail = detail.unwrap_or_default();
@@ -245,6 +264,38 @@ pub fn gate_with(d: &Daemon, ctx: &Ctx, kind: ActionKind, value: &str, target: O
     }
 }
 
+/// Policy gate for an agent sending something off this Mac (`value`, e.g. `share send message
+/// <device id>`): a deny refuses, an allow the human gave lets it through, and anything else
+/// asks the human with `title` and `detail` (what would leave) and waits. An agent's own allow
+/// rule never counts ([`crate::policy::evaluate_off_machine`]). Approving "always" remembers
+/// exactly `value`. `allowed`: the human let agents send this without asking (Settings ›
+/// Nearby), which lets it through where no rule decides; a deny or ask rule still applies.
+pub fn gate_off_machine(d: &Daemon, ctx: &Ctx, value: &str, title: String, detail: String, allowed: bool) -> Result<(), RpcError> {
+    let a = complete(d, ctx, PolicyAction { kind: ActionKind::Cli, value: value.to_string(), session: None, project: None });
+    let mut res = crate::policy::evaluate_off_machine(&d.core().state.rules, &a, time::now_unix());
+    if allowed && res.source == DecisionSource::Default {
+        res.decision = Effect::Allow;
+    }
+    fire(d, &a, &ctx.actor(), &res);
+    match res.decision {
+        Effect::Allow => Ok(()),
+        Effect::Deny => Err(RpcError::refused(format!(
+            "`{value}` denied by {}",
+            res.rule.map(|r| format!("rule {}", r.id)).unwrap_or_else(|| "policy".into())
+        ))),
+        Effect::Ask => {
+            let timeout = d.core().state.setting_i64("policy.request_timeout_secs").max(1) as u64;
+            let r = ask_human_titled(d, ctx, &a, title, res.rule.map(|r| r.id), Some(detail), timeout, None);
+            if r.decision == Effect::Allow {
+                Ok(())
+            } else {
+                Err(RpcError::refused(format!("nothing was sent: {}", r.reason.unwrap_or_default()))
+                    .with_data(json!({ "needs_you_id": r.needs_you_id, "source": r.source })))
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------------ rules
 
 pub fn rule_list(d: &Daemon) -> R {
@@ -300,8 +351,8 @@ pub fn rule_add(d: &Daemon, ctx: &Ctx, p: RuleAddParams) -> R {
     ok(insert_rule(d, new_rule(p.effect, p.matcher, scope, p.expires_in_secs, ctx.actor())))
 }
 
-/// The rule an approval scope creates (None for `once`).
-pub fn rule_from_approval(d: &Daemon, item: &NeedsYou, scope: &ApprovalScope) -> Option<Rule> {
+/// The rule an approval scope creates (None for `once`), made by whoever approved (`by`).
+pub fn rule_from_approval(d: &Daemon, item: &NeedsYou, scope: &ApprovalScope, by: Actor) -> Option<Rule> {
     let a = &item.approval.as_ref()?.action;
     let session = a.session.clone().or(item.session_id.clone());
     let project = a.project.clone().or(item.project_id.clone());
@@ -316,7 +367,7 @@ pub fn rule_from_approval(d: &Daemon, item: &NeedsYou, scope: &ApprovalScope) ->
         ApprovalScope::Always => (project.map(RuleScope::Project).unwrap_or(RuleScope::Global), None),
     };
     let matcher = Matcher { kind: a.kind, pattern: escape_glob(&a.value) };
-    let mut rule = new_rule(Effect::Allow, matcher, rule_scope, expires, Actor::human());
+    let mut rule = new_rule(Effect::Allow, matcher, rule_scope, expires, by);
     rule.origin = Some(RuleOrigin { needs_you_id: item.id.clone(), approval_scope: scope.clone() });
     Some(insert_rule(d, rule))
 }

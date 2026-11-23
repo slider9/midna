@@ -16,6 +16,7 @@ pub mod script;
 pub mod secret;
 pub mod session;
 pub mod settings;
+pub mod streams;
 pub mod themes;
 pub mod trigger;
 pub mod ui;
@@ -56,6 +57,15 @@ pub struct Ctx {
     /// Agents this call starts run supervised (`triggers.agent_mode`): set for webhook triggers
     /// and notification buttons, whose prompts carry text the human didn't write.
     pub supervised: bool,
+    /// The verified Midna app itself, on this Mac (not an agent, the CLI or a drive link): the
+    /// only caller that may open a drive link (`drive.open`). Set by [`crate::conn`].
+    pub app: bool,
+    /// The call comes from something a trigger's action started (`caller.caused_by`), or is a
+    /// trigger's own action opening a terminal. See [`Ctx::caused_by`].
+    pub caused_by: Option<TriggerCause>,
+    /// The stream producer token the caller sent (`caller.stream_token`); see
+    /// [`crate::producers::token_ok`].
+    pub stream_token: Option<String>,
 }
 
 /// What a detached `caller.no_wait` call reports back to the connection that made it.
@@ -106,6 +116,9 @@ fn call_no_wait(d: &Arc<Daemon>, ctx: &Ctx, method: &str, params: Value) -> R {
         detached: Some(nw.clone()),
         client: ctx.client.clone(),
         supervised: ctx.supervised,
+        caused_by: ctx.caused_by.clone(),
+        stream_token: ctx.stream_token.clone(),
+        app: ctx.app,
     };
     let (d2, m) = (d.clone(), method.to_string());
     let spawned = std::thread::Builder::new().name("no-wait".into()).spawn(move || {
@@ -142,26 +155,37 @@ impl Ctx {
         let caller: Caller = params.get("caller").cloned().and_then(|c| serde_json::from_value(c).ok()).unwrap_or_default();
         let downgrade = caller.session.is_some() || caller.role.as_deref() == Some("agent");
         let role = if downgrade { Role::Agent } else { base };
-        Ctx { role, session: caller.session, conn_id, out, pid, as_actor: None, no_wait: caller.no_wait, detached: None, client: None, supervised: false }
+        Ctx { role, session: caller.session, conn_id, out, pid, as_actor: None, no_wait: caller.no_wait, detached: None, client: None, supervised: false, app: false, caused_by: caller.caused_by, stream_token: caller.stream_token }
     }
 
     /// A human context for executing approved deferred actions (no connection).
     pub fn internal_human() -> Ctx {
-        Ctx { role: Role::Human, session: None, conn_id: 0, out: OutTx::detached(), pid: None, as_actor: None, no_wait: false, detached: None, client: None, supervised: false }
+        Ctx { role: Role::Human, session: None, conn_id: 0, out: OutTx::detached(), pid: None, as_actor: None, no_wait: false, detached: None, client: None, supervised: false, app: false, caused_by: None, stream_token: None }
     }
 
     /// midnad acting on its own (actor kind `system`), e.g. closing a `close_on_exit` terminal.
     pub fn internal_system() -> Ctx {
-        Ctx { role: Role::Human, session: None, conn_id: 0, out: OutTx::detached(), pid: None, as_actor: Some(Actor::system()), no_wait: false, detached: None, client: None, supervised: false }
+        Ctx { role: Role::Human, session: None, conn_id: 0, out: OutTx::detached(), pid: None, as_actor: Some(Actor::system()), no_wait: false, detached: None, client: None, supervised: false, app: false, caused_by: None, stream_token: None }
     }
 
     /// A trigger acting on its own (agent-level privileges, actor kind `trigger`).
     pub fn internal_trigger(actor: Actor) -> Ctx {
-        Ctx { role: Role::Agent, session: None, conn_id: 0, out: OutTx::detached(), pid: None, as_actor: Some(actor), no_wait: false, detached: None, client: None, supervised: false }
+        Ctx { role: Role::Agent, session: None, conn_id: 0, out: OutTx::detached(), pid: None, as_actor: Some(actor), no_wait: false, detached: None, client: None, supervised: false, app: false, caused_by: None, stream_token: None }
     }
 
     pub fn is_human(&self) -> bool {
         self.role == Role::Human
+    }
+
+    /// The trigger behind this call, if any: the one it acts as (its own action, or a process of
+    /// its headless run), else what the caller said (`caller.caused_by`). A stream event it
+    /// publishes fires no triggers, and a terminal it opens carries `MIDNA_TRIGGER` on.
+    pub fn caused_by(&self) -> Option<TriggerCause> {
+        match (&self.caused_by, &self.as_actor) {
+            (Some(c), _) => Some(c.clone()),
+            (None, Some(Actor { kind: ActorKind::Trigger, trigger: Some(id), .. })) => Some(TriggerCause { trigger: id.clone(), delivery: None }),
+            _ => None,
+        }
     }
 
     pub fn actor(&self) -> Actor {
@@ -239,6 +263,8 @@ pub fn call(d: &Arc<Daemon>, ctx: &Ctx, method: &str, mut params: Value) -> R {
         Err(RpcError::conflict("midnad is upgrading/restarting; reconnect and retry in a moment"))
     } else if spec.stub {
         Err(RpcError::new(NOT_IMPLEMENTED, format!("{method} is not implemented yet (later phase)")))
+    } else if let Some(e) = crate::nearby::local_only::refusal(d, ctx, method, &params) {
+        Err(e)
     } else if spec.human_only && !ctx.is_human() && !project::agent_may_remove(d, method, &params) && !updates::agent_may_install(d, method) {
         Err(human_only_refusal(d, ctx, method, &params))
     } else if ctx.no_wait && spec.mutating && ctx.detached.is_none() {
@@ -285,6 +311,7 @@ fn dispatch(d: &Arc<Daemon>, ctx: &Ctx, method: &str, p: Value) -> R {
         "session.clear_status" => session::clear_status(d, ctx, parse(p)?),
         "session.set_background" => session::set_background(d, ctx, parse(p)?),
         "session.input" => session::input(d, ctx, parse(p)?),
+        "session.send_image" => session::send_image(d, ctx, parse(p)?),
         "session.read" => session::read(d, parse(p)?),
         "session.resize" => session::resize(d, parse(p)?),
         "session.key" => session::key(d, ctx, parse(p)?),
@@ -323,11 +350,13 @@ fn dispatch(d: &Arc<Daemon>, ctx: &Ctx, method: &str, p: Value) -> R {
         "links.remove" => links::remove(d, ctx, parse(p)?),
         "links.served_by" => links::served_by(d, parse(p)?),
         "links.refresh" => links::refresh(d, ctx, parse(p)?),
+        "links.preview" => links::preview(parse(p)?),
         "links.patterns.list" => links::patterns_list(d),
         "links.patterns.register" => links::patterns_register(d, ctx, parse(p)?),
         "links.actions.list" => links::actions_list(d),
         "links.actions.register" => links::actions_register(d, ctx, parse(p)?),
         "links.actions.approve" => links::actions_approve(d, ctx, parse(p)?),
+        "links.patterns.approve" => links::patterns_approve(d, ctx, parse(p)?),
         "summary.list" => crate::summary::list(d, parse(p)?),
         "summary.remove" => crate::summary::remove(d, ctx, parse(p)?),
         "summary.annotate" => crate::summary::annotate(d, ctx, parse(p)?),
@@ -358,6 +387,14 @@ fn dispatch(d: &Arc<Daemon>, ctx: &Ctx, method: &str, p: Value) -> R {
         "notify.read" => notify::read(d, ctx, parse(p)?),
         "notify.play" => notify::play(d, ctx, parse(p)?),
         "events.list" => events::list(d, parse(p)?),
+        "streams.publish" => streams::publish(d, ctx, parse(p)?),
+        "streams.events" => streams::events(d, parse(p)?),
+        "streams.add" => streams::add(d, ctx, parse(p)?),
+        "streams.update" => streams::update(d, ctx, parse(p)?),
+        "streams.list" => streams::list(d),
+        "streams.remove" => streams::remove(d, ctx, parse(p)?),
+        "streams.set_enabled" => streams::set_enabled(d, ctx, parse(p)?),
+        "streams.restart" => streams::restart(d, parse(p)?),
         "events.subscribe" => events::subscribe(d, ctx, parse(p)?),
         "needs_you.list" => needs_you::list(d, parse(p)?),
         "needs_you.get" => needs_you::get(d, parse(p)?),
@@ -407,6 +444,23 @@ fn dispatch(d: &Arc<Daemon>, ctx: &Ctx, method: &str, p: Value) -> R {
         "usage.get" => ok(crate::usage::get(d)),
         "clock.sleeps" => crate::clock::sleeps(d, parse(p)?),
         "keep_awake.status" => crate::keep_awake::status(d),
+        "peers.list" => crate::nearby::list(d),
+        "peers.pair" => crate::nearby::pairing::pair(d, parse(p)?),
+        "peers.confirm" => crate::nearby::pairing::confirm(d, parse(p)?),
+        "peers.set_tier" => crate::nearby::pairing::set_tier(d, parse(p)?),
+        "peers.set_auto_accept" => crate::nearby::pairing::set_auto_accept(d, parse(p)?),
+        "peers.set_drive" => crate::nearby::pairing::set_drive(d, parse(p)?),
+        "peers.set_agent_send" => crate::nearby::pairing::set_agent_send(d, parse(p)?),
+        "peers.forget" => crate::nearby::pairing::forget(d, parse(p)?),
+        "drive.open" => crate::nearby::relay::open_rpc(d, ctx, parse(p)?),
+        "drive.close" => crate::nearby::relay::close_rpc(d, ctx, parse(p)?),
+        "drive.list" => ok(midna_proto::nearby::DriveListResult { links: crate::nearby::relay::list(d) }),
+        "share.send" => crate::nearby::share::send(d, ctx, parse(p)?),
+        "share.accept" => crate::nearby::share::accept(d, ctx, parse(p)?),
+        "share.decline" => crate::nearby::share::decline(d, ctx, parse(p)?),
+        "share.answer" => crate::nearby::agent_start::answer(d, parse(p)?),
+        "peers.sessions" => crate::nearby::agent_ask::sessions(d, parse(p)?),
+        "inbox.list" => crate::nearby::share::list(d, ctx, parse(p)?),
         "keep_awake.set" => crate::keep_awake::set(d, ctx, parse(p)?),
         "keep_awake.wake_setup" => crate::wake::setup(d, ctx, parse(p)?),
         "window.list" => window::list(d),
@@ -419,10 +473,12 @@ fn dispatch(d: &Arc<Daemon>, ctx: &Ctx, method: &str, p: Value) -> R {
 }
 
 /// Per-call audit would drown the log for these high-frequency calls; they emit their own events.
+/// A published stream event is its own record (kind, publisher, envelope).
 fn skip_audit(method: &str, params: &Value) -> bool {
     match method {
         "agent.hook" => params.get("event").and_then(Value::as_str) == Some("statusline"),
-        "session.resize" | "session.scroll" | "session.selection" | "session.select_all" | "session.link_at" | "links.served_by" | "session.find" | "session.jump_prompt" => true,
+        "streams.publish" => true,
+        "session.resize" | "session.scroll" | "session.selection" | "session.select_all" | "session.link_at" | "links.served_by" | "links.preview" | "session.find" | "session.jump_prompt" => true,
         _ => false,
     }
 }
@@ -437,6 +493,9 @@ fn summarize(method: &str, params: &Value) -> String {
         }
         if method == "agent.hook" {
             o.remove("payload");
+        }
+        if method == "session.send_image" && o.contains_key("data") {
+            o.insert("data".into(), json!("…"));
         }
     }
     let s = p.to_string();
@@ -483,8 +542,20 @@ fn human_only_refusal(d: &Daemon, ctx: &Ctx, method: &str, params: &Value) -> Rp
     if method == "links.actions.approve" {
         return RpcError::human_only("links.actions.approve is the human's answer to the approval links.actions.register raised");
     }
+    if method == "links.patterns.approve" {
+        return RpcError::human_only("links.patterns.approve is the human's answer to the approval links.patterns.register raised");
+    }
+    if method == "session.send_image" {
+        // Only the person driving from another Mac sends one; nobody here can, approved or not.
+        return session::send_image_refusal();
+    }
     if method == "rule.remove" {
         return RpcError::human_only("rule.remove is human only; use rule.request_removal to ask the human");
+    }
+    // A pairing and an incoming share each raised their own approval; deferring would add a
+    // second one, and approving it would stand in for comparing the codes.
+    if let Some(e) = crate::nearby::guard::refusal(d, method, params) {
+        return e;
     }
     let cli = format!("{method} {}", summarize(method, params));
     defer_to_human(d, ctx, &format!("Agent asks to run {method}"), &cli, method, params)
@@ -565,6 +636,13 @@ pub fn deferred_guard(d: &Daemon, method: &str, params: &Value) -> (Option<Strin
                 None => (Some("missing".into()), None),
             }
         }
+        "streams.set_enabled" | "streams.remove" => {
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+            match streams::approval_target(d, name) {
+                Some((def, shown)) => (Some(hex(def.as_bytes())), Some(shown)),
+                None => (Some("missing".into()), None),
+            }
+        }
         "secret.replace" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let project = params.get("project_id").and_then(Value::as_str);
@@ -583,6 +661,14 @@ pub fn deferred_guard(d: &Daemon, method: &str, params: &Value) -> (Option<Strin
             let menus = d.core().state.app_link_actions.get(owner).map(|a| a.menus.clone()).unwrap_or_default();
             match links::fingerprint(owner, &menus) {
                 Some(fp) => (Some(fp), Some(midna_proto::link_actions::commands(&menus).join("\n"))),
+                None => (Some("missing".into()), None),
+            }
+        }
+        "links.patterns.approve" => {
+            let owner = params.get("owner").and_then(Value::as_str).unwrap_or("");
+            let patterns = d.core().state.app_link_patterns.get(owner).cloned().unwrap_or_default();
+            match links::preview_fingerprint(owner, &patterns) {
+                Some(fp) => (Some(fp), Some(links::preview_commands(&patterns).join("\n"))),
                 None => (Some("missing".into()), None),
             }
         }

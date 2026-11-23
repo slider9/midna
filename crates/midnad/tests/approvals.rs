@@ -198,15 +198,18 @@ impl FakeTrust {
              screen = [l.rstrip() for l in open({fixture:?}, encoding='utf-8').read().splitlines()]\n\
              while screen and not screen[-1]: screen.pop()\n\
              sys.stdout.write('\\x1b[H\\x1b[2J' + '\\r\\n'.join(screen)); sys.stdout.flush()\n\
+             d = {d:?}\n\
+             real = lambda p: os.path.normcase(os.path.realpath(p))\n\
+             keys = os.path.join(os.getcwd(), 'keys') if real(os.getcwd()).startswith(os.path.join(real(d), '')) else os.path.join(d, 'keys')\n\
              {raw}\n\
              while True:\n\
              \x20   b = os.read(0, 64)\n\
              \x20   if not b: break\n\
-             \x20   open({keys:?}, 'ab').write(b)\n\
-             \x20   if b'\\r' in b and b'\\x1b[B' not in open({keys:?}, 'rb').read(): break\n\
+             \x20   open(keys, 'ab').write(b)\n\
+             \x20   if b'\\r' in b and b'\\x1b[B' not in open(keys, 'rb').read(): break\n\
              \x20   if b'\\r' in b:\n\
              \x20       sys.stdout.write('\\x1b[H\\x1b[2J  welcome\\r\\n> '); sys.stdout.flush()\n",
-            keys = dir.join("keys")
+            d = dir
         );
         let bin = dir.join("claude");
         #[cfg(unix)]
@@ -231,6 +234,11 @@ impl FakeTrust {
 
     fn keys(&self) -> Vec<u8> {
         std::fs::read(self.dir.join("keys")).unwrap_or_default()
+    }
+
+    /// What was typed at one opened in the subfolder `sub` of its folder.
+    fn keys_in(&self, sub: &str) -> Vec<u8> {
+        std::fs::read(self.dir.join(sub).join("keys")).unwrap_or_default()
     }
 }
 
@@ -272,6 +280,38 @@ fn folder_trust_dialog_is_a_needs_you_item() {
 fn as_saved(cwd: &str) -> String {
     let home = midna_proto::paths::home_var().unwrap_or_default();
     midna_proto::paths::after(cwd, &home).map_or_else(|| cwd.to_string(), |rest| format!("~{rest}"))
+}
+
+#[test]
+fn trusting_one_folder_trusts_the_projects_other_open_ones() {
+    let fake = FakeTrust::new("siblings");
+    let bin = fake.bin();
+    let root = fake.dir.to_string_lossy().into_owned();
+    std::fs::create_dir_all(fake.dir.join("slot-1")).unwrap();
+    std::fs::create_dir_all(fake.dir.join("slot-2")).unwrap();
+    let d = TestDaemon::start_with(move |c| c.agent_bin = Some(bin));
+    let mut h = d.human();
+    let pid = call(&mut h, "project.add", json!({ "path": root }))["id"].as_str().unwrap().to_string();
+    let slot = |sub: &str| fake.dir.join(sub).to_string_lossy().into_owned();
+    let open = |h: &mut Client, sub: &str| {
+        let cwd = slot(sub);
+        call(h, "session.open", json!({ "kind": "agent", "agent": "claude", "project_id": pid, "cwd": cwd }))["id"].as_str().unwrap().to_string()
+    };
+    let (one, two) = (open(&mut h, "slot-1"), open(&mut h, "slot-2"));
+    let items = wait_for(10, "two trust items", || {
+        let list = call(&mut h, "needs_you.list", json!({}));
+        let items: Vec<Value> = list.as_array().unwrap().iter().filter(|n| n["kind"] == "permission_prompt").cloned().collect();
+        (items.len() == 2).then_some(items)
+    });
+    let first = items.iter().find(|n| n["session_id"] == one).unwrap();
+    call(&mut h, "needs_you.resolve", json!({ "id": first["id"], "resolution": { "kind": "approve", "scope": { "kind": "once" } } }));
+    wait_for(5, "Yes typed in both", || (fake.keys_in("slot-1") == b"\x1b[B\r" && fake.keys_in("slot-2") == b"\x1b[B\r").then_some(()));
+    assert!(call(&mut h, "needs_you.list", json!({})).as_array().unwrap().iter().all(|n| n["kind"] != "permission_prompt"), "both closed");
+    for sid in [&one, &two] {
+        assert_eq!(call(&mut h, "session.get", json!({ "id": sid }))["status"]["state"], "idle");
+    }
+    let saved = call(&mut h, "settings.get", json!({ "key": "agents.trust_folders" }))["value"].clone();
+    assert_eq!(saved, json!([as_saved(&slot("slot-1")), as_saved(&slot("slot-2"))]));
 }
 
 #[test]

@@ -30,17 +30,32 @@ impl TestDaemon {
         cfg.app_path = Some(std::env::current_exe().unwrap().to_string_lossy().into_owned());
         f(&mut cfg);
         let handle = midnad::start(cfg).expect("start daemon");
-        TestDaemon { handle: Some(handle), home }
+        let d = TestDaemon { handle: Some(handle), home };
+        d.calm();
+        d
+    }
+
+    /// Agent terminals never wait for the machine running the tests to calm down
+    /// (`guard.hold_agents_at`); `tests/admit.rs` turns it back on.
+    fn calm(&self) {
+        self.daemon().core().state.settings.insert("guard.hold_agents_at".into(), json!(0));
     }
 
     /// Stop midnad and start a new one on the same home (state.json, the event log).
     pub fn restart(&mut self) {
+        self.restart_with(|_| {});
+    }
+
+    /// Like `restart`, with the config adjusted first (as `start_with` did).
+    pub fn restart_with(&mut self, f: impl FnOnce(&mut midnad::Config)) {
         if let Some(h) = self.handle.take() {
             h.shutdown();
         }
         let mut cfg = midnad::Config::for_home(self.home.clone());
         cfg.app_path = Some(std::env::current_exe().unwrap().to_string_lossy().into_owned());
+        f(&mut cfg);
         self.handle = Some(midnad::start(cfg).expect("restart daemon"));
+        self.calm();
     }
 
     pub fn daemon(&self) -> std::sync::Arc<midnad::daemon::Daemon> {

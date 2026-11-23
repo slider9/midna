@@ -52,6 +52,7 @@ pub fn stop_daemon(d: &Daemon) -> bool {
     for rt in rts {
         let _ = rt.tx.send(crate::term::EngineMsg::Stop);
     }
+    crate::producers::stop_all(d);
     d.save_now();
     let _ = UnixStream::connect(&d.cfg.socket); // wake the accept loop
     let _ = std::fs::remove_file(&d.cfg.socket);
@@ -262,12 +263,18 @@ fn background(d: &Arc<Daemon>) {
     crate::restart::start(d);
     crate::webhooks::start(d);
     crate::notify::start(d);
+    // Copied out first: a publish locks the intake, then the log.
+    let published: Vec<midna_proto::Event> = d.log.with_events(|events| events.iter().filter(|e| e.stream.is_some()).cloned().collect());
+    d.streams.seed(&published);
     crate::local::start(d);
+    crate::producers::start(d);
     crate::queue::start(d);
     crate::resume::start(d);
     crate::clock::start(d);
     crate::keep_awake::start(d);
+    crate::nearby::start(d);
     crate::guard::start(d);
+    crate::admit::start(d);
     crate::panic::start(d);
     crate::worktrees::start(d);
     crate::trust::start(d);

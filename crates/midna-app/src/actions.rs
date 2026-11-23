@@ -9,8 +9,10 @@ actions!(
     [
         /// ⌘K palette (CommandBar-A). Placeholder overlay for now.
         ToggleCommandBar,
-        /// Jump to the next needs-you item.
+        /// Jump to the newest needs-you item on the Mac whose window is in front.
         NextNeedsYou,
+        /// Jump to the newest needs-you item on any of my Macs.
+        NextNeedsYouAnywhere,
         /// Open the needs-you inbox (`ui/needs_you.rs`).
         OpenNeedsYou,
         NewTerminal,
@@ -93,6 +95,10 @@ actions!(
         ShowProjectSummary,
         /// Collapse the sidebar to a rail / expand it again.
         ToggleSidebar,
+        /// ⌃⌘M: the Mac switcher under the sidebar's name plate.
+        ToggleMacSwitcher,
+        /// Window menu → Pair Another Mac…: Settings › Nearby.
+        PairMac,
     ]
 );
 
@@ -100,6 +106,18 @@ actions!(
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = midna, no_json)]
 pub struct SelectProject(pub usize);
+
+/// ⌃⌘1–9, the Window menu and the Mac switcher: the Nth Mac (0: this one, then my paired Macs
+/// by name, see `macs`) — its window opens or comes forward.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = midna, no_json)]
+pub struct SwitchMac(pub usize);
+
+/// The Window menu's entry for a Mac that can't be driven now. Nothing handles it, so macOS
+/// greys the entry.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = midna, no_json)]
+pub struct MacUnavailable(pub usize);
 
 pub const CTX_MAIN: &str = "MidnaMain";
 pub const CTX_TERM: &str = "Terminal";
@@ -147,8 +165,9 @@ pub mod overlay {
     pub const INSIGHTS: &str = "insights";
     pub const NOTIFICATIONS: &str = "notifications";
     pub const SUMMARY: &str = "summary";
+    pub const MACS: &str = "macs";
     #[cfg(test)]
-    pub const ALL: &[&str] = &[ANNOTATE, NEEDS_YOU, COMMAND_BAR, LINKS, QUEUE, SUBAGENTS, IDE, RULES, TRIGGERS, INSIGHTS, NOTIFICATIONS, SUMMARY];
+    pub const ALL: &[&str] = &[ANNOTATE, NEEDS_YOU, COMMAND_BAR, LINKS, QUEUE, SUBAGENTS, IDE, RULES, TRIGGERS, INSIGHTS, NOTIFICATIONS, SUMMARY, MACS];
 }
 
 /// An overlay's key context (see [`CTX_OVERLAY`]).
@@ -205,6 +224,7 @@ pub const PLACES: &[(&str, &str)] = &[
     (overlay::INSIGHTS, "Insights"),
     (overlay::NOTIFICATIONS, "Notifications"),
     (overlay::SUMMARY, "Summary"),
+    (overlay::MACS, "Mac switcher"),
 ];
 
 /// A when clause in words, for Settings ▸ Shortcuts: `None` is "Anywhere",
@@ -317,6 +337,7 @@ macro_rules! shortcut {
 pub const SHORTCUTS: &[Shortcut] = &[
     shortcut!("keys.command_bar", ToggleCommandBar, WINDOW),
     shortcut!("keys.next_needs_you", NextNeedsYou, WINDOW),
+    shortcut!("keys.next_needs_you_anywhere", NextNeedsYouAnywhere, WINDOW),
     shortcut!("keys.needs_you", OpenNeedsYou, WINDOW),
     shortcut!("keys.new_terminal", NewTerminal, WINDOW),
     shortcut!("keys.new_agent", NewAgent, WINDOW),
@@ -387,10 +408,14 @@ pub const OVERLAY_KEYS: &[Shortcut] = &[
     shortcut!("keys.approve", ApproveOnce, Some("overlay == needs_you")),
     shortcut!("keys.deny", Deny, Some("overlay == needs_you")),
     shortcut!("keys.next_needs_you", NextNeedsYou, Some("overlay == needs_you")),
+    shortcut!("keys.next_needs_you_anywhere", NextNeedsYouAnywhere, Some("overlay == needs_you")),
     shortcut!("keys.approve", crate::ui::command_bar::RunSelected, Some("overlay == command_bar")),
     shortcut!("keys.deny", crate::ui::command_bar::ClearQuery, Some("overlay == command_bar")),
     shortcut!("keys.approve", crate::annotate::AttachImages, Some("overlay == annotate")),
     shortcut!("keys.close", crate::annotate::RemoveImage, Some("overlay == annotate")),
+    // The Summary reopens or removes the record on screen.
+    shortcut!("keys.approve", crate::ui::summary::ResumeRecord, Some("overlay == summary")),
+    shortcut!("keys.deny", crate::ui::summary::RemoveRecord, Some("overlay == summary")),
 ];
 
 /// Keys that aren't settings: standard editing keys and the keys a screen handles itself.
@@ -574,7 +599,11 @@ pub fn bind_keys(cx: &mut App, get: impl Fn(&str) -> Option<String>, when: &[Str
     b.extend(crate::composer::bindings());
     for i in 1..=9 {
         b.push(KeyBinding::new(&format!("{}-{i}", pick("cmd", "ctrl")), SelectProject(i - 1), WINDOW));
+        // The Window menu shows these beside its Macs (it finds them by the action).
+        #[cfg(target_os = "macos")]
+        b.push(KeyBinding::new(&format!("ctrl-cmd-{i}"), SwitchMac(i - 1), ANYWHERE));
     }
+    b.push(KeyBinding::new("ctrl-cmd-m", ToggleMacSwitcher, Some("MidnaMain && !Modal")));
     b.push(KeyBinding::new("escape", Dismiss, Some(CTX_OVERLAY)));
     b.push(KeyBinding::new(term_keys::COPY, TermCopy, TERM));
     b.push(KeyBinding::new(term_keys::CUT, TermCut, TERM));
@@ -939,10 +968,11 @@ mod tests {
 mod dispatch {
     // Not `super::*`: GPUI's test macro would come in with it and shadow `#[test]`.
     use super::{
-        ApproveOnce, CTX_MAIN, CloseWindow, Dismiss, HoldToQuit, Kind, NewAgent, OpenSettings, SelectProject, SplitRight,
+        ApproveOnce, CTX_MAIN, CloseWindow, Deny, Dismiss, HoldToQuit, Kind, NewAgent, OpenSettings, SelectProject, SplitRight,
         bind_keys, overlay, overlay_context,
     };
     use crate::annotate::{AttachImages, RemoveImage};
+    use crate::ui::summary::{RemoveRecord, ResumeRecord};
     use crate::ui::links::ToggleLinks;
     use gpui_kit::prelude::*;
     use gpui_kit::{Action, App, Context, FocusHandle, TestAppContext, Window, div};
@@ -973,6 +1003,7 @@ mod dispatch {
                 .on_action(record::<SplitRight>(l, "split"))
                 .on_action(record::<SelectProject>(l, "select_project"))
                 .on_action(record::<ApproveOnce>(l, "approve"))
+                .on_action(record::<Deny>(l, "deny"))
                 .on_action(record::<CloseWindow>(l, "close_window"))
                 .on_action(record::<OpenSettings>(l, "settings"))
                 .on_action(record::<HoldToQuit>(l, "quit"))
@@ -984,7 +1015,9 @@ mod dispatch {
                         .on_action(record::<RemoveImage>(l, "remove_image"))
                         .on_action(record::<AttachImages>(l, "attach"))
                         .on_action(record::<Dismiss>(l, "dismiss"))
-                        .on_action(record::<ToggleLinks>(l, "toggle_links")),
+                        .on_action(record::<ToggleLinks>(l, "toggle_links"))
+                        .on_action(record::<ResumeRecord>(l, "resume_record"))
+                        .on_action(record::<RemoveRecord>(l, "remove_record")),
                 )
         }
     }
@@ -1070,6 +1103,17 @@ mod dispatch {
         let (t, p1, w) = (key("keys.new_agent"), project_1(), key("keys.close"));
         let got = press(Kind::Screen, overlay::RULES, &[&t, &p1, &w].map(|s| s.as_str()), cx);
         assert_eq!(got, vec![ran(&t, &["new_agent"]), ran(&p1, &["select_project"]), ran(&w, &["close_window"])]);
+    }
+
+    #[gpui_kit::test]
+    fn summary_takes_approve_and_deny_for_its_record(cx: &mut TestAppContext) {
+        // ⌘↩, ⌘⌫ and ⌘T on macOS.
+        let (yes, no, t) = (key("keys.approve"), key("keys.deny"), key("keys.new_agent"));
+        let got = press(Kind::Screen, overlay::SUMMARY, &[&yes, &no, &t].map(|s| s.as_str()), cx);
+        assert_eq!(got, vec![ran(&yes, &["resume_record"]), ran(&no, &["remove_record"]), ran(&t, &["new_agent"])]);
+        // Any other screen leaves them to the main window.
+        let got = press(Kind::Screen, overlay::RULES, &[&yes, &no].map(|s| s.as_str()), cx);
+        assert_eq!(got, vec![ran(&yes, &["approve"]), ran(&no, &["deny"])]);
     }
 
     #[gpui_kit::test]

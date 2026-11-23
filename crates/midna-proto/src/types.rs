@@ -26,6 +26,8 @@ pub enum ActorKind {
 /// Who did something. Agents inside a midna terminal carry their session id. A trigger carries
 /// its id (`trigger`) and name; `via: "run"` marks a call made by a process of that trigger's
 /// headless run (midnad matches the caller's process to the run it started, never an env var).
+/// `via: "peer"` marks a call carried over a drive link from one of my other Macs, `peer` being
+/// that Mac's fingerprint as the Noise handshake proved it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct Actor {
@@ -38,25 +40,37 @@ pub struct Actor {
     pub trigger: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
+    /// `via: "peer"`: the fingerprint of the paired Mac whose drive link made the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
 }
 
 impl Actor {
     pub fn human() -> Actor {
-        Actor { kind: ActorKind::Human, session: None, name: None, trigger: None, via: None }
+        Actor { kind: ActorKind::Human, session: None, name: None, trigger: None, via: None, peer: None }
     }
     pub fn system() -> Actor {
-        Actor { kind: ActorKind::System, session: None, name: None, trigger: None, via: None }
+        Actor { kind: ActorKind::System, session: None, name: None, trigger: None, via: None, peer: None }
     }
     pub fn agent(session: Option<Id>) -> Actor {
-        Actor { kind: ActorKind::Agent, session, name: None, trigger: None, via: None }
+        Actor { kind: ActorKind::Agent, session, name: None, trigger: None, via: None, peer: None }
     }
     /// Trigger `id` (named `name`) acting on its own.
     pub fn trigger(id: &str, name: &str) -> Actor {
-        Actor { kind: ActorKind::Trigger, session: None, name: Some(name.to_string()), trigger: Some(id.to_string()), via: None }
+        Actor { kind: ActorKind::Trigger, session: None, name: Some(name.to_string()), trigger: Some(id.to_string()), via: None, peer: None }
     }
     /// A process of trigger `id`'s headless run.
     pub fn trigger_run(id: &str, name: &str) -> Actor {
         Actor { via: Some("run".into()), ..Actor::trigger(id, name) }
+    }
+    /// The person at paired device `fingerprint`, driving this Mac over a drive link: the human
+    /// here, except for what is local-only (midnad `nearby/local_only.rs`).
+    pub fn peer(fingerprint: &str) -> Actor {
+        Actor { via: Some("peer".into()), peer: Some(fingerprint.to_string()), ..Actor::human() }
+    }
+    /// The paired device's fingerprint when this is the person driving over a drive link.
+    pub fn drive_peer(&self) -> Option<&str> {
+        self.peer.as_deref().filter(|_| self.is_human() && self.via.as_deref() == Some("peer"))
     }
     pub fn is_human(&self) -> bool {
         self.kind == ActorKind::Human
@@ -816,6 +830,8 @@ pub enum NeedsYouKind {
     TriggerWaiting,
     RuleRemoval,
     SecretNeeded,
+    /// A stream midnad runs keeps failing (`stream`); resolves itself once it runs 10 minutes.
+    StreamFailing,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -867,6 +883,9 @@ pub struct NeedsYou {
     /// The trigger this item is about (e.g. `secret_needed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_id: Option<Id>,
+    /// The stream this item is about (`stream_failing`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
     /// What an agent's question dialog asks (Claude's AskUserQuestion): the full text and its
     /// options, which the title only summarizes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -875,6 +894,11 @@ pub struct NeedsYou {
     /// Approving may save a different value (`needs_you.resolve`'s `value`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setting: Option<SettingChange>,
+    /// Approving it runs something only this Mac's own human may do (DECISIONS.md, Local-only),
+    /// so another of my Macs driving this one shows "Decide at <Mac>" instead of Approve. Set by
+    /// `needs_you.list` and `needs_you.get`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_only: bool,
 }
 
 /// A setting an agent asked to change, as it was when it asked.
@@ -898,6 +922,22 @@ pub struct NeedsYouQuestion {
     pub multi_select: bool,
     #[serde(default)]
     pub options: Vec<QuestionOption>,
+    /// The call's other questions, in order (each with no `more` of its own). Answering it
+    /// (`session.answer_question`) takes an answer for every one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub more: Vec<NeedsYouQuestion>,
+}
+
+impl NeedsYouQuestion {
+    /// This question and the ones after it, in the picker's order.
+    pub fn all(&self) -> impl Iterator<Item = &NeedsYouQuestion> {
+        std::iter::once(self).chain(&self.more)
+    }
+
+    /// How many questions the picker asks.
+    pub fn count(&self) -> usize {
+        1 + self.more.len()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -963,10 +1003,49 @@ pub struct TriggerFilter {
     /// Needs `keep_awake.enabled`, `keep_awake.wake` and its admin grant.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wake: bool,
-    /// Local: dotted path into the hook payload or event data -> case-insensitive glob, e.g.
-    /// `{"message": "*Compact first*"}`. Every entry must match.
+    /// Local: dotted path into the hook payload or event data -> case-insensitive glob, or a
+    /// list of globs that must all match (in any order), e.g. `{"message": "*Compact first*"}`
+    /// or `{"text": ["*failed*", "*master*"]}`. Every entry must match.
     #[serde(default, rename = "match", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub fields: std::collections::BTreeMap<String, String>,
+    pub fields: std::collections::BTreeMap<String, Globs>,
+}
+
+/// One `filter.match` entry: a glob, or several that must all match the same value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum Globs {
+    One(String),
+    All(Vec<String>),
+}
+
+impl Globs {
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        let s: &[String] = match self {
+            Globs::One(g) => std::slice::from_ref(g),
+            Globs::All(v) => v,
+        };
+        s.iter().map(String::as_str)
+    }
+}
+
+impl From<&str> for Globs {
+    fn from(g: &str) -> Self {
+        Globs::One(g.to_string())
+    }
+}
+
+impl From<String> for Globs {
+    fn from(g: String) -> Self {
+        Globs::One(g)
+    }
+}
+
+impl std::fmt::Display for Globs {
+    /// The globs, quoted and joined with ` and `.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shown: Vec<String> = self.iter().map(|g| format!("\"{g}\"")).collect();
+        f.write_str(&shown.join(" and "))
+    }
 }
 
 /// Local times of day, `HH:MM` (24-hour): `from` counts, `until` doesn't, so `13:00`–`17:00`
@@ -1007,7 +1086,7 @@ pub enum StatusClear {
     Never,
 }
 
-/// What a trigger does. Templates use `{{pr.number}}`, `{{pr.title}}`, `{{repo}}`, `{{branch}}`, `{{sender}}`, `{{url}}`. Templates use `{{pr.number}}`, `{{pr.title}}`, `{{repo}}`, `{{branch}}`, `{{sender}}`, `{{url}}`.
+/// What a trigger does. Templates use `{{pr.number}}`, `{{pr.title}}`, `{{repo}}`, `{{branch}}`, `{{sender}}`, `{{url}}`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum TriggerAction {
@@ -1047,12 +1126,28 @@ pub enum TriggerAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_secs: Option<u64>,
     },
-    Attention { message: String },
-    /// Local only: type `steps` into the terminal that fired, in order. Each step after the
-    /// first waits until the agent is ready for input again.
-    SendToSession { steps: Vec<SendStep> },
+    Attention {
+        message: String,
+        /// Local only: the terminal to act on instead of the one that fired, by name (exact) or
+        /// session id, looked up when it fires among running terminals (within `filter.project`
+        /// when set). For events about no terminal (`stream.*`, `schedule`). Several with that
+        /// name: the most recently active one. None: nothing happens and the delivery says so.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
+    },
+    /// Local only: type `steps` into the terminal that fired (or `to`), in order. Each step after
+    /// the first waits until the agent is ready for input again.
+    SendToSession {
+        steps: Vec<SendStep>,
+        /// Local only: the terminal to act on instead of the one that fired, by name (exact) or
+        /// session id, looked up when it fires among running terminals (within `filter.project`
+        /// when set). For events about no terminal (`stream.*`, `schedule`). Several with that
+        /// name: the most recently active one. None: nothing happens and the delivery says so.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
+    },
     /// Local only: show `label` in `color` (named: red, orange, amber, yellow, green, teal, blue,
-    /// purple, pink, gray; or `#rrggbb`) on the terminal that fired, on top of the built-in
+    /// purple, pink, gray; or `#rrggbb`) on the terminal that fired (or `to`), on top of the built-in
     /// `base` state (which keeps driving sorting, notifications and Needs You).
     SetStatus {
         label: String,
@@ -1062,9 +1157,22 @@ pub enum TriggerAction {
         base: StatusState,
         #[serde(default)]
         clear_on: StatusClear,
+        /// Local only: the terminal to act on instead of the one that fired, by name (exact) or
+        /// session id, looked up when it fires among running terminals (within `filter.project`
+        /// when set). For events about no terminal (`stream.*`, `schedule`). Several with that
+        /// name: the most recently active one. None: nothing happens and the delivery says so.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
     },
-    /// Local only: remove the custom status from the terminal that fired.
-    ClearStatus {},
+    /// Local only: remove the custom status from the terminal that fired (or `to`).
+    ClearStatus {
+        /// Local only: the terminal to act on instead of the one that fired, by name (exact) or
+        /// session id, looked up when it fires among running terminals (within `filter.project`
+        /// when set). For events about no terminal (`stream.*`, `schedule`). Several with that
+        /// name: the most recently active one. None: nothing happens and the delivery says so.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
+    },
     /// Post a notification (category `from_trigger`: its sound, volume, image and mute switches
     /// apply). Clicking it selects the terminal that fired, if any. Templates work in both texts.
     Notify {
@@ -1085,6 +1193,12 @@ pub enum TriggerAction {
         /// one still showing (see `notify.send`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
+        /// Local only: the terminal to act on instead of the one that fired, by name (exact) or
+        /// session id, looked up when it fires among running terminals (within `filter.project`
+        /// when set). For events about no terminal (`stream.*`, `schedule`). Several with that
+        /// name: the most recently active one. None: nothing happens and the delivery says so.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
     },
 }
 
@@ -1097,9 +1211,31 @@ impl TriggerAction {
         }
     }
 
-    /// Acts on the terminal that fired (local triggers only).
+    /// Acts on a terminal: the one that fired, or `to` (local triggers only).
+    pub fn acts_on_terminal(&self) -> bool {
+        matches!(self, TriggerAction::SendToSession { .. } | TriggerAction::SetStatus { .. } | TriggerAction::ClearStatus { .. })
+    }
+
+    /// Acts on the terminal that fired, since it names no other (`to`).
     pub fn needs_session(&self) -> bool {
-        matches!(self, TriggerAction::SendToSession { .. } | TriggerAction::SetStatus { .. } | TriggerAction::ClearStatus {})
+        self.acts_on_terminal() && self.to().is_none()
+    }
+
+    /// The terminal it names to act on (`to`), if any.
+    pub fn to(&self) -> Option<&str> {
+        match self {
+            TriggerAction::Attention { to, .. }
+            | TriggerAction::SendToSession { to, .. }
+            | TriggerAction::SetStatus { to, .. }
+            | TriggerAction::ClearStatus { to }
+            | TriggerAction::Notify { to, .. } => to.as_deref(),
+            TriggerAction::StartAgent { .. } | TriggerAction::RunCommand { .. } => None,
+        }
+    }
+
+    /// Whether this kind of action takes a `to`.
+    pub fn takes_to(&self) -> bool {
+        !matches!(self, TriggerAction::StartAgent { .. } | TriggerAction::RunCommand { .. })
     }
 
     /// A `start_agent`'s `permission_mode` and `allowed_tools` (human only), if it sets either.
@@ -1136,6 +1272,42 @@ pub const STATUS_COLORS: &[&str] = &["red", "orange", "amber", "yellow", "green"
 
 pub fn valid_status_color(c: &str) -> bool {
     STATUS_COLORS.contains(&c) || (c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|x| x.is_ascii_hexdigit()))
+}
+
+/// A running terminal a trigger's `to` could name.
+#[derive(Clone, Copy, Debug)]
+pub struct ToCandidate<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub project_id: &'a str,
+    /// Unix seconds of its last activity (ties between same-named terminals).
+    pub active_at: i64,
+}
+
+/// Which terminal a trigger's `to` names: `index` into the candidates, out of `matches` that did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToPick {
+    pub index: usize,
+    pub matches: usize,
+}
+
+/// Resolve a trigger's `to` among running terminals: an exact name first, then a session id,
+/// only in `project` when given. Several with the name: the most recently active.
+pub fn pick_to(to: &str, project: Option<&str>, terms: &[ToCandidate]) -> Result<ToPick, String> {
+    let to = to.trim();
+    let here = |c: &ToCandidate| project.is_none_or(|p| c.project_id == p);
+    let named: Vec<usize> = (0..terms.len()).filter(|&i| here(&terms[i]) && terms[i].name == to).collect();
+    // The most recently active; the first listed of equals.
+    if let Some(&index) = named.iter().max_by_key(|&&i| (terms[i].active_at, std::cmp::Reverse(i))) {
+        return Ok(ToPick { index, matches: named.len() });
+    }
+    if let Some(index) = terms.iter().position(|c| here(c) && c.id == to) {
+        return Ok(ToPick { index, matches: 1 });
+    }
+    Err(match project {
+        Some(p) => format!("no terminal named {to} in project {p}"),
+        None => format!("no terminal named {to}"),
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1191,6 +1363,29 @@ impl Secret {
     }
 }
 
+/// A local trigger's cooldown when it sets none: 0 for a stream trigger (`stream.…`; every
+/// published event has its own id and is deduped, so each one fires), else 60 seconds.
+pub fn default_cooldown_secs(event: &str) -> u64 {
+    if is_stream_event(event) { 0 } else { 60 }
+}
+
+/// What a local trigger's cooldown counts per: a stream event has no terminal.
+pub fn cooldown_scope(event: &str) -> &'static str {
+    if is_stream_event(event) { "per stream" } else { "per terminal" }
+}
+
+/// `stream.<name>.<kind>`, or a pattern over them such as `stream.*`.
+pub fn is_stream_event(event: &str) -> bool {
+    event.trim().get(..7).is_some_and(|p| p.eq_ignore_ascii_case("stream."))
+}
+
+impl Trigger {
+    /// The cooldown it waits between firings: its own, else [`default_cooldown_secs`].
+    pub fn cooldown(&self) -> u64 {
+        self.cooldown_secs.unwrap_or_else(|| default_cooldown_secs(&self.event))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct Trigger {
@@ -1228,7 +1423,8 @@ pub struct Trigger {
     /// Name for terminals this trigger opens (same `{{…}}` placeholders). Defaults to the trigger name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name_template: Option<String>,
-    /// Local: seconds before the same trigger may fire again for the same terminal (default 60).
+    /// Local: seconds before the same trigger may fire again for the same terminal, or the same
+    /// stream (default 60; 0 for a stream trigger, see [`default_cooldown_secs`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown_secs: Option<u64>,
     /// Set on triggers midna ships (e.g. `prompt_blocked_status`); they can be edited, paused or removed.
@@ -1266,6 +1462,8 @@ pub enum Verdict {
     Replayed,
     Recovered,
     NoTrigger,
+    /// A local trigger matched but its cooldown held this firing back (stream events only).
+    Cooldown,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1306,7 +1504,7 @@ pub struct Delivery {
     /// Recovered from GitHub's delivery log after it was missed (e.g. while asleep).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recovered: bool,
-    /// For replays: the delivery that was replayed.
+    /// For replays: the delivery that was replayed, or `event:<seq>` for a stream event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_of: Option<Id>,
     /// sha256 of a verified live body. Delivery GUID headers aren't signed, so a captured
@@ -1317,6 +1515,10 @@ pub struct Delivery {
     /// `finished_at`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command_runs: Vec<CommandRun>,
+    /// Local: the seq of the logged event it answered (a stream event's, say), so the event
+    /// and what it fired line up exactly. None for a hook, a webhook or a test.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_seq: Option<u64>,
 }
 
 /// One headless `run_command` run, kept on its delivery.
@@ -1362,6 +1564,10 @@ pub struct Event {
     pub session_id: Option<Id>,
     #[serde(default)]
     pub data: Value,
+    /// A published stream event's envelope (`streams.publish`): its stream, kind and id. The
+    /// publisher is `actor`; the payload is `data`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<Box<crate::streams::StreamRef>>,
 }
 
 /// Event kinds (dotted). Kept as constants so the daemon and clients agree on spelling.
@@ -1407,6 +1613,11 @@ pub mod kinds {
     /// A headless `run_command` finished: {trigger_id, delivery_id, run}.
     pub const TRIGGER_COMMAND_FINISHED: &str = "trigger.command_finished";
     pub const TRIGGER_REMOVED: &str = "trigger.removed";
+    /// A stream midnad runs changed state (data = `StreamHealth`: running, backoff, failing,
+    /// paused, …). Never fires triggers: it isn't a `stream.<name>.<kind>` event.
+    pub const STREAM_HEALTH: &str = "stream.health";
+    /// A stream midnad ran was removed (`{stream}`). Never fires triggers, like `stream.health`.
+    pub const STREAM_REMOVED: &str = "stream.removed";
     pub const SECRET_SET: &str = "secret.set";
     pub const SECRET_REMOVED: &str = "secret.removed";
     pub const SECRET_USED: &str = "secret.used";
@@ -1509,6 +1720,51 @@ pub mod kinds {
     /// started (`{agent, five_hour?, seven_day?: {used_percentage, resets_at}}`, the merged numbers
     /// `usage.get` returns). Insights charts it (`insights.detail` `usage`).
     pub const USAGE_SAMPLED: &str = "usage.sampled";
+    /// Nearby: another Midna showed up on the network (data: `nearby::Peer`); see `peers.list`.
+    pub const PEERS_APPEARED: &str = "peers.appeared";
+    /// Nearby: a Midna this daemon saw went away or stopped showing itself (data: `nearby::PeerLeft`).
+    pub const PEERS_LEFT: &str = "peers.left";
+    /// Nearby: a pairing reached its code; both screens show it (data: `nearby::Pairing`).
+    pub const PEERS_PAIRING: &str = "peers.pairing";
+    /// Nearby: a pairing ended without pairing: declined, codes differed, timed out or failed
+    /// (data: `nearby::Pairing`, with `state` and `error`).
+    pub const PEERS_PAIRING_ENDED: &str = "peers.pairing_ended";
+    /// Nearby: both people confirmed; the device is paired (data: `nearby::PairedPeer`).
+    pub const PEERS_PAIRED: &str = "peers.paired";
+    /// Nearby: a paired device changed (its tier; data: `nearby::PairedPeer`).
+    pub const PEERS_CHANGED: &str = "peers.changed";
+    /// Nearby: a paired device was forgotten (data: `nearby::PairedPeer`).
+    pub const PEERS_FORGOTTEN: &str = "peers.forgotten";
+    /// Nearby: whether a paired device may drive this Mac changed (data: `nearby::PeerDrive`,
+    /// `{peer, name, on}`): `peers.set_drive`, or off because it was kept as a contact, forgotten
+    /// or paired again without it. Turning it off cuts that device's drive links at once.
+    pub const PEERS_DRIVE: &str = "peers.drive";
+    /// Nearby: a drive link this Mac opened to another of my Macs changed state (data: a
+    /// `nearby::DriveLink`: connecting with its stage, connected, reconnecting, offline or closed,
+    /// and why).
+    pub const DRIVE_STATE: &str = "drive.state";
+    /// Nearby: Local Network access changed as midnad sees it (data: `{local_network: ok | waiting |
+    /// denied}`, as in `peers.list` `me.local_network`).
+    pub const PEERS_LOCAL_NETWORK: &str = "peers.local_network";
+    /// Nearby: a paired device offered this Mac a share; it waits in the inbox for the human
+    /// (data: `nearby::ShareItem`, direction incoming).
+    pub const SHARE_OFFERED: &str = "share.offered";
+    /// Nearby: this Mac's share reached the other device's inbox (data: `nearby::ShareItem`,
+    /// direction outgoing).
+    pub const SHARE_SENT: &str = "share.sent";
+    /// Nearby: a share was accepted: here (direction incoming, with `result`), or by the other
+    /// device's person (direction outgoing) (data: `nearby::ShareItem`).
+    pub const SHARE_ACCEPTED: &str = "share.accepted";
+    /// Nearby: a share was declined, here or on the other device (data: `nearby::ShareItem`).
+    pub const SHARE_DECLINED: &str = "share.declined";
+    /// Nearby: the other device's agent answered an agent start this Mac sent with
+    /// `want_reply` (data: `nearby::ShareItem`, the incoming message; its `reply_to` is the agent
+    /// start).
+    pub const SHARE_ANSWERED: &str = "share.answered";
+    /// Nearby: an accepted file share's contents moved on (about once a second while they
+    /// move), finished or failed; here or, for a share this Mac sent, as the other device fetches
+    /// it (data: `nearby::ShareItem`, see its `transfer`).
+    pub const SHARE_PROGRESS: &str = "share.progress";
     /// midnad took or released its keep-awake power assertion, or why changed (data: `keep_awake.status`).
     pub const KEEP_AWAKE_CHANGED: &str = "keep_awake.changed";
     /// midnad decided to notify the human (data: `notify::Posted`); the app shows it.
@@ -1652,5 +1908,46 @@ impl Segment {
     pub fn icon(mut self, icon: &str) -> Segment {
         self.icon = Some(icon.into());
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stream_trigger_has_no_cooldown_by_default_and_counts_per_stream() {
+        for e in ["stream.slack.message", "stream.*", " Stream.ci.done"] {
+            assert_eq!((default_cooldown_secs(e), cooldown_scope(e)), (0, "per stream"), "{e}");
+        }
+        for e in ["agent.prompt_blocked", "hook.Stop", "idle", "*", "streams.x", "stream"] {
+            assert_eq!((default_cooldown_secs(e), cooldown_scope(e)), (60, "per terminal"), "{e}");
+        }
+    }
+
+    #[test]
+    fn pick_to_takes_a_name_then_an_id_within_the_project() {
+        let c = |id, name, project_id, active_at| ToCandidate { id, name, project_id, active_at };
+        let terms = [c("aaaa1111", "build", "p1", 10), c("bbbb2222", "build", "p2", 30), c("cccc3333", "api", "p1", 20), c("build", "x", "p1", 0)];
+        // A name before an id; of several, the most recently active.
+        assert_eq!(pick_to(" build ", None, &terms), Ok(ToPick { index: 1, matches: 2 }));
+        assert_eq!(pick_to("build", Some("p1"), &terms), Ok(ToPick { index: 0, matches: 1 }));
+        assert_eq!(pick_to("cccc3333", None, &terms), Ok(ToPick { index: 2, matches: 1 }));
+        assert_eq!(pick_to("api", Some("p2"), &terms), Err("no terminal named api in project p2".into()));
+        assert_eq!(pick_to("nope", None, &terms), Err("no terminal named nope".into()));
+        // Equally active: the first listed.
+        let tied = [c("a", "w", "p", 5), c("b", "w", "p", 5)];
+        assert_eq!(pick_to("w", None, &tied).unwrap().index, 0);
+    }
+
+    #[test]
+    fn to_is_optional_and_left_out_when_unset() {
+        let old: TriggerAction = serde_json::from_str(r#"{"kind":"clear_status"}"#).unwrap();
+        assert_eq!(old.to(), None);
+        assert!(old.needs_session());
+        assert_eq!(serde_json::to_value(&old).unwrap(), serde_json::json!({ "kind": "clear_status" }));
+        let named: TriggerAction = serde_json::from_str(r#"{"kind":"attention","message":"m","to":"build"}"#).unwrap();
+        assert_eq!(named.to(), Some("build"));
+        assert!(!named.needs_session() && named.takes_to());
     }
 }

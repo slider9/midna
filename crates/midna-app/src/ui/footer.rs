@@ -17,6 +17,8 @@ use serde_json::{Value, json};
 /// Card slots shown.
 const SLOTS: usize = 3;
 const MAX_BUTTONS: usize = 4;
+/// The sidebar width under which the card shows its stats' short labels.
+const LONG_LABEL_WIDTH: f32 = 250.;
 
 /// The picker's groups.
 const STAT_GROUPS: [(&str, &[&str]); 2] = [("Activity", &["turns", "messages", "spend", "approvals", "triggers"]), ("Time", &["working", "waiting", "reply", "longest", "peak"])];
@@ -71,6 +73,13 @@ fn stat(today: &Today, key: &str) -> (String, &'static str, &'static str) {
         "longest" => (dur(today.longest_secs), "longest turn", "longest"),
         _ => (String::new(), "", ""),
     }
+}
+
+/// The card's stat `key`: a dash while another Mac's window waits for its first list (its
+/// numbers come from that Mac).
+fn shown_stat(m: &MainWindow, key: &str) -> (String, &'static str, &'static str) {
+    let (v, label, short) = stat(&m.today, key);
+    (if m.remote_loading() { "—".into() } else { v }, label, short)
 }
 
 fn stat_name(key: &str) -> &'static str {
@@ -180,16 +189,22 @@ pub fn render(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> impl I
 }
 
 fn card(m: &MainWindow, t: &Theme, stats: &[String], cx: &mut Context<MainWindow>) -> Stateful<Div> {
-    let mut row = div().flex().justify_between().gap(px(8.));
+    // Below this sidebar width the long labels ("messages sent") don't fit three across, so the
+    // card uses the short ones. Values never wrap; if a slot still overflows (a big spend), the
+    // row wraps instead of the stats running into each other.
+    let narrow = m.sidebar_width < LONG_LABEL_WIDTH;
+    let mut row = div().flex().flex_wrap().justify_between().gap_x(px(10.)).gap_y(px(6.));
     for k in stats {
-        let (v, label, _) = stat(&m.today, k);
+        let (v, label, short) = shown_stat(m, k);
+        let label = if narrow && !short.is_empty() { short } else { label };
         row = row.child(
             div()
                 .flex()
                 .flex_col()
-                .min_w_0()
+                .flex_none()
+                .whitespace_nowrap()
                 .child(div().text_size(px(15.)).font_weight(FontWeight::BOLD).child(v))
-                .child(div().text_size(px(11.5)).text_color(t.dim).whitespace_nowrap().child(label)),
+                .child(div().text_size(px(11.5)).text_color(t.dim).child(label)),
         );
     }
     div()
@@ -231,7 +246,7 @@ fn compact_card(m: &MainWindow, t: &Theme, stats: &[String], cx: &mut Context<Ma
         .on_click(cx.listener(|m, _, w, cx| m.set_screen(Screen::Insights, w, cx)))
         .child(div().text_size(px(10.)).font_weight(FontWeight::BOLD).child(if week(m) { "WEEK" } else { "TODAY" }));
     for k in stats {
-        let (v, _, short) = stat(&m.today, k);
+        let (v, _, short) = shown_stat(m, k);
         row = row.child(div().flex().items_baseline().gap(px(3.)).child(div().text_size(px(12.5)).font_weight(FontWeight::BOLD).text_color(t.fg).child(v)).child(short));
     }
     row
@@ -239,10 +254,16 @@ fn compact_card(m: &MainWindow, t: &Theme, stats: &[String], cx: &mut Context<Ma
 
 fn button_row(m: &MainWindow, t: &Theme, buttons: &[String], compact: bool, cx: &mut Context<MainWindow>) -> Div {
     let mut row = div().flex().gap(px(if compact { 2. } else { 4. }));
+    // A stream that's failing, waiting for approval or restarting flags the Triggers button
+    // (design/stream-health, concept C). Healthy and paused streams leave it alone.
+    let flag = crate::ui::triggers::stream_flag(&m.streams, super::screen_kit::now_unix());
     for b in buttons {
         let (icon, label, setting) = button_info(b);
         let on = active(m, b);
         let key = b.clone();
+        let flag = flag.clone().filter(|_| b == "triggers");
+        let tip = super::header::tip_keys(flag.as_ref().map(|f| SharedString::from(f.tip.clone())).unwrap_or_else(|| label.into()), if flag.is_some() { "" } else { setting });
+        let open = flag.as_ref().map(|f| f.stream.clone());
         let btn = div()
             .id(SharedString::from(format!("btn-{b}")))
             .flex()
@@ -253,12 +274,28 @@ fn button_row(m: &MainWindow, t: &Theme, buttons: &[String], compact: bool, cx: 
             .when(on, |d| d.bg(t.raised))
             .cursor_pointer()
             .hover(|s| s.bg(t.raised))
-            .tooltip(super::header::tip_keys(label, setting))
-            .on_click(cx.listener(move |m, _, w, cx| press(m, &key, w, cx)));
+            .tooltip(tip)
+            .on_click(cx.listener(move |m, _, w, cx| match &open {
+                Some(name) => crate::ui::triggers::open_stream(m, name, w, cx),
+                None => press(m, &key, w, cx),
+            }));
+        let color = if on { t.fg } else { t.dim };
+        let icon = match &flag {
+            Some(f) => div()
+                .relative()
+                .child(icon.el(16., color))
+                .child(div().absolute().top(px(-3.)).right(px(-5.)).size(px(8.)).rounded_full().bg(f.tone.color(t)).border_2().border_color(t.bg))
+                .into_any_element(),
+            None => icon.el(16., color).into_any_element(),
+        };
         row = row.child(if compact {
-            btn.w(px(32.)).h(px(28.)).child(icon.el(16., if on { t.fg } else { t.dim }))
+            btn.w(px(32.)).h(px(28.)).child(icon)
         } else {
-            btn.flex_1().flex_col().gap(px(3.)).pt(px(7.)).pb(px(5.)).text_size(px(10.5)).child(icon.el(16., if on { t.fg } else { t.dim })).child(label)
+            let label = match &flag {
+                Some(f) => div().font_weight(FontWeight::BOLD).text_color(f.tone.color(t)).child(f.word),
+                None => div().child(label),
+            };
+            btn.flex_1().flex_col().gap(px(3.)).pt(px(7.)).pb(px(5.)).text_size(px(10.5)).child(icon).child(label)
         });
     }
     row

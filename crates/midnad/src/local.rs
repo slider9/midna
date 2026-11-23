@@ -6,7 +6,8 @@
 //! One worker thread takes events (the event log's listener) and hooks (`agent.hook`) in order,
 //! clears custom statuses whose condition passed, and fires matching triggers. Events a trigger
 //! caused never fire triggers (no chains, no loops), and a trigger waits `cooldown_secs`
-//! (default 60) before firing again for the same terminal. `send_to_session` adds its steps to
+//! before firing again for the same terminal (default 60), or for the same stream when a
+//! published event has no terminal (default 0: each event fires). `send_to_session` adds its steps to
 //! the terminal's message queue (`queue.rs`), which types each once the agent is ready.
 //!
 //! It also notices prompts a UserPromptSubmit hook refused: Claude erases the prompt, writes a
@@ -23,7 +24,6 @@ use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-pub const DEFAULT_COOLDOWN_SECS: u64 = 60;
 /// The built-in trigger that labels a terminal whose prompt a hook refused.
 pub const BUILTIN_PROMPT_BLOCKED: &str = "prompt_blocked_status";
 const IDLE_TICK: Duration = Duration::from_secs(15);
@@ -45,7 +45,7 @@ pub enum Input {
 struct Book {
     /// Unix time of each terminal's last prompt or turn start/end (the idle clock).
     activity: HashMap<Id, i64>,
-    /// (trigger, terminal) -> when it last fired.
+    /// (trigger, terminal or `stream:<name>`) -> when it last fired.
     fired: HashMap<(Id, Id), Instant>,
     /// (trigger, terminal) -> the activity time an idle trigger already fired for.
     idle_fired: HashMap<(Id, Id), i64>,
@@ -142,7 +142,7 @@ pub fn seed_builtins(d: &Daemon) {
         source: TriggerSource::Local,
         event: kinds::AGENT_PROMPT_BLOCKED.into(),
         filter: TriggerFilter::default(),
-        action: TriggerAction::SetStatus { label: "Prompt blocked".into(), color: "amber".into(), icon: None, base: StatusState::NeedsYou, clear_on: StatusClear::Prompt },
+        action: TriggerAction::SetStatus { label: "Prompt blocked".into(), color: "amber".into(), icon: None, base: StatusState::NeedsYou, clear_on: StatusClear::Prompt, to: None },
         enabled: true,
         state: TriggerState::Active,
         secret_set: false,
@@ -184,6 +184,9 @@ fn is_activity(kind: &str) -> bool {
 // ------------------------------------------------------------------ inputs
 
 fn on_event(d: &Arc<Daemon>, e: &Event) {
+    if e.stream.is_some() {
+        d.streams.taken();
+    }
     if let Some(sid) = &e.session_id {
         if is_activity(&e.kind)
             && let Some(at) = time::parse_rfc3339(&e.at)
@@ -197,15 +200,21 @@ fn on_event(d: &Arc<Daemon>, e: &Event) {
             b.status_seq.remove(sid);
         }
     }
-    // What a trigger did (and trigger bookkeeping) never fires triggers.
-    if e.actor.kind == ActorKind::Trigger || e.kind.starts_with("trigger.") {
+    // What a trigger did (and trigger bookkeeping) never fires triggers, nor does a stream
+    // event published by something a trigger started, nor a stream's health or removal
+    // (`stream.*` is for its events).
+    if e.actor.kind == ActorKind::Trigger
+        || e.kind.starts_with("trigger.")
+        || matches!(e.kind.as_str(), kinds::STREAM_HEALTH | kinds::STREAM_REMOVED)
+        || e.stream.as_ref().is_some_and(|s| s.caused_by.is_some())
+    {
         return;
     }
-    fire_matching(d, &e.kind, e.session_id.as_deref(), None, &e.data);
+    fire_matching(d, &e.kind, e.session_id.as_deref(), None, &e.data, e.stream.as_deref(), Some(e.seq));
 }
 
 fn on_hook(d: &Arc<Daemon>, sid: &str, agent: AgentKind, event: &str, payload: &Value) {
-    fire_matching(d, event, Some(sid), Some(agent), payload);
+    fire_matching(d, event, Some(sid), Some(agent), payload, None, None);
 }
 
 /// Tests: move a terminal's idle clock back `secs`, then check idle triggers now.
@@ -253,7 +262,7 @@ fn idle_tick(d: &Arc<Daemon>) {
                 continue;
             }
             d.local.book().idle_fired.insert(key, last);
-            fire(d, t, "idle", Some(s), &data, ev.line);
+            fire(d, t, "idle", Some(s), &data, None, ev.line);
         }
     }
 }
@@ -306,14 +315,15 @@ pub fn schedule_data(cron: &str, at: i64) -> Value {
 }
 
 /// A schedule with a session, project or agent filter acts on every running terminal that
-/// matches; without one it fires once, about no terminal.
+/// matches; without one, or when its action names a terminal (`to`), it fires once, about no
+/// terminal.
 fn fire_schedule(d: &Arc<Daemon>, t: &Trigger, at: i64) {
     let data = schedule_data(t.filter.cron.as_deref().unwrap_or_default(), at);
     let f = &t.filter;
-    if f.session.is_none() && f.project.is_none() && f.agent.is_none() {
+    if t.action.to().is_some() || (f.session.is_none() && f.project.is_none() && f.agent.is_none()) {
         let ev = evaluate(t, "schedule", None, &data);
         if ev.fires() {
-            fire(d, t, "schedule", None, &data, ev.line);
+            fire(d, t, "schedule", None, &data, None, ev.line);
         }
         return;
     }
@@ -324,7 +334,7 @@ fn fire_schedule(d: &Arc<Daemon>, t: &Trigger, at: i64) {
     for s in &sessions {
         let ev = evaluate(t, "schedule", Some(s), &data);
         if ev.fires() {
-            fire(d, t, "schedule", Some(s), &data, ev.line);
+            fire(d, t, "schedule", Some(s), &data, None, ev.line);
         }
     }
 }
@@ -389,17 +399,22 @@ pub fn evaluate(t: &Trigger, event: &str, s: Option<&SessionFacts>, data: &Value
         }
     };
     check("session", &f.session, s.map(|s| s.id.as_str()));
-    check("project", &f.project, s.map(|s| s.project_id.as_str()));
+    // About no terminal, a project only says where to look for the `to` terminal.
+    if s.is_some() || t.action.to().is_none() {
+        check("project", &f.project, s.map(|s| s.project_id.as_str()));
+    }
     check("agent", &f.agent.map(|a| a.as_str().to_string()), s.and_then(|s| s.agent).map(|a| a.as_str()));
     for (path, want) in &f.fields {
         let got = lookup(data, path);
-        let pass = got.as_deref().is_some_and(|g| glob_ci(want, g));
+        // Each glob on its own, so words in one field match in any order.
+        let missed: Vec<&str> = want.iter().filter(|w| !got.as_deref().is_some_and(|g| glob_ci(w, g))).collect();
+        let pass = got.is_some() && missed.is_empty();
         ok &= pass;
         let shown = got.as_deref().map(|g| clip(g, 60));
         parts.push(match shown {
             Some(g) if pass => format!("{path} \"{g}\" ✓"),
-            Some(g) => format!("{path} \"{g}\" ≠ \"{want}\""),
-            None => format!("{path} missing (wants \"{want}\")"),
+            Some(g) => format!("{path} \"{g}\" ≠ {}", missed.iter().map(|w| format!("\"{w}\"")).collect::<Vec<_>>().join(" and ")),
+            None => format!("{path} missing (wants {want})"),
         });
     }
     Eval { event_ok, filters_ok: ok, line: format!("{}: {}", t.name, parts.join(" · ")) }
@@ -428,8 +443,12 @@ fn clip(s: &str, n: usize) -> String {
 }
 
 /// `{{last_prompt}}`, `{{event}}`, `{{session.id|name|project_id|agent|status}}`,
-/// `{{data.<path>}}` or a bare `{{<path>}}` into the data. `quote` shell-quotes every value.
-pub fn render(tpl: &str, event: &str, s: Option<&SessionFacts>, data: &Value, last_prompt: Option<&str>, quote: bool) -> String {
+/// `{{stream.name|kind|id}}` (a published stream event's envelope; without one, the name and kind
+/// come from a `stream.<name>.<kind>` event), `{{data.<path>}}` or a bare `{{<path>}}` into the
+/// data. `quote` shell-quotes every value.
+pub fn render(tpl: &str, event: &str, stream: Option<&StreamRef>, s: Option<&SessionFacts>, data: &Value, last_prompt: Option<&str>, quote: bool) -> String {
+    let derived = if stream.is_none() && tpl.contains("stream.") { StreamRef::of_event(event) } else { None };
+    let stream = stream.or(derived.as_ref());
     let mut out = String::with_capacity(tpl.len());
     let mut rest = tpl;
     while let Some(i) = rest.find("{{") {
@@ -448,6 +467,9 @@ pub fn render(tpl: &str, event: &str, s: Option<&SessionFacts>, data: &Value, la
             "session.project_id" => s.map(|s| s.project_id.clone()),
             "session.agent" => s.and_then(|s| s.agent).map(|a| a.as_str().to_string()),
             "session.status" => s.map(|s| s.status.as_str().to_string()),
+            "stream.name" => stream.map(|x| x.name.clone()),
+            "stream.kind" => stream.map(|x| x.kind.clone()),
+            "stream.id" => stream.and_then(|x| x.id.clone()),
             k => lookup(data, k.strip_prefix("data.").unwrap_or(k)),
         }
         .unwrap_or_default();
@@ -460,7 +482,7 @@ pub fn render(tpl: &str, event: &str, s: Option<&SessionFacts>, data: &Value, la
 
 fn uses_last_prompt(t: &Trigger) -> bool {
     match &t.action {
-        TriggerAction::SendToSession { steps } => steps.iter().any(|s| s.text.contains("last_prompt")),
+        TriggerAction::SendToSession { steps, .. } => steps.iter().any(|s| s.text.contains("last_prompt")),
         TriggerAction::StartAgent { prompt_template, .. } => prompt_template.contains("last_prompt"),
         _ => false,
     }
@@ -473,7 +495,8 @@ pub fn last_prompt(d: &Daemon, sid: &str) -> Option<String> {
 }
 
 /// `agent`: who sent the hook (an agent run by hand in a shell terminal has no session agent).
-fn fire_matching(d: &Arc<Daemon>, event: &str, sid: Option<&str>, agent: Option<AgentKind>, data: &Value) {
+/// `stream`: a published stream event's envelope. `seq`: the logged event's (none for a hook).
+fn fire_matching(d: &Arc<Daemon>, event: &str, sid: Option<&str>, agent: Option<AgentKind>, data: &Value, stream: Option<&StreamRef>, seq: Option<u64>) {
     let candidates: Vec<Trigger> = d.core().state.triggers.iter().filter(|t| is_live(t) && glob_ci(t.event.trim(), event)).cloned().collect();
     if candidates.is_empty() {
         return;
@@ -487,17 +510,68 @@ fn fire_matching(d: &Arc<Daemon>, event: &str, sid: Option<&str>, agent: Option<
         if !ev.fires() {
             continue;
         }
-        if let Some(s) = &s {
-            let cooldown = Duration::from_secs(t.cooldown_secs.unwrap_or(DEFAULT_COOLDOWN_SECS));
-            let key = (t.id.clone(), s.id.clone());
-            let mut b = d.local.book();
-            if b.fired.get(&key).is_some_and(|at| at.elapsed() < cooldown) {
+        // Per terminal; a stream event has none, so per stream.
+        let on = s.as_ref().map(|s| s.id.clone()).or_else(|| stream.map(|x| format!("stream:{}", x.name)));
+        if let Some(on) = on {
+            let cooldown = Duration::from_secs(t.cooldown());
+            let key = (t.id.clone(), on);
+            let since = {
+                let mut b = d.local.book();
+                match b.fired.get(&key).map(Instant::elapsed).filter(|e| *e < cooldown) {
+                    Some(since) => Some(since),
+                    None => {
+                        b.fired.insert(key, Instant::now());
+                        None
+                    }
+                }
+            };
+            if let Some(since) = since {
+                // A stream event is a message someone sent: say why it did nothing. A terminal's
+                // hooks are many and the cooldown is how they're thinned out, so those stay quiet.
+                if let Some(x) = stream {
+                    held_back(d, t, event, x, seq, ev.line, since);
+                }
                 continue;
             }
-            b.fired.insert(key, Instant::now());
         }
-        fire(d, t, event, s.as_ref(), data, ev.line);
+        fire_as(d, t, event, s.as_ref(), data, stream, ev.line, None, seq);
     }
+}
+
+/// Record that stream event `event` matched `t` but `t`'s cooldown held it back, `since` after
+/// it last fired for that stream.
+fn held_back(d: &Daemon, t: &Trigger, event: &str, stream: &StreamRef, seq: Option<u64>, line: String, since: Duration) {
+    let cooldown = t.cooldown();
+    let left = cooldown.saturating_sub(since.as_secs()).max(1);
+    let del = Delivery {
+        id: format!("d_{}", hex_id(6)),
+        source: TriggerSource::Local,
+        event: event.to_string(),
+        delivery_guid: format!("local-{}", hex_id(8)),
+        received_at: time::now_rfc3339(),
+        verdict: Verdict::Cooldown,
+        trigger_id: Some(t.id.clone()),
+        session_started: None,
+        summary: format!(
+            "Held back by its cooldown · {} fired for stream {} {}s ago and waits {cooldown}s between firings ({left}s left)",
+            t.name,
+            stream.name,
+            since.as_secs()
+        ),
+        action: None,
+        repo: None,
+        subject: None,
+        http_status: None,
+        eval: vec![line],
+        triggers_fired: vec![],
+        sessions_started: vec![],
+        recovered: false,
+        replay_of: None,
+        body_sha256: None,
+        command_runs: vec![],
+        event_seq: seq,
+    };
+    crate::webhooks::process::record(d, &del, None);
 }
 
 // ------------------------------------------------------------------ firing
@@ -522,7 +596,7 @@ pub fn action_name(a: &TriggerAction) -> &'static str {
         TriggerAction::Attention { .. } => "attention",
         TriggerAction::SendToSession { .. } => "send_to_session",
         TriggerAction::SetStatus { .. } => "set_status",
-        TriggerAction::ClearStatus {} => "clear_status",
+        TriggerAction::ClearStatus { .. } => "clear_status",
         TriggerAction::Notify { .. } => "notify",
     }
 }
@@ -539,13 +613,131 @@ pub fn fire_once(d: &Arc<Daemon>, t: &Trigger, event: &str, sid: Option<&str>, d
         _ => "a process outside midna".to_string(),
     };
     let line = format!("{}: response ✓ · sent by {by}", t.name);
-    fire(d, t, event, s.as_ref(), data, line)
+    fire(d, t, event, s.as_ref(), data, None, line)
 }
 
-fn fire(d: &Arc<Daemon>, t: &Trigger, event: &str, s: Option<&SessionFacts>, data: &Value, line: String) -> (Id, String) {
+/// `trigger.replay` of a recorded stream event: run it through the local triggers again, past
+/// the stream's dedupe (it was taken once) and each trigger's cooldown (a replay is asked for),
+/// but not the loop guard: an event a trigger caused still fires nothing. Each firing is
+/// recorded as its own delivery (verdict replayed, replay_of `event:<seq>`); the result sums
+/// them up and isn't recorded.
+pub fn replay_stream(d: &Arc<Daemon>, e: &Event) -> Delivery {
+    let of = format!("event:{}", e.seq);
+    let mut sum = Delivery {
+        id: "d_replay".into(),
+        source: TriggerSource::Local,
+        event: e.kind.clone(),
+        delivery_guid: "replay".into(),
+        received_at: time::now_rfc3339(),
+        verdict: Verdict::Replayed,
+        trigger_id: None,
+        session_started: None,
+        summary: String::new(),
+        action: None,
+        repo: None,
+        subject: None,
+        http_status: None,
+        eval: vec![],
+        triggers_fired: vec![],
+        sessions_started: vec![],
+        recovered: false,
+        replay_of: Some(of.clone()),
+        body_sha256: None,
+        command_runs: vec![],
+        event_seq: Some(e.seq),
+    };
+    let stream = e.stream.as_deref();
+    if let Some(c) = stream.and_then(|x| x.caused_by.as_ref()) {
+        sum.summary = format!("Not replayed · trigger {} caused event {}, so it never fires triggers", c.trigger, e.seq);
+        return sum;
+    }
+    let candidates: Vec<Trigger> = d.core().state.triggers.iter().filter(|t| is_live(t) && glob_ci(t.event.trim(), &e.kind)).cloned().collect();
+    let mut outcomes = vec![];
+    for t in &candidates {
+        let ev = evaluate(t, &e.kind, None, &e.data);
+        if !ev.fires() {
+            sum.eval.push(ev.line);
+            continue;
+        }
+        let (id, outcome) = fire_as(d, t, &e.kind, None, &e.data, stream, ev.line, Some(&of), Some(e.seq));
+        sum.eval.push(format!("{}: {outcome} (delivery {id})", t.name));
+        sum.triggers_fired.push(t.id.clone());
+        let started = d.core().state.deliveries.iter().rev().find(|x| x.id == id).and_then(|x| x.session_started.clone());
+        sum.sessions_started.extend(started);
+        outcomes.push(t.name.clone());
+    }
+    sum.trigger_id = sum.triggers_fired.first().cloned();
+    sum.session_started = sum.sessions_started.first().cloned();
+    sum.summary = match (outcomes.len(), candidates.len()) {
+        (0, 0) => format!("Replayed event {} · no live local trigger listens for {}", e.seq, e.kind),
+        (0, n) => format!("Replayed event {} · {n} trigger{} listen{} for {}, but none matched its filters", e.seq, plural(n), if n == 1 { "s" } else { "" }, e.kind),
+        (n, _) => format!("Replayed event {} · fired {n} trigger{}: {}", e.seq, plural(n), outcomes.join(", ")),
+    };
+    sum
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// A trigger's `to`, looked up now among running terminals (within `project`): the terminal,
+/// and a note when several have that name.
+pub fn resolve_to(d: &Daemon, to: &str, project: Option<&str>) -> Result<(SessionFacts, Option<String>), String> {
+    let running: Vec<Session> = {
+        let core = d.core();
+        core.state.sessions.iter().filter(|s| core.rt.contains_key(&s.id)).cloned().collect()
+    };
+    let running: Vec<Session> = running.iter().map(|s| crate::rpc::session::live(d, s)).collect();
+    let found: Vec<ToCandidate> = running
+        .iter()
+        .map(|s| ToCandidate { id: &s.id, name: &s.name, project_id: &s.project_id, active_at: time::parse_rfc3339(&s.last_activity_at).unwrap_or(0) })
+        .collect();
+    let pick = pick_to(to, project, &found)?;
+    let s = &running[pick.index];
+    let note = (pick.matches > 1).then(|| format!("{} terminals named {}; picked the most recently active ({})", pick.matches, s.name, s.id));
+    Ok((SessionFacts::of(s), note))
+}
+
+/// The terminal `t` acts on: its `to`, resolved now, or else the event's own (`s`).
+fn acting_on(d: &Daemon, t: &Trigger, s: Option<&SessionFacts>) -> Result<(Option<SessionFacts>, Option<String>), String> {
+    match t.action.to() {
+        Some(to) => resolve_to(d, to, t.filter.project.as_deref()).map(|(x, note)| (Some(x), note)),
+        None => Ok((s.cloned(), None)),
+    }
+}
+
+fn fire(d: &Arc<Daemon>, t: &Trigger, event: &str, s: Option<&SessionFacts>, data: &Value, stream: Option<&StreamRef>, line: String) -> (Id, String) {
+    fire_as(d, t, event, s, data, stream, line, None, None)
+}
+
+/// [`fire`], as a replay of `replay_of` (`event:<seq>`) when it is one, answering logged event
+/// `seq` when there is one.
+#[allow(clippy::too_many_arguments)]
+fn fire_as(
+    d: &Arc<Daemon>, t: &Trigger, event: &str, s: Option<&SessionFacts>, data: &Value, stream: Option<&StreamRef>, line: String, replay_of: Option<&str>,
+    seq: Option<u64>,
+) -> (Id, String) {
     let id = format!("d_{}", hex_id(6));
+    let guid = format!("local-{}", hex_id(8));
+    // A run_command gets the hook payload or event data in $MIDNA_PAYLOAD, kept and pruned with
+    // the delivery, as a webhook's command gets its body.
+    let json = data.to_string();
+    let file = crate::webhooks::process::body_file(d, &id);
+    let body = (matches!(t.action, TriggerAction::RunCommand { .. }) && crate::webhooks::process::write_private(&file, json.as_bytes()).is_ok())
+        .then(|| crate::headless::Body { json: &json, file: &file, event, action: None, guid: &guid });
     let mut runs = vec![];
-    let (started, outcome) = run(d, t, event, s, data, &id, &mut runs);
+    // A `to` that names no running terminal: nothing is done, and the delivery says why.
+    let on = acting_on(d, t, s);
+    let (started, outcome) = match &on {
+        Ok((on, note)) => {
+            let (started, out) = run(d, t, event, s, on.as_ref(), data, stream, &id, body.as_ref(), &mut runs);
+            (started, note.as_ref().map_or(out.clone(), |n| format!("{out} · {n}")))
+        }
+        Err(e) => (None, format!("Could not {}: {e}", action_name(&t.action).replace('_', " "))),
+    };
+    let outcome = if replay_of.is_some() { format!("Replayed · {outcome}") } else { outcome };
+    let on = on.ok().and_then(|(x, _)| x);
+    let s = on.as_ref().or(s);
     let summary = s.map(|s| s.name.clone());
     {
         let mut core = d.core();
@@ -560,9 +752,9 @@ fn fire(d: &Arc<Daemon>, t: &Trigger, event: &str, s: Option<&SessionFacts>, dat
         id,
         source: TriggerSource::Local,
         event: event.to_string(),
-        delivery_guid: format!("local-{}", hex_id(8)),
+        delivery_guid: guid,
         received_at: time::now_rfc3339(),
-        verdict: Verdict::Verified,
+        verdict: if replay_of.is_some() { Verdict::Replayed } else { Verdict::Verified },
         trigger_id: Some(t.id.clone()),
         session_started: started.clone(),
         summary: outcome.clone(),
@@ -574,9 +766,10 @@ fn fire(d: &Arc<Daemon>, t: &Trigger, event: &str, s: Option<&SessionFacts>, dat
         triggers_fired: vec![t.id.clone()],
         sessions_started: started.clone().into_iter().collect(),
         recovered: false,
-        replay_of: None,
+        replay_of: replay_of.map(str::to_string),
         body_sha256: None,
         command_runs: runs,
+        event_seq: seq,
     };
     let project = t.action.project_id().cloned().or_else(|| s.map(|s| s.project_id.clone()));
     d.emit(
@@ -584,22 +777,31 @@ fn fire(d: &Arc<Daemon>, t: &Trigger, event: &str, s: Option<&SessionFacts>, dat
         actor_of(t),
         project,
         s.map(|s| s.id.clone()).or(started.clone()),
-        json!({ "trigger_id": t.id, "delivery_id": del.id, "session_id": started, "outcome": outcome, "event": event, "local": true }),
+        json!({ "trigger_id": t.id, "delivery_id": del.id, "session_id": started, "outcome": outcome, "event": event, "local": true, "replay": replay_of.is_some() }),
     );
     crate::webhooks::process::record(d, &del, None);
     (del.id, outcome)
 }
 
-/// Run one local trigger's action for delivery `del_id`. Returns (terminal started, one-line
-/// outcome); a headless command's run goes in `runs`.
-fn run(d: &Arc<Daemon>, t: &Trigger, event: &str, s: Option<&SessionFacts>, data: &Value, del_id: &str, runs: &mut Vec<CommandRun>) -> (Option<Id>, String) {
+/// Run one local trigger's action for delivery `del_id`, on terminal `on` (its `to`, or the
+/// event's `s`). Returns (terminal started, one-line outcome); a headless command's run goes in
+/// `runs`. A `run_command` gets `body`.
+#[allow(clippy::too_many_arguments)]
+fn run(
+    d: &Arc<Daemon>, t: &Trigger, event: &str, s: Option<&SessionFacts>, on: Option<&SessionFacts>, data: &Value, stream: Option<&StreamRef>, del_id: &str,
+    body: Option<&crate::headless::Body>, runs: &mut Vec<CommandRun>,
+) -> (Option<Id>, String) {
     let actor = actor_of(t);
-    let prompt = if uses_last_prompt(t) { s.and_then(|s| last_prompt(d, &s.id)) } else { None };
-    let r = |tpl: &str, quote: bool| render(tpl, event, s, data, prompt.as_deref(), quote);
-    let target = || s.ok_or_else(|| format!("{}: event {event} isn't about a terminal", action_name(&t.action)));
+    let prompt = if uses_last_prompt(t) { on.and_then(|s| last_prompt(d, &s.id)) } else { None };
+    // `{{session.*}}`: the event's terminal, or for an event about none, the `to` one.
+    let facts = s.or(on);
+    let r = |tpl: &str, quote: bool| render(tpl, event, stream, facts, data, prompt.as_deref(), quote);
+    let target = || on.ok_or_else(|| format!("{}: event {event} isn't about a terminal (name one with `to`)", action_name(&t.action)));
     let open = |params: Value| -> Result<Id, String> {
         let p: SessionOpenParams = serde_json::from_value(params).map_err(|e| e.to_string())?;
         let mut ctx = Ctx::internal_trigger(actor.clone());
+        // The terminal carries MIDNA_TRIGGER / MIDNA_DELIVERY, so what it publishes fires nothing.
+        ctx.caused_by = Some(TriggerCause { trigger: t.id.clone(), delivery: Some(del_id.to_string()) });
         // The human wrote a local trigger's prompt; a notification button's came from its sender.
         ctx.supervised = crate::notify::is_callback(t);
         let v = crate::rpc::session::open(d, &ctx, p).map_err(|e| e.message)?;
@@ -628,7 +830,7 @@ fn run(d: &Arc<Daemon>, t: &Trigger, event: &str, s: Option<&SessionFacts>, data
         TriggerAction::RunCommand { project_id, command, background, headless, timeout_secs } => {
             let n = name();
             if *headless {
-                let run = crate::headless::start(d, t, del_id, project_id, &r(command, true), *timeout_secs, None);
+                let run = crate::headless::start(d, t, del_id, project_id, &r(command, true), *timeout_secs, body);
                 let out = match &run.error {
                     Some(e) => Err(e.clone()),
                     None => Ok((None, format!("Running with no terminal › {n}"))),
@@ -636,19 +838,24 @@ fn run(d: &Arc<Daemon>, t: &Trigger, event: &str, s: Option<&SessionFacts>, data
                 runs.push(run);
                 out
             } else {
-                open(json!({ "project_id": project_id, "kind": "monitor", "name": n, "command": [r(command, true)], "background": background }))
+                let cmd = r(command, true);
+                let cmd = match body {
+                    Some(b) => b.exported(&t.id, del_id, &cmd),
+                    None => cmd,
+                };
+                open(json!({ "project_id": project_id, "kind": "monitor", "name": n, "command": [cmd], "background": background }))
                     .map(|id| (Some(id), format!("Ran command{} › {n}", if *background { " in Background" } else { "" })))
             }
         }
-        TriggerAction::Attention { message } => {
+        TriggerAction::Attention { message, .. } => {
             let msg = r(message, false);
-            let mut item = d.new_needs_you(NeedsYouKind::Note, if msg.trim().is_empty() { t.name.clone() } else { msg }, actor.clone(), s.map(|s| s.id.clone()));
+            let mut item = d.new_needs_you(NeedsYouKind::Note, if msg.trim().is_empty() { t.name.clone() } else { msg }, actor.clone(), on.map(|s| s.id.clone()));
             item.bulk_safe = true;
             item.trigger_id = Some(t.id.clone());
             let item = d.raise_needs_you(item);
             Ok((None, format!("Raised attention ({})", item.id)))
         }
-        TriggerAction::SendToSession { steps } => target().and_then(|s| {
+        TriggerAction::SendToSession { steps, .. } => target().and_then(|s| {
             if steps.iter().any(|x| x.text.contains("last_prompt")) && prompt.is_none() {
                 return Err(format!("{} has no prompt to resend yet", s.name));
             }
@@ -657,7 +864,7 @@ fn run(d: &Arc<Daemon>, t: &Trigger, event: &str, s: Option<&SessionFacts>, data
             let n = crate::queue::add_steps(d, &s.id, t, actor_of(t), rendered, restored)?;
             Ok((None, format!("Queued {n} step{} for {}", if n == 1 { "" } else { "s" }, s.name)))
         }),
-        TriggerAction::SetStatus { label, color, icon, base, clear_on } => target().map(|s| {
+        TriggerAction::SetStatus { label, color, icon, base, clear_on, .. } => target().map(|s| {
             let label = r(label, false);
             let detail = lookup(data, "message").map(|m| clip(&m, 300));
             let cs = CustomStatus {
@@ -674,11 +881,11 @@ fn run(d: &Arc<Daemon>, t: &Trigger, event: &str, s: Option<&SessionFacts>, data
             set_custom(d, &s.id, cs, actor.clone());
             (None, format!("Status “{label}” on {}", s.name))
         }),
-        TriggerAction::Notify { title, body, sound, category, open, id } => {
+        TriggerAction::Notify { title, body, sound, category, open, id, .. } => {
             let extras = crate::notify::Extras { id: id.as_deref().map(|i| r(i, false)), open: open.as_deref().map(|u| r(u, false)), actions: vec![], ..Default::default() };
-            Ok((None, notify(d, t, s.map(|s| s.id.clone()), &r(title, false), &r(body, false), *sound, category.as_deref(), extras)))
+            Ok((None, notify(d, t, on.map(|s| s.id.clone()), &r(title, false), &r(body, false), *sound, category.as_deref(), extras)))
         }
-        TriggerAction::ClearStatus {} => target().map(|s| {
+        TriggerAction::ClearStatus { .. } => target().map(|s| {
             let had = clear_custom(d, &s.id, actor.clone(), "clear_status", true);
             (None, if had { format!("Cleared the status on {}", s.name) } else { format!("{} had no custom status", s.name) })
         }),
@@ -831,7 +1038,7 @@ pub fn prompt_blocked(d: &Arc<Daemon>, sid: &str, content: &str) {
     let Some((project, agent)) = d.core().state.session(sid).map(|s| (s.project_id.clone(), s.agent)) else { return };
     crate::rpc::agent::end_turn_if_open(d, sid, "prompt blocked");
     d.set_status(sid, StatusState::Idle, Some("prompt blocked by a hook".into()), None, Actor::system());
-    let actor = Actor { kind: ActorKind::Agent, session: Some(sid.to_string()), name: agent.map(|a| a.as_str().to_string()), trigger: None, via: None };
+    let actor = Actor { kind: ActorKind::Agent, session: Some(sid.to_string()), name: agent.map(|a| a.as_str().to_string()), trigger: None, via: None, peer: None };
     let prompt = prompt.or_else(|| last_prompt(d, sid));
     d.emit(kinds::AGENT_PROMPT_BLOCKED, actor, Some(project), Some(sid.to_string()), json!({ "hook": hook, "message": message, "prompt": prompt }));
 }
@@ -863,7 +1070,8 @@ fn watch_silent_prompt(d: &Arc<Daemon>, sid: &str, seen: u64) {
 // ------------------------------------------------------------------ dry run
 
 /// `trigger.test` for a local trigger: how it evaluates, and what it would do. Nothing runs.
-pub fn dry_run(d: &Daemon, t: &Trigger, event: &str, sid: Option<&str>, data: &Value) -> Delivery {
+/// `stream`: the stream event's envelope, when the test names one.
+pub fn dry_run(d: &Daemon, t: &Trigger, event: &str, sid: Option<&str>, data: &Value, stream: Option<&StreamRef>) -> Delivery {
     let s = sid.and_then(|sid| SessionFacts::lookup(d, sid));
     // A schedule: test against its next run, and say when the next few are.
     let mut next = String::new();
@@ -883,20 +1091,39 @@ pub fn dry_run(d: &Daemon, t: &Trigger, event: &str, sid: Option<&str>, data: &V
     }
     let data = sched.as_ref().unwrap_or(data);
     let ev = evaluate(t, event, s.as_ref(), data);
+    // The terminal it would act on: its `to`, looked up now, or the event's.
+    let acting = acting_on(d, t, s.as_ref());
+    let target = acting.as_ref().ok().and_then(|(x, _)| x.clone());
     // Without a terminal (or before its first prompt) show where the prompt would go.
-    let prompt = s.as_ref().and_then(|s| last_prompt(d, &s.id)).unwrap_or_else(|| "‹last prompt›".into());
-    let r = |tpl: &str, quote: bool| render(tpl, event, s.as_ref(), data, Some(&prompt), quote);
-    let on = s.as_ref().map(|s| format!(" on {}", s.name)).unwrap_or_default();
+    let prompt = target.as_ref().and_then(|s| last_prompt(d, &s.id)).unwrap_or_else(|| "‹last prompt›".into());
+    // A stream event: the envelope given, or its stream and kind from the event with the
+    // publisher's id not known yet.
+    let stream = stream.cloned().or_else(|| StreamRef::of_event(event).map(|x| StreamRef { id: Some("‹id›".into()), ..x }));
+    let facts = s.as_ref().or(target.as_ref());
+    let r = |tpl: &str, quote: bool| render(tpl, event, stream.as_ref(), facts, data, Some(&prompt), quote);
+    let mut on = match (&acting, t.action.to()) {
+        (Ok((Some(x), note)), Some(_)) => format!(" on {} ({}){}", x.name, x.id, note.as_ref().map(|n| format!(" — {n}")).unwrap_or_default()),
+        (Err(e), Some(to)) => format!(" on {to} (but there's {e} right now, so it would do nothing)"),
+        _ => s.as_ref().map(|s| format!(" on {}", s.name)).unwrap_or_default(),
+    };
+    // These act on the event's terminal unless they name one, and a stream event has none.
+    if let (None, Some(x), true) = (&s, &stream, t.action.needs_session()) {
+        on = format!(" (but stream `{}`'s events belong to no terminal, so there is none to act on: name one with `to`)", x.name);
+    }
     let would = match &t.action {
         TriggerAction::StartAgent { agent, prompt_template, .. } => format!("would start {} with prompt: {}", agent.as_str(), r(prompt_template, false)),
-        TriggerAction::RunCommand { command, background, headless, .. } => format!("would run{}: {}", run_where(*background, *headless), r(command, true)),
-        TriggerAction::Attention { message } => format!("would raise attention: {}", r(message, false)),
-        TriggerAction::SendToSession { steps } => {
+        TriggerAction::RunCommand { command, background, headless, .. } => {
+            let size = data.to_string().len();
+            let payload = if *headless { format!("the {size}-byte payload on stdin and in $MIDNA_PAYLOAD") } else { format!("the {size}-byte payload in $MIDNA_PAYLOAD") };
+            format!("would run{}: {} · with {payload}", run_where(*background, *headless), r(command, true))
+        }
+        TriggerAction::Attention { message, .. } => format!("would raise attention{on}: {}", r(message, false)),
+        TriggerAction::SendToSession { steps, .. } => {
             let shown: Vec<String> = steps.iter().map(|x| format!("“{}”", clip(&r(&x.text, false), 80))).collect();
             format!("would send{on}: {}", shown.join(" → "))
         }
         TriggerAction::SetStatus { label, color, base, clear_on, .. } => format!("would set status{on}: “{}” ({color}, {}, clears on {clear_on:?})", r(label, false), base.as_str()),
-        TriggerAction::ClearStatus {} => format!("would clear the status{on}"),
+        TriggerAction::ClearStatus { .. } => format!("would clear the status{on}"),
         TriggerAction::Notify { title, body, .. } => format!("would notify{on}: {}", [r(title, false), r(body, false)].iter().filter(|x| !x.trim().is_empty()).cloned().collect::<Vec<_>>().join(" — ")),
     };
     let fires = ev.fires();
@@ -917,7 +1144,7 @@ pub fn dry_run(d: &Daemon, t: &Trigger, event: &str, sid: Option<&str>, data: &V
         },
         action: None,
         repo: None,
-        subject: s.map(|s| s.name),
+        subject: target.or(s).map(|s| s.name),
         http_status: None,
         eval: vec![ev.line],
         triggers_fired: vec![],
@@ -926,6 +1153,7 @@ pub fn dry_run(d: &Daemon, t: &Trigger, event: &str, sid: Option<&str>, data: &V
         replay_of: None,
         body_sha256: None,
         command_runs: vec![],
+        event_seq: None,
     }
 }
 
@@ -940,7 +1168,7 @@ mod tests {
             source: TriggerSource::Local,
             event: event.into(),
             filter,
-            action: TriggerAction::SendToSession { steps: vec![SendStep { text: "/compact".into(), enter: true }, SendStep { text: "{{last_prompt}}".into(), enter: true }] },
+            action: TriggerAction::SendToSession { steps: vec![SendStep { text: "/compact".into(), enter: true }, SendStep { text: "{{last_prompt}}".into(), enter: true }], to: None },
             enabled: true,
             state: TriggerState::Active,
             secret_set: false,
@@ -979,6 +1207,26 @@ mod tests {
     }
 
     #[test]
+    fn a_list_of_globs_on_one_path_must_all_match_in_any_order() {
+        let mut f = TriggerFilter::default();
+        f.fields.insert("text".into(), Globs::All(vec!["*failed to build*".into(), "*master*".into()]));
+        let t = trig("stream.slack.message", f);
+        let fires = |text: &str| evaluate(&t, "stream.slack.message", None, &json!({ "text": text }));
+        assert!(fires("roon_mobile failed to build on master").fires());
+        assert!(fires("master: roon_mobile FAILED TO BUILD").fires(), "either order");
+        let e = fires("roon_mobile failed to build on dev");
+        assert!(!e.fires());
+        assert!(e.line.ends_with("≠ \"*master*\""), "names only the glob that missed: {}", e.line);
+        let e = evaluate(&t, "stream.slack.message", None, &json!({}));
+        assert!(e.line.ends_with("text missing (wants \"*failed to build*\" and \"*master*\")"), "{}", e.line);
+        // A list round-trips as JSON's array; one glob stays a string.
+        let v = serde_json::to_value(&t.filter).unwrap();
+        assert_eq!(v, json!({ "match": { "text": ["*failed to build*", "*master*"] } }));
+        let one: TriggerFilter = serde_json::from_value(json!({ "match": { "m": "*x*" } })).unwrap();
+        assert_eq!(one.fields["m"], Globs::One("*x*".into()));
+    }
+
+    #[test]
     fn hook_globs_and_nested_paths() {
         let mut f = TriggerFilter::default();
         f.fields.insert("tool_input.command".into(), "git push*".into());
@@ -993,10 +1241,22 @@ mod tests {
     #[test]
     fn renders_templates() {
         let data = json!({ "message": "Compact first", "nested": { "n": 2 } });
-        let out = render("{{session.name}} {{event}} {{message}} {{data.nested.n}} {{missing}}|{{last_prompt}}", "agent.prompt_blocked", Some(&sess()), &data, Some("fix the bug"), false);
+        let out = render("{{session.name}} {{event}} {{message}} {{data.nested.n}} {{missing}}|{{last_prompt}}", "agent.prompt_blocked", None, Some(&sess()), &data, Some("fix the bug"), false);
         assert_eq!(out, "api agent.prompt_blocked Compact first 2 |fix the bug");
-        assert_eq!(render("echo {{message}}", "e", None, &json!({ "message": "a'b; rm" }), None, true), r"echo 'a'\''b; rm'");
-        assert_eq!(render("open {{ unterminated", "e", None, &data, None, false), "open {{ unterminated");
+        assert_eq!(render("echo {{message}}", "e", None, None, &json!({ "message": "a'b; rm" }), None, true), r"echo 'a'\''b; rm'");
+        assert_eq!(render("open {{ unterminated", "e", None, None, &data, None, false), "open {{ unterminated");
+    }
+
+    #[test]
+    fn renders_a_stream_events_envelope() {
+        let data = json!({ "text": "failed to build", "stream": { "name": "payload's own" } });
+        let st = StreamRef { name: "slack".into(), kind: "message".into(), id: Some("1700.01".into()), caused_by: None };
+        let tpl = "{{stream.name}}/{{stream.kind}}/{{stream.id}} {{data.text}} {{data.stream.name}}";
+        assert_eq!(render(tpl, "stream.slack.message", Some(&st), None, &data, None, false), "slack/message/1700.01 failed to build payload's own");
+        // Without the envelope (a dry run): the name and kind from the event, no id.
+        assert_eq!(render(tpl, "stream.slack.message", None, None, &data, None, false), "slack/message/ failed to build payload's own");
+        assert_eq!(render("{{stream.name}}|{{stream.id}}", "agent.turn_ended", None, None, &json!({}), None, false), "|");
+        assert_eq!(render("echo {{stream.id}}", "stream.ci.x", Some(&StreamRef { id: Some("a'b".into()), ..st }), None, &data, None, true), r"echo 'a'\''b'");
     }
 
     #[test]

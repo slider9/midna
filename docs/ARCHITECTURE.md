@@ -31,11 +31,11 @@ Cargo.toml            workspace
 env.sh                source before building (Zig 0.15.2 + SDK shim + LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast)
 .toolchain/           (gitignored) zig, fakebin/xcrun, ghostty-src
 crates/
-  midna-proto/        serde types, method catalog, OpenRPC generation, blocking + async client
+  midna-proto/        serde types, method catalog, OpenRPC generation, blocking client
   midnad/             daemon binary (lib + bin; the lib holds modules so they're testable)
   midna-cli/          `midna` binary: CLI verbs, `midna mcp` (stdio MCP bridge), `midna hook <agent>`
   midna-app/          GPUI app (gpui-kit 0.7), binary `midna-app`, bundled as Midna.app
-  midna-relay/        self-hostable webhook relay (later phase)
+  slate-stub/         stand-in for the private Slate crate (not a member; `scripts/slate.sh` patches the real one in)
 docs/
   ARCHITECTURE.md     this file
   design/             approved .dc.html boards (Main, CommandBar-A, NeedsYou-C, Rules-B, Triggers-A, Insights-A, Settings-A, Onboarding-B; Settings-C is the older one-table Settings)
@@ -66,20 +66,22 @@ spikes/               proven prototypes; reuse code from here freely
 - The daemon answers with one JSON line (result `{ok:true}`). From then on the connection is binary in both directions:
   - Daemon → client: length-prefixed frames, `u32 LE len` + payload = `Frame::encode()` (the dirty-rows frame format from the spike). Moving that encoder into `midna-proto` is fine.
   - Client → daemon: 1-byte tags.
-    - `0x01` = want (credit for the next frame).
+    - `0x01` = want (credit for one more frame).
     - `0x02` + u16 cols + u16 rows + u32 cw + u32 ch = resize.
     - `0x03` + u32 len + bytes = input. Input may also go through `session.input` on the control connection.
 - The daemon only sends a frame when the client has credit, and merges dirty rows meanwhile. That's what makes 120fps on an 80MB `cat` possible.
+- Credit is a count, capped at 4 (`term::MAX_CREDIT`). The app gives one back per frame it applies, counting frames that merged before it painted. A local stream keeps one frame in flight. Over a drive link the app asks for two more at attach, so three are in flight and a frame doesn't wait a Wi-Fi round trip for the one before it.
 
 **Caller identity.**
 - **GUI = human.** The daemon reads the peer pid (`LOCAL_PEERPID`) and resolves its executable with `proc_pidpath`. If that is the midna-app binary (`MIDNA_APP_PATH` env override for dev), the connection's role is `human`.
 - **CLI inside a midna terminal = agent.** Calls carrying `MIDNA_SESSION` (sent as the `caller.session` field in params, see below) are `agent` with that session id.
 - **`caller.no_wait: true`** (CLI `--no-wait`, MCP `no_wait: true`) never changes the role: a mutating call runs on its own thread, and if it raises an approval the caller gets error `6` with `data.needs_you_id` at once while the call finishes when the human answers (the approval then stays open for at least a day).
 - **Anything else** is `agent` with no session.
+- **A drive link = the human at that Mac, with limits.** A connection carried over a drive link from one of my Macs (`docs/DECISIONS.md`, "Nearby: driving another of my Macs") is to act as `{kind: human, via: peer, peer: <fingerprint>}`: it may approve and type, but the local-only methods and settings listed there answer error `2` and never become a needs-you. `conn::serve_peer` gives each stream human role and that actor (dropping any `caller` claim); `rpc::call` asks `nearby::local_only` before anything else, and `needs_you.resolve` refuses approving an item whose deferred call is local-only. Only the verified app opens a link (`drive.open`), checked by GUI identity, not by `human` role.
 - **Document the limitation honestly.** Same-user processes can't be fully authenticated, so human-only actions requested over the CLI always become a needs-you confirmation in the GUI and never execute directly.
 - **Hardening (see `docs/SECURITY.md`).** Signed builds check the GUI's code signature (Team ID + identifier) instead of its name; `MIDNA_APP_PATH` is debug-only; a GUI binary running inside a midna terminal is an agent; `caller.session` must match the terminal the calling process runs in; the app's `MIDNA_DEBUG_*` drivers compile out of release builds.
 
-**Errors.** JSON-RPC error codes: `-32601` unknown method, `-32602` bad params, `1` refused by policy, `2` human-only, `3` not found, `4` conflict, `6` pending (a `caller.no_wait` call is waiting on the human: `data.needs_you_id`; the call carries on when they answer and `needs_you.get` reports how it ended).
+**Errors.** JSON-RPC error codes: `-32601` unknown method, `-32602` bad params, `1` refused by policy, `2` human-only, `3` not found, `4` conflict, `5` not implemented, `6` pending (a `caller.no_wait` call is waiting on the human: `data.needs_you_id`; the call carries on when they answer and `needs_you.get` reports how it ended), `7` busy (the Mac is too loaded for `daemon.upgrade` / `daemon.restart`; `data` says how busy, and `force` does it anyway).
 
 ## Domain model (midna-proto)
 
@@ -108,8 +110,8 @@ All ids are short lowercase strings: 8 hex chars for sessions, `p_xxxxxx` for pr
 - **PolicyAction** `{ kind: command|tool|path|cli|window, value: string, session?: id, project?: id }`
   - **Evaluation**:
     - The most specific scope wins (session > project > global).
-    - Within a scope, deny beats ask beats allow.
-    - With no match, the default comes from the setting `policy.default` (default `ask` for `cli` destructive verbs, `allow` otherwise; keep the defaults table in code).
+    - Within a scope: deny, then an allow the human gave by approving that action ("always": `origin` set, `added_by` human), then ask, then any other allow. So "approve always" on an `ask` rule takes hold at that scope, and a deny still wins.
+    - With no match, the default comes from the setting `policy.default`: `allow`, `ask` or `deny`, or `auto` (the default: `ask` for `cli` destructive verbs, `allow` otherwise; keep the defaults table in code).
     - `policy.check` returns `{ decision, rule?: Rule, trace: [{rule_id, matched, reason}] }`. The trace powers the "test a command" view.
 - **Trigger**
   - Fields: `{ id, name, source: github|bitbucket, event: string, filter: {repo?, branch?, action?, label?}, action: TriggerAction, enabled: bool, state: draft|needs_secret|active|paused, secret_set: bool, created_by: Actor, created_at, last_fired_at?, fired: u64 }`
@@ -137,7 +139,7 @@ All ids are short lowercase strings: 8 hex chars for sessions, `p_xxxxxx` for pr
     - `agents.may_force_close` (human_only, default false): agents close any terminal (working ones, `close --force`, someone else's) with no default ask; rules on `close …` still apply
     - `agents.may_install_updates` (human_only, default false): an agent's `updates.install` goes to the GUI without a needs-you approval; the app's signature checks still apply
     - `approve.from_cli` (human_only)
-    - `keys.*` keybindings: `keys.command_bar` = cmd-k, `keys.next_needs_you` = cmd-j, `keys.new_terminal` = cmd-t, `keys.new_agent` = cmd-shift-t, `keys.new_terminal_root` = cmd-alt-t, `keys.new_agent_root` = cmd-alt-shift-t, `keys.approve` = cmd-enter, `keys.deny` = cmd-backspace, `keys.settings` = cmd-comma, `keys.rules`, `keys.triggers`, `keys.insights`. ⌘1–9 are reserved for projects.
+    - `keys.*` keybindings: `keys.command_bar` = cmd-k, `keys.next_needs_you` = cmd-j, `keys.new_agent` = cmd-t, `keys.new_terminal` = cmd-shift-t, `keys.new_agent_root` = cmd-alt-t, `keys.new_terminal_root` = cmd-alt-shift-t, `keys.approve` = cmd-enter, `keys.deny` = cmd-backspace, `keys.settings` = cmd-comma, `keys.rules` = cmd-shift-r, `keys.triggers` = cmd-shift-g, `keys.insights` = cmd-shift-i, and more (the full list and defaults are in `midna-proto/src/settings.rs`). ⌘1–9 are reserved for projects.
 - **Event** `{ seq: u64, at, kind: string, actor: Actor, project_id?, session_id?, data: serde_json::Value }`
   - Kinds, dotted: `project.added|updated|removed`, `session.opened|renamed|closed|status|title|exited|input_by_agent`, `needs_you.raised|resolved`, `rule.added|fired|removal_requested|removed|expired`, `trigger.added|updated|delivery|fired`, `settings.changed`, `window.command`, `agent.turn_started|turn_ended|prompt_submitted|cost`, `daemon.started|upgraded`, `audit` (data: `{method, params_summary, outcome: ok|denied|error}`).
 - **Insights** are computed in the daemon from events: `insights.summary{ range: today|yesterday|week, by?: project|agent|terminal|day }`.
@@ -156,7 +158,7 @@ Each method has a name, a description written for agents, params/result types, `
 | `session` | `session.list{project_id?}`, `session.get{id}`, `session.open{project_id, kind, agent?, name?, cwd?, command?, prompt?, agent_args?, resume?}`, `session.close{id, force?}`, `session.rename{id,name}`, `session.input{id, text, enter?: bool}`, `session.read{id, lines?: u32, screen?: bool}` (plain text), `session.resize`, `session.restart{id}`, `session.focus{id}` (emits `window.command`), `session.prompts{id}`, `session.jump_prompt{id, n | to}` (prompt fast travel) |
 | `stream` | `stream.attach` (see wire protocol) |
 | `events` | `events.list{since_seq?, limit?, filter?}`, `events.subscribe{since_seq?}` (connection then receives `event` notifications) |
-| `needs_you` | `needs_you.list`, `needs_you.get{id, wait_secs?}` (an open item, or how it ended: resolved/withdrawn/timeout, plus a no-wait call's result or error), `needs_you.raise{kind:blocked|note, message}` (agents: "attention"), `needs_you.resolve{id, resolution}` (human for approvals; agents get `approve` only when `approve.from_cli` allows it, and only for their own session) |
+| `needs_you` | `needs_you.list`, `needs_you.get{id, wait_secs?}` (each open item carries `local_only: true` when a drive link couldn't approve it) (an open item, or how it ended: resolved/withdrawn/timeout, plus a no-wait call's result or error), `needs_you.raise{kind:blocked|note, message}` (agents: "attention"), `needs_you.resolve{id, resolution}` (human for approvals; agents get `approve` only when `approve.from_cli` allows it, and only for their own session) |
 | `policy` | `policy.check{action}` (no side effects), `policy.request{action}` (check + raise approval if ask + block up to `timeout_secs` waiting for the decision; used by hooks) |
 | `rule` | `rule.list`, `rule.add{effect, matcher, scope, expires_in_secs?}`, `rule.request_removal{id, reason}`, `rule.remove{id}` (human_only), `rule.restore{rule}` (human_only) |
 | `trigger` | `trigger.list`, `trigger.add` (agents create drafts), `trigger.update`, `trigger.set_enabled` (human_only to enable), `trigger.set_secret{id, secret}` (human_only), `trigger.remove`, `trigger.deliveries{trigger_id?, limit?}`, `trigger.replay{delivery_id}`, `trigger.test{trigger_id, payload}` |
@@ -165,6 +167,9 @@ Each method has a name, a description written for agents, params/result types, `
 | `insights` | `insights.summary`, `insights.activity{since?, filter?}` |
 | `usage` | `usage.get` (Claude's plan usage limits, the latest any terminal's status line reported: `claude{five_hour, seven_day: {used_percentage, resets_at, expired?}, observed_at, session, limited, limited_until}`); per terminal in `session.get` `agent_info.rate_limits`; events `usage.limit_reached`, `usage.sampled` (charted by `insights.detail` `usage`) |
 | `keep_awake` | `keep_awake.status` (held, reason, line, window_open, next_on/next_off, work, battery, schedule, settings, today), `keep_awake.set{enabled|on?, mode?, start?, end?, days?, hours?, min_battery?, linger_mins?, today?}` (returns the status); event `keep_awake.changed` |
+| `peers` | `peers.list` (Nearby: `me{fingerprint, name, visibility, everyone_until?, service?, advertising, browsing, protocol, error?}`, `peers[{fingerprint, name, protocol, host?, port?, seen_since}]`), `peers.sessions{peer}` (a my_device's agent terminals), `peers.pair{fingerprint}`, `peers.confirm{pairing, accept?, as?, allow_drive?}` (human_only), `peers.forget{fingerprint}` (human_only), `peers.set_tier{fingerprint, as}` (human_only), `peers.set_drive{peer, on}` (human_only, refused outright: let that my_device drive this Mac; off cuts its drive links), `peers.set_auto_accept{fingerprint, kind, on}` (human_only), `peers.set_agent_send{fingerprint, kinds, on}` (human_only, refused outright: agents here send that my_device those kinds without asking where no rule decides); events `peers.appeared` (a `Peer`), `peers.left{fingerprint, name}`, `peers.pairing`, `peers.pairing_ended`, `peers.paired`, `peers.forgotten`, `peers.changed`, `peers.drive{peer, name, on}`; settings `nearby.visibility` (human_only: off, paired, everyone), `nearby.downloads` (human_only), `nearby.name` and `nearby.mac_themes` (this Mac's theme for another of my Macs' windows) |
+| `share` | `share.send{peer, kind, …}`, `share.accept{id}` (human_only), `share.decline{id}` (human_only), `share.answer{id, wait_secs?}`, `inbox.list{direction?, state?, peer?, limit?}`; events `share.offered`, `share.sent`, `share.progress`, `share.accepted`, `share.declined`, `share.answered` |
+| `drive` (see DECISIONS "Nearby: driving another of my Macs") | This Mac: `drive.open{peer}` (only the verified app; refused outright for everyone else) returns a `DriveLink{link, peer, name, socket, state, stage?, reason?, last_seen?, drops}`, its `socket` a per-link Unix socket (`$MIDNA_HOME/drive/<link>.sock`) the app's Backend connects to like `midnad.sock`, each connection carried to that Mac as a stream over one Noise connection (`nearby/relay.rs`); `drive.close{link}` (the verified app only); `drive.list` (`links`); events `drive.state` (a `DriveLink`: `connecting` with `stage` finding|proving, `connected`, `reconnecting`, `offline`, `closed`). That Mac: serves each stream as a client while the device is my_device with drive on (checked on every message); with human role and actor `{kind: human, via: peer, peer}`; local-only methods (`nearby/local_only.rs`) answer error `2` "Do this at <Mac>" with data `{local_only: true, mac}`. `session.send_image{id, name, data}` (base64; only the person driving over a link, error `2` for anyone else and never deferred; ≤ 10 MiB, an image by its bytes) saves an image sent from the remote window in `$MIDNA_HOME/images/`, pastes its path into that terminal and returns `{path}` |
 | `clock` | `clock.sleeps{since?}` (when the Mac slept, the last 14 days: `sleeps[{from, to, secs}]`; idle triggers, `idle_for` messages, needs-you expiry and restart grace count awake time only) |
 | `window` | `window.list`, `window.command{action: front|keep_on_top|pop_out|snap|close|open_screen|split, target?, value?}` (daemon forwards to the GUI; policy-checked; `agents.may_move_windows` gates all but front, open_screen and split) |
 | `notify` | `notify.list{session?, global?}`, `notify.set{session? \| global, key, value: bool\|null}` (per-terminal overrides in `Session.notify`), `notify.send{title, body?, session?, sound?, category?, id?, open?, actions?, wait_secs?}` (agents: dedupe + 6/min; returns `id`, `via`, `response`), `notify.withdraw{id}` (event `notify.withdrawn`), `notify.response{id, wait_secs?}`, `notify.respond{id, response}` (app only; event `notify.responded`), `notify.media{kind?}`, `notify.import{path, use_for?}` (sound/image into MIDNA_HOME/notify), `notify.remove{name}`, `notify.test{category?, session?}`, `notify.play{sound, volume?, session?}` (a kind's or a named sound, no banner; event `notify.sound`; agents 6/min) |
@@ -234,7 +239,7 @@ Build it with GPUI via `gpui-kit` 0.7 (see `spikes/gpui-terminal` for a working 
 
 - Tests use a temp `MIDNA_HOME`. Never touch the real one, `~/.claude`, `~/.codex`, Saggar's config, or any global config.
 - GUI checks:
-  - Screenshot only your own window, with `screencapture -l <windowid>`. Never take a full-screen screenshot.
+  - Look at the app with `scripts/slate.sh shoot` and drive it with `scripts/slate.sh drive`: the window stays hidden below the desktop and midna never takes focus (see "Look at the app" in `AGENTS.md`). Never open a visible test window over the human's work, and never take a full-screen screenshot.
   - Never send keystrokes or clicks to other apps' windows.
 - Clean up after yourself: background processes you started, temp dirs, and test windows.
 - Don't run `git commit` or push. The user reviews the work.

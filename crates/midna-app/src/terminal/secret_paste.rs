@@ -32,10 +32,21 @@ pub struct Sheet {
     busy: bool,
     /// Opened with ⌥⌘V rather than detected.
     explicit: bool,
-    /// From the Kass composer: send it as the composer would (with ↩), not as a paste.
-    submit: bool,
+    /// Where the text goes once the sheet is answered.
+    out: Out,
     /// "Add a secret…": the value field. Then `rows` holds just the name and nothing is pasted.
     value: Option<LineInput>,
+}
+
+/// Where a sheet's text goes once it's answered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Out {
+    /// Pasted into the terminal.
+    Paste,
+    /// From the composer's ↩: sent as the composer would, then ↩.
+    Submit,
+    /// From ⌘V in the composer: back into the composer's field, at its cursor.
+    Composer,
 }
 
 struct Row {
@@ -77,11 +88,33 @@ impl TerminalView {
     /// The composer is about to send `text` here (with ↩). True = the sheet took it.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the composer is macOS only
     pub fn submit_checks_secrets(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let took = self.paste_checks_secrets(text.trim_end_matches(['\n', '\r']), window, cx);
+        let trimmed = text.trim_end_matches(['\n', '\r']);
+        if self.composer_vetted.as_deref() == Some(trimmed) {
+            self.composer_vetted = None;
+            return false;
+        }
+        self.checks_secrets_for(trimmed, Out::Submit, window, cx)
+    }
+
+    /// ⌘V in the composer over this terminal: ask about a secret now, not at ↩. Whatever the
+    /// sheet decides goes back into the composer's field. True = the sheet took it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS's composer
+    pub fn composer_paste_checks_secrets(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.checks_secrets_for(text, Out::Composer, window, cx)
+    }
+
+    fn checks_secrets_for(&mut self, text: &str, out: Out, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let took = self.paste_checks_secrets(text, window, cx);
         if let Some(s) = self.secret_sheet.as_mut().filter(|_| took) {
-            s.submit = true;
+            s.out = out;
         }
         took
+    }
+
+    /// The secret sheet is open here (the composer stays hidden under it).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS's composer
+    pub fn secret_sheet_open(&self) -> bool {
+        self.secret_sheet.is_some()
     }
 
     /// ⌥⌘V: the clipboard as a secret, whatever it looks like.
@@ -121,7 +154,7 @@ impl TerminalView {
             r.input.field.update(cx, |f, cx| f.select_all(cx));
             r.input.focus.focus(window, cx);
         }
-        self.secret_sheet = Some(Sheet { text, found, rows, project_only: self.project_for_secrets().is_some(), error: None, busy: false, explicit, submit: false, value: None });
+        self.secret_sheet = Some(Sheet { text, found, rows, project_only: self.project_for_secrets().is_some(), error: None, busy: false, explicit, out: Out::Paste, value: None });
         cx.notify();
     }
 
@@ -135,7 +168,7 @@ impl TerminalView {
         let rows = vec![Row { input: name, store: true, label: "Name", shown: String::new() }];
         let value = Some(LineInput::new(cx, true, "Type or paste the value"));
         let project_only = self.project_for_secrets().is_some();
-        self.secret_sheet = Some(Sheet { text: String::new(), found: vec![], rows, project_only, error: None, busy: false, explicit: true, submit: false, value });
+        self.secret_sheet = Some(Sheet { text: String::new(), found: vec![], rows, project_only, error: None, busy: false, explicit: true, out: Out::Paste, value });
         cx.notify();
     }
 
@@ -152,24 +185,38 @@ impl TerminalView {
     }
 
     fn close_secret_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.secret_sheet = None;
+        if self.secret_sheet.take().is_some_and(|s| s.out == Out::Composer) {
+            // Cancelled a composer paste: back to the composer, its text as it was.
+            crate::composer::emit(crate::composer::ComposerEvent::Refocus);
+            cx.notify();
+            return;
+        }
         self.focus.focus(window, cx);
         cx.notify();
     }
 
     fn paste_anyway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(s) = self.secret_sheet.take() else { return };
-        self.send_out(s.text, s.submit, window, cx);
+        self.send_out(s.text, s.out, window, cx);
     }
 
-    /// A paste, or (from the composer) what the composer would have sent, then ↩.
-    fn send_out(&mut self, text: String, submit: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if submit {
-            let data = crate::composer::encode(&text, self.bracketed_paste());
-            self.call("session.input", json!({ "id": self.session_id, "text": data, "enter": true }), window, cx, |_, _, _, _| {});
-        } else {
-            self.erase_selection(cx);
-            self.deliver(ClientMsg::Paste(text));
+    /// A paste, what the composer would have sent (then ↩), or text for the composer's field.
+    fn send_out(&mut self, text: String, out: Out, window: &mut Window, cx: &mut Context<Self>) {
+        match out {
+            Out::Submit => {
+                let data = crate::composer::encode(&text, self.bracketed_paste());
+                self.call("session.input", json!({ "id": self.session_id, "text": data, "enter": true }), window, cx, |_, _, _, _| {});
+            }
+            Out::Composer => {
+                self.composer_vetted = Some(text.clone());
+                crate::composer::emit(crate::composer::ComposerEvent::Insert(text));
+                cx.notify();
+                return;
+            }
+            Out::Paste => {
+                self.erase_selection(cx);
+                self.deliver(ClientMsg::Paste(text));
+            }
         }
         self.focus.focus(window, cx);
         cx.notify();
@@ -250,8 +297,8 @@ impl TerminalView {
             let _ = this.update_in(cx, |t, window, cx| match r {
                 Ok(()) => match text {
                     Some(text) => {
-                        let submit = t.secret_sheet.take().is_some_and(|s| s.submit);
-                        t.send_out(text, submit, window, cx);
+                        let out = t.secret_sheet.take().map_or(Out::Paste, |s| s.out);
+                        t.send_out(text, out, window, cx);
                     }
                     None => t.close_secret_sheet(window, cx),
                 },
@@ -421,6 +468,7 @@ impl TerminalView {
             .occlude()
             .w(px(560.))
             .max_w(relative(0.94))
+            .max_h(relative(0.9))
             .flex()
             .flex_col()
             .gap(px(14.))
@@ -436,7 +484,8 @@ impl TerminalView {
             .child(div().text_size(px(15.)).font_weight(FontWeight::BOLD).child(title))
             .child(div().text_color(t.dim).child(body))
             .children(new_secret)
-            .when(!adding, |d| d.child(div().flex().flex_col().gap(px(10.)).children(rows)))
+            // A long list scrolls by itself so the buttons under it stay on screen.
+            .when(!adding, |d| d.child(div().id("secret-rows").flex().flex_col().min_h_0().overflow_y_scroll().gap(px(10.)).children(rows)))
             .children(scope)
             .when_some(s.error.clone(), |d, e| d.child(div().text_color(t.err).text_size(px(12.)).child(e)))
             .child(

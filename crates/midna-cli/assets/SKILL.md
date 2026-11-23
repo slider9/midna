@@ -61,7 +61,7 @@ The rest of the guide comes on request. Read one with `midna skill <topic>`, the
 `topic`, or `midna://skill/<topic>`; the files sit beside `$MIDNA_SKILL`.
 
 - `triggers`: the human says "whenever X, do Y", wants something on a schedule, or wants a webhook
-  to start work.
+  or a program on this Mac (a Slack channel, a CI watcher) to start work.
 - `keep-awake`: work has to run while the human is away or the Mac would sleep.
 - `load`: before heavy work, when a command is held because the Mac is busy, before you wait on a
   process, and for worktrees and what midna cleans up when a terminal closes.
@@ -70,6 +70,8 @@ The rest of the guide comes on request. Read one with `midna skill <topic>`, the
 - `terminals`: an agent's prompts, processes and subagents, `restart --idle`, `replace`, plan
   usage, Claude's question picker, linking a terminal for the human.
 - `links`: pinning links for the human, link patterns, hover cards and link menus.
+- `nearby`: opening a tab in a project on another of the human's Macs, or asking an agent there
+  for help and waiting for its answer.
 
 ## Terminals
 
@@ -117,6 +119,7 @@ The rest of the guide comes on request. Read one with `midna skill <topic>`, the
 | change a human-only setting | `midna settings set ...`, which asks the human |
 | remove a project, stop, upgrade or reset the daemon, configure webhooks, install an app update or hooks | call it; it becomes a needs-you approval (a project midna created for your `open --cwd` you may remove yourself once its terminals are closed) |
 | approve your own request | wait; the human answers it |
+| clear a `midna attention` item you no longer need | `midna approve <id> --done` (yours only; `--dismiss` is the human's) |
 | grant macOS permissions | `midna attention` and say what you need |
 
 When a call is refused (exit 1, error code 1 or 2), the message says what happened and what to

@@ -24,11 +24,13 @@ fn path(v: &Value) -> Option<&std::path::Path> {
     v.as_str().map(std::path::Path::new)
 }
 
-/// A turn's "Finished" body. Windows: an agent call takes over 100 ms there, so a turn of two
-/// hooks may cross a second, and turns are timed in whole seconds ("Finished in 1s: …").
-fn finished(body: &Value) -> String {
-    let b = body.as_str().unwrap_or_default();
-    if cfg!(windows) { b.replacen("Finished in 1s:", "Finished:", 1) } else { b.to_string() }
+/// A turn-done body without its length: "Finished: …" or, once the turn spans a second
+/// boundary (the events' timestamps are whole seconds), "Finished in 1s: …".
+fn finished(n: &Value) -> String {
+    let body = n["data"]["body"].as_str().unwrap_or_default();
+    let (took, reply) = body.split_once(": ").unwrap_or((body, ""));
+    assert!(took == "Finished" || took.starts_with("Finished in "), "{n}");
+    reply.to_string()
 }
 
 /// Give the notifier time to (not) act, then return what it posted. Windows gets longer: an
@@ -50,7 +52,7 @@ fn defaults_record_everything_important_but_push_only_what_needs_you() {
     let p = wait_posted(&mut h, 1);
     let n = &p[0]["data"];
     assert_eq!((n["category"].as_str(), n["via"].as_str()), (Some("turn_done"), Some("none")), "{n}");
-    assert_eq!(finished(&n["body"]), "Finished: All 12 tests pass now.");
+    assert_eq!(finished(&p[0]), "All 12 tests pass now.");
     // Recorded, but not a banner anywhere.
     assert_eq!((n["push"].as_bool(), n.get("push_focused")), (Some(false), None), "{n}");
     // Every kind plays one of midna's own (Twilight) sounds out of the box.
@@ -107,7 +109,8 @@ fn turns_that_leave_background_work_running_stay_quiet() {
     hook(&mut a, "UserPromptSubmit", json!({ "session_id": "c1", "prompt": "<task-notification>b1 completed</task-notification>" }));
     hook(&mut a, "Stop", json!({ "session_id": "c1", "last_assistant_message": "All tests pass.", "background_tasks": [] }));
     let p = wait_posted(&mut h, 1);
-    assert_eq!((p[0]["data"]["category"].as_str(), finished(&p[0]["data"]["body"]).as_str()), (Some("turn_done"), "Finished: All tests pass."), "{}", p[0]);
+    assert_eq!(p[0]["data"]["category"], "turn_done", "{}", p[0]);
+    assert_eq!(finished(&p[0]), "All tests pass.");
 }
 
 #[test]

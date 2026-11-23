@@ -95,10 +95,31 @@ type PrCache = HashMap<(String, String), (Instant, Option<PrInfo>)>;
 static PR_CACHE: Mutex<Option<PrCache>> = Mutex::new(None);
 const PR_TTL: Duration = Duration::from_secs(30);
 
-fn gh_available() -> bool {
+pub fn gh_available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(|| std::env::var("MIDNA_NO_GH").is_err() && run_cmd(&["gh", "--version"], "/", Duration::from_secs(3), None, &[]).is_some())
+    *AVAILABLE.get_or_init(|| std::env::var("MIDNA_NO_GH").is_err() && run_cmd(&[gh_bin(), "--version"], "/", Duration::from_secs(3), None, &[]).is_some())
 }
+
+/// Where `gh` is, found once. launchd starts midnad with only `/usr/bin:/bin:/usr/sbin:/sbin`,
+/// which leaves out Homebrew's `gh`, so after midnad's own PATH come the usual install places,
+/// then the login shell's PATH; bare `gh` when none has it.
+pub fn gh_bin() -> &'static str {
+    static BIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        let own = std::env::var("PATH").unwrap_or_default();
+        find_gh(&own)
+            .or_else(|| find_gh(&midna_proto::preview_cmd::user_path(false)))
+            .or_else(|| midna_proto::preview_cmd::login_shell_path().and_then(|p| find_gh(&p)))
+            .map_or_else(|| "gh".into(), |p| p.to_string_lossy().into_owned())
+    })
+}
+
+/// The first `gh` in a PATH-style list of directories (`gh.exe` on Windows).
+fn find_gh(path: &str) -> Option<std::path::PathBuf> {
+    std::env::split_paths(path).map(|d| d.join(GH)).find(|p| p.is_file())
+}
+
+const GH: &str = if cfg!(windows) { "gh.exe" } else { "gh" };
 
 pub fn checks_state(rollup: &[Value]) -> (ChecksState, u32) {
     if rollup.is_empty() {
@@ -136,7 +157,7 @@ pub fn pr_info(cwd: &str, branch: &str) -> Option<PrInfo> {
         && at.elapsed() < PR_TTL {
             return v.clone();
         }
-    let out = run_cmd(&["gh", "pr", "view", "--json", "number,url,statusCheckRollup"], cwd, Duration::from_secs(10), None, &[]);
+    let out = run_cmd(&[gh_bin(), "pr", "view", "--json", "number,url,statusCheckRollup"], cwd, Duration::from_secs(10), None, &[]);
     let pr = out.and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| {
         let rollup = v.get("statusCheckRollup").and_then(Value::as_array).cloned().unwrap_or_default();
         let (checks, failing_count) = checks_state(&rollup);
@@ -250,6 +271,18 @@ pub fn refresh_loop(d: std::sync::Weak<Daemon>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn finds_gh_past_launchds_path() {
+        let dir = std::env::temp_dir().join(format!("midnad-gh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(super::GH), "").unwrap();
+        // launchd's PATH alone may not have it; a later directory does
+        let path = std::env::join_paths([std::path::Path::new("/nonexistent-midna"), &dir]).unwrap().into_string().unwrap();
+        assert_eq!(super::find_gh(&path), Some(dir.join(super::GH)));
+        assert_eq!(super::find_gh("/nonexistent-midna"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

@@ -7,6 +7,9 @@
 //! While midnad still answers trigger/webhook methods with error 5 ("not implemented"),
 //! the screen says so and rechecks every 20s.
 mod schedule;
+mod streams;
+
+pub use streams::{flag as stream_flag, open_stream};
 
 use super::rules::{Names, ask};
 use super::screen_kit::{self as kit, KeyOutcome, LineInput};
@@ -50,9 +53,9 @@ pub struct FilterItem {
     /// Local `schedule`: wake the Mac for each run, even outside the keep-awake hours.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub wake: bool,
-    /// Local: dotted path into the hook payload / event data -> glob.
+    /// Local: dotted path into the hook payload / event data -> a glob, or globs that must all match.
     #[serde(rename = "match")]
-    pub fields: std::collections::BTreeMap<String, String>,
+    pub fields: std::collections::BTreeMap<String, midna_proto::Globs>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -80,7 +83,8 @@ pub struct TriggerItem {
     pub secret_store: Option<String>,
     pub github_hook_id: Option<u64>,
     pub session_name_template: Option<String>,
-    /// Local: seconds before it may fire again for the same terminal (daemon default 60).
+    /// Local: seconds before it may fire again for the same terminal or stream
+    /// (`midna_proto::types::default_cooldown_secs` when unset).
     pub cooldown_secs: Option<u64>,
     /// Set on triggers midna ships (e.g. `prompt_blocked_status`).
     pub builtin: Option<String>,
@@ -186,6 +190,18 @@ impl TriggerItem {
     /// "Start Claude in midna", "Run a command in api", "Raise attention",
     /// `Send "/compact" → "{{last_prompt}}"`, "Set status Prompt blocked", "Clear status".
     fn action_label(&self, n: &Names) -> String {
+        match self.to() {
+            Some(to) => format!("{} on {to}", self.what_label(n)),
+            None => self.what_label(n),
+        }
+    }
+
+    /// The terminal the action names (`to`), instead of the one that fired.
+    fn to(&self) -> Option<String> {
+        self.action.get("to").and_then(Value::as_str).map(String::from)
+    }
+
+    fn what_label(&self, n: &Names) -> String {
         let proj = self.project_id().map(|p| format!(" in {}", n.project(&p))).unwrap_or_default();
         match self.action_kind().as_str() {
             "start_agent" => format!("Start {}{proj}", if self.s("agent") == "codex" { "Codex" } else { "Claude" }),
@@ -261,7 +277,7 @@ impl TriggerItem {
         if let Some(c) = &f.cron {
             parts.push(format!("cron \"{c}\"{}", self.next_run().map(|r| format!(" · next {r}")).unwrap_or_default()));
         }
-        parts.extend(f.fields.iter().map(|(k, v)| format!("{k} ~ \"{v}\"")));
+        parts.extend(f.fields.iter().map(|(k, v)| format!("{k} ~ {v}")));
         (!parts.is_empty()).then(|| parts.join(" && "))
     }
 
@@ -321,7 +337,7 @@ impl TriggerItem {
             a.push("--wake".into());
         }
         for (k, v) in &f.fields {
-            a.push(format!("--match {}", sh_quote(&format!("{k}={v}"))));
+            a.extend(v.iter().map(|g| format!("--match {}", sh_quote(&format!("{k}={g}")))));
         }
         match self.action_kind().as_str() {
             "send_to_session" => a.extend(self.steps().iter().map(|s| format!("--send {}", sh_quote(s)))),
@@ -351,6 +367,9 @@ impl TriggerItem {
             }
             _ => a.push(format!("--action-json {}", sh_quote(&self.action.to_string()))),
         }
+        if let Some(to) = self.to().filter(|_| !a.last().is_some_and(|x| x.starts_with("--action-json"))) {
+            a.push(format!("--to {}", sh_quote(&to)));
+        }
         if let Some(c) = self.cooldown_secs {
             a.push(format!("--cooldown {c}s"));
         }
@@ -358,6 +377,18 @@ impl TriggerItem {
             a.push("--enable".into());
         }
         a.join(" ")
+    }
+
+    /// The cooldown midnad uses: its own, else the default for its event.
+    fn cooldown(&self) -> u64 {
+        self.cooldown_secs.unwrap_or_else(|| midna_proto::types::default_cooldown_secs(&self.event))
+    }
+
+    /// The Cooldown row: `1 min per terminal (default)`, `Every event per stream`.
+    fn cooldown_label(&self) -> String {
+        let c = self.cooldown();
+        let what = if c == 0 { "None, every event fires".to_string() } else { format!("{} {}", cooldown_text(c), midna_proto::types::cooldown_scope(&self.event)) };
+        format!("{what}{}", if self.cooldown_secs.is_none() { " (default)" } else { "" })
     }
 
     fn last_text(&self) -> String {
@@ -401,6 +432,8 @@ pub struct DeliveryItem {
     pub replay_of: Option<String>,
     /// Headless `run_command` runs: {command, finished_at, exit_code, signal, timed_out, output, error}.
     pub command_runs: Vec<Value>,
+    /// Local: the seq of the logged event it answered (a stream event's).
+    pub event_seq: Option<u64>,
 }
 
 impl DeliveryItem {
@@ -446,6 +479,7 @@ impl DeliveryItem {
             "replayed" => ("Replayed", t.accent),
             "recovered" => ("Recovered", t.ok),
             "no_trigger" => ("No trigger", t.dim),
+            "cooldown" => ("Held back (cooldown)", t.dim),
             _ => ("Received", t.dim),
         }
     }
@@ -533,6 +567,15 @@ pub struct TriggersView {
     sel_cron: Option<String>,
     /// The schedule editor, open in place of the detail pane.
     editor: Option<schedule::ScheduleEditor>,
+    /// The selected stream (`streams::`), shown in place of a trigger's detail.
+    sel_stream: Option<String>,
+    stream_tab: streams::StreamTab,
+    stream_events: Option<streams::StreamEvents>,
+    events_fetching: bool,
+    /// The stream ⋯ / right-click menu: which stream, where.
+    stream_menu: Option<(String, Point<Pixels>)>,
+    /// "Remove stream…" asked; the detail shows Remove / Keep.
+    confirm_remove: Option<String>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -580,6 +623,12 @@ impl TriggersView {
             tab: if crate::dev::var("MIDNA_DEBUG_TRIGGERS_TAB").is_ok_and(|v| v == "crons") { Tab::Crons } else { Tab::Triggers },
             sel_cron: None,
             editor: None,
+            sel_stream: None,
+            stream_tab: streams::StreamTab::Events,
+            stream_events: None,
+            events_fetching: false,
+            stream_menu: None,
+            confirm_remove: None,
             _tasks: vec![tick],
         };
         v.refetch(cx);
@@ -648,6 +697,13 @@ impl TriggersView {
                 if k.starts_with("trigger.") || k.starts_with("webhooks.") || wh {
                     self.refetch(cx);
                 }
+                // The selected stream published or changed state: its events and facts moved.
+                if k.starts_with("stream.") {
+                    if self.sel_stream.is_some() {
+                        self.fetch_stream_events(cx);
+                    }
+                    cx.notify();
+                }
                 // A terminal's crons changed (or it went away).
                 if [kinds::SESSION_AGENT, kinds::SESSION_EXITED, kinds::SESSION_CLOSED, kinds::SESSION_RENAMED].contains(&k) {
                     cx.notify();
@@ -698,6 +754,15 @@ impl TriggersView {
                 "enable" => self.set_enabled(v.to_string(), true, cx),
                 "disable" => self.set_enabled(v.to_string(), false, cx),
                 "select" => self.selected = Some(v.to_string()),
+                // Streams: `stream:slack`, `stream-tab:log`, `stream-menu`, `stream-remove`.
+                "stream" => self.select_stream(v.to_string(), cx),
+                "stream-tab" => self.stream_tab = if v == "log" { streams::StreamTab::Log } else { streams::StreamTab::Events },
+                "stream-menu" => {
+                    if let Some(n) = self.sel_stream.clone() {
+                        self.stream_menu = Some((n, point(px(980.), px(170.))));
+                    }
+                }
+                "stream-remove" => self.confirm_remove = self.sel_stream.clone(),
                 "replace" => self.replacing = Some(v.to_string()),
                 "replay" => {
                     if let Some(d) = self.deliveries.iter().find(|d| d.id == v).cloned() {
@@ -720,6 +785,55 @@ impl TriggersView {
                 _ => {}
             }
         }
+    }
+
+    fn set_cooldown(&mut self, id: String, secs: u64, cx: &mut Context<Self>) {
+        if let Some(t) = self.triggers.iter_mut().find(|t| t.id == id) {
+            t.cooldown_secs = Some(secs); // optimistic; the trigger.updated event confirms
+        }
+        self.call("trigger.update", json!({"id": id, "cooldown_secs": secs}), cx, |v, _, cx| v.refetch(cx));
+        cx.notify();
+    }
+
+    /// The Cooldown row: what it is now, and a chip per preset (the current one lit). A
+    /// cooldown set elsewhere that isn't a preset gets a lit chip of its own.
+    fn cooldown_row(&self, t: &Theme, s: &TriggerItem, cx: &mut Context<Self>) -> Div {
+        let now = s.cooldown();
+        let mut picks: Vec<u64> = COOLDOWN_PRESETS.to_vec();
+        if !picks.contains(&now) {
+            picks.push(now);
+            picks.sort_unstable();
+        }
+        let chips = picks.into_iter().map(|secs| {
+            let on = secs == now;
+            let id = s.id.clone();
+            let label = if secs == 0 { "None".to_string() } else { cooldown_text(secs) };
+            div()
+                .id(SharedString::from(format!("trig-cooldown-{secs}")))
+                .flex()
+                .flex_none()
+                .items_center()
+                .h(px(22.))
+                .px(px(8.))
+                .rounded(px(6.))
+                .border_1()
+                .text_size(px(11.5))
+                .whitespace_nowrap()
+                .cursor_pointer()
+                .map(|d| if on { d.border_color(t.accent).bg(t.accent_soft).text_color(t.accent) } else { d.border_color(t.line).text_color(t.dim).hover(|h| h.bg(t.raised)) })
+                .child(label)
+                .on_click(cx.listener(move |v, _, _, cx| {
+                    if !on {
+                        v.set_cooldown(id.clone(), secs, cx);
+                    }
+                }))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(div().text_color(t.dim).child(s.cooldown_label()))
+            .child(div().flex().flex_wrap().gap(px(6.)).children(chips))
     }
 
     fn set_enabled(&mut self, id: String, on: bool, cx: &mut Context<Self>) {
@@ -814,7 +928,7 @@ pub fn on_backend_event(m: &mut MainWindow, ev: &BackendEvent, cx: &mut Context<
     }
 }
 
-fn view(m: &mut MainWindow, cx: &mut Context<MainWindow>) -> Entity<TriggersView> {
+pub(super) fn view(m: &mut MainWindow, cx: &mut Context<MainWindow>) -> Entity<TriggersView> {
     match &m.triggers_view {
         Some(v) => v.clone(),
         None => {
@@ -844,11 +958,12 @@ pub fn render(m: &mut MainWindow, _window: &mut Window, cx: &mut Context<MainWin
 
 impl Render for TriggersView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = cx.global::<Theme>().clone();
+        let t = crate::theme::of(window, cx).clone();
         let names = self.main.upgrade().map(|m| Names::from_main(m.read(cx))).unwrap_or_default();
         let cmdk = self.main.upgrade().map(|m| m.read(cx).key_label("keys.command_bar")).unwrap_or_else(|| "⌘K".into());
         let crons = self.main.upgrade().map(|m| schedule::cron_rows(m.read(cx)).len()).unwrap_or(0);
-        let empty = self.loaded && self.triggers.is_empty() && crons == 0 && self.editor.is_none() && self.list_error.is_none();
+        let streams = self.streams(cx);
+        let empty = self.loaded && self.triggers.is_empty() && crons == 0 && streams.is_empty() && self.editor.is_none() && self.list_error.is_none();
         let down = self.status.as_ref().is_some_and(|s| s.health == "down");
         let recon = self.status.as_ref().map(|s| &s.reconcile).filter(|r| r.recovered > 0 && r.last_run_at != self.recon_dismissed).cloned();
         div()
@@ -868,6 +983,7 @@ impl Render for TriggersView {
             .when(empty, |d| d.child(self.render_empty(&t, &names)))
             .when(!empty && self.loaded && self.list_error.is_none(), |d| d.child(self.render_body(&t, &names, window, cx)))
             .when(self.path_menu, |d| d.child(self.render_path_menu(&t, cx)))
+            .children(self.render_stream_menu(&t, cx))
     }
 }
 
@@ -1176,6 +1292,8 @@ impl TriggersView {
         let sel = self.selected.as_ref().and_then(|id| self.triggers.iter().find(|t| &t.id == id)).cloned().or_else(|| self.triggers.first().cloned());
         let crons = self.main.upgrade().map(|m| schedule::cron_rows(m.read(cx))).unwrap_or_default();
         let cron_sel = self.sel_cron.as_ref().and_then(|k| crons.iter().find(|c| &c.key() == k)).or(crons.first()).cloned();
+        let streams = self.streams(cx);
+        let stream_sel = self.sel_stream.as_ref().filter(|n| streams.iter().any(|s| &s.name == *n)).cloned();
         let column = div()
             .flex()
             .flex_col()
@@ -1186,11 +1304,14 @@ impl TriggersView {
             .border_color(t.line)
             .child(self.render_tabs(t, crons.len(), cx))
             .child(match self.tab {
-                Tab::Triggers => self.render_list(t, n, sel.as_ref().map(|s| s.id.clone()), cx).into_any_element(),
+                Tab::Triggers => self.render_list(t, n, sel.as_ref().map(|s| s.id.clone()).filter(|_| stream_sel.is_none()), &streams, cx).into_any_element(),
                 Tab::Crons => self.render_cron_list(t, &crons, cron_sel.as_ref().map(|c| c.key()), cx).into_any_element(),
             });
+        let stream = (self.tab == Tab::Triggers).then(|| self.sel_stream.as_ref().and_then(|n| streams.iter().find(|s| &s.name == n))).flatten();
         let detail = if self.editor.is_some() {
             Some(self.render_editor(t, window, cx).into_any_element())
+        } else if let Some(s) = stream {
+            Some(self.render_stream_detail(t, s, cx).into_any_element())
         } else {
             match self.tab {
                 Tab::Triggers => sel.map(|s| self.render_detail(t, n, &s, window, cx).into_any_element()),
@@ -1234,10 +1355,13 @@ impl TriggersView {
             .child(tab("trig-tab-crons", "Crons", crons, Tab::Crons, cx))
     }
 
-    fn render_list(&self, t: &Theme, n: &Names, sel: Option<String>, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_list(&self, t: &Theme, n: &Names, sel: Option<String>, streams: &[midna_proto::StreamStatus], cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let pending: Vec<&TriggerItem> = self.triggers.iter().filter(|t| t.pending().is_some()).collect();
         let active: Vec<&TriggerItem> = self.triggers.iter().filter(|t| t.pending().is_none()).collect();
         let mut list = div().id("trig-list").flex().flex_col().flex_1().min_h_0().overflow_y_scroll();
+        if !streams.is_empty() {
+            list = list.child(self.render_stream_rows(t, streams, cx));
+        }
         let row_bg = |on: bool, d: Stateful<Div>| {
             if on { d.bg(t.raised).border_l_2().border_color(t.accent) } else { d.border_l_2().border_color(transparent_black()) }
         };
@@ -1266,6 +1390,7 @@ impl TriggersView {
                     )
                     .on_click(cx.listener(move |v, _, _, cx| {
                         v.selected = Some(id.clone());
+                        v.sel_stream = None;
                         v.secret.clear(cx);
                         v.replacing = None;
                         cx.notify();
@@ -1305,6 +1430,7 @@ impl TriggersView {
                 )
                 .on_click(cx.listener(move |v, _, _, cx| {
                     v.selected = Some(id.clone());
+                    v.sel_stream = None;
                     v.secret.clear(cx);
                     v.replacing = None;
                     cx.notify();
@@ -1627,16 +1753,13 @@ impl TriggersView {
             .child(row(dt("Only if", false), only_if))
             .child(row(dt("Then", false), then));
         let dl = if s.is_local() {
-            // No secret: local triggers fire on what midnad sees here. Show the cooldown and
-            // the CLI that makes this trigger instead of a form.
-            let cooldown = s.cooldown_secs.unwrap_or(60);
+            // No secret: local triggers fire on what midnad sees here. Show the cooldown (pick
+            // one of the presets) and the CLI that makes this trigger instead of a form. A
+            // schedule fires on the clock, so it has no cooldown to set.
             let cli = s.cli();
             let copy = cli.clone();
+            let dl = if s.filter.cron.is_some() { dl } else { dl.child(row(dt("Cooldown", false), dd(false).child(self.cooldown_row(t, s, cx)))) };
             dl.child(row(
-                dt("Cooldown", false),
-                dd(false).child(div().text_color(t.dim).child(format!("{} per terminal{}", cooldown_text(cooldown), if s.cooldown_secs.is_none() { " (default)" } else { "" }))),
-            ))
-            .child(row(
                 dt("CLI", true),
                 dd(true)
                     .flex()
@@ -1789,6 +1912,9 @@ impl TriggersView {
 }
 
 /// "60s", "5 min", "1 h".
+/// The cooldowns the trigger detail offers, in seconds.
+const COOLDOWN_PRESETS: [u64; 6] = [0, 30, 60, 300, 900, 3600];
+
 fn cooldown_text(secs: u64) -> String {
     match secs {
         s if s >= 3600 && s % 3600 == 0 => format!("{} h", s / 3600),
@@ -1859,15 +1985,26 @@ mod tests {
     }
 
     #[test]
+    fn the_cooldown_label_names_its_default_and_what_it_counts_per() {
+        let item = |event: &str, cooldown_secs: Option<u64>| TriggerItem { source: "local".into(), event: event.into(), cooldown_secs, ..Default::default() };
+        assert_eq!(item("agent.prompt_blocked", None).cooldown_label(), "1 min per terminal (default)");
+        assert_eq!(item("agent.prompt_blocked", Some(0)).cooldown_label(), "None, every event fires");
+        assert_eq!(item("stream.slack.message", None).cooldown_label(), "None, every event fires (default)");
+        assert_eq!(item("stream.slack.message", Some(300)).cooldown_label(), "5 min per stream");
+        assert!(item("stream.slack.*", Some(90)).cli().ends_with("--cooldown 90s"));
+    }
+
+    #[test]
     fn reads_local_triggers() {
         use midna_proto as p;
         let names = super::Names::default();
         let mut tr = proto_trigger(true, p::TriggerState::Active, false);
         tr.source = p::TriggerSource::Local;
         tr.event = "agent.prompt_blocked".into();
-        tr.filter = p::TriggerFilter { fields: [("message".to_string(), "*Compact first*".to_string())].into(), ..Default::default() };
+        tr.filter = p::TriggerFilter { fields: [("message".to_string(), "*Compact first*".into())].into(), ..Default::default() };
         tr.action = p::TriggerAction::SendToSession {
             steps: vec![p::SendStep { text: "/compact".into(), enter: true }, p::SendStep { text: "{{last_prompt}}".into(), enter: true }],
+            to: None,
         };
         let got: Vec<TriggerItem> = parse_list(&json!([tr.clone()]));
         let g = &got[0];
@@ -1883,7 +2020,7 @@ mod tests {
 
         tr.builtin = Some("prompt_blocked_status".into());
         tr.filter = p::TriggerFilter { idle_minutes: Some(55), agent: Some(p::AgentKind::Claude), ..Default::default() };
-        tr.action = p::TriggerAction::SetStatus { label: "Prompt blocked".into(), color: "amber".into(), icon: None, base: p::StatusState::NeedsYou, clear_on: p::StatusClear::Prompt };
+        tr.action = p::TriggerAction::SetStatus { label: "Prompt blocked".into(), color: "amber".into(), icon: None, base: p::StatusState::NeedsYou, clear_on: p::StatusClear::Prompt, to: None };
         let g = parse_list::<TriggerItem>(&json!([tr]))[0].clone();
         assert_eq!(g.builtin.as_deref(), Some("prompt_blocked_status"));
         assert_eq!(g.set_status().unwrap().base, "needs_you");
@@ -1896,12 +2033,17 @@ mod tests {
 
         tr.event = "schedule".into();
         tr.filter = p::TriggerFilter { cron: Some("0 9 * * mon-fri".into()), ..Default::default() };
-        tr.action = p::TriggerAction::Notify { title: "Standup".into(), body: String::new(), sound: true, category: None, open: None, id: None };
-        let g = parse_list::<TriggerItem>(&json!([tr]))[0].clone();
+        tr.action = p::TriggerAction::Notify { title: "Standup".into(), body: String::new(), sound: true, category: None, open: None, id: None, to: None };
+        let g = parse_list::<TriggerItem>(&json!([tr.clone()]))[0].clone();
         assert_eq!(g.scope(&names), "no terminal");
         let text = g.filter_text().unwrap();
         assert!(text.starts_with("cron \"0 9 * * mon-fri\" · next ") && text.ends_with(" 09:00"), "{text}");
         assert!(g.cli().contains("--event schedule --cron '0 9 * * mon-fri' --notify Standup"), "{}", g.cli());
+
+        tr.action = p::TriggerAction::SendToSession { steps: vec![p::SendStep { text: "rebuild".into(), enter: true }], to: Some("build angel".into()) };
+        let g = parse_list::<TriggerItem>(&json!([tr]))[0].clone();
+        assert_eq!(g.action_label(&names), "Send “rebuild” on build angel");
+        assert!(g.cli().ends_with("--send rebuild --to 'build angel' --enable"), "{}", g.cli());
     }
 
     #[test]

@@ -51,13 +51,13 @@ struct Log {
 
 impl Log {
     fn push(&mut self, at: i64, kind: &str, actor: Actor, project: Option<&str>, session: Option<&str>, data: Value) {
-        let e = Event { seq: 0, at: time::format_unix(at), kind: kind.into(), actor, project_id: project.map(Into::into), session_id: session.map(Into::into), data };
+        let e = Event { seq: 0, at: time::format_unix(at), kind: kind.into(), actor, project_id: project.map(Into::into), session_id: session.map(Into::into), data, stream: None };
         self.events.push((at, e));
     }
 }
 
 fn agent_actor(sid: &str, agent: &str) -> Actor {
-    Actor { kind: ActorKind::Agent, session: Some(sid.into()), name: Some(agent.into()), trigger: None, via: None }
+    Actor { kind: ActorKind::Agent, session: Some(sid.into()), name: Some(agent.into()), trigger: None, via: None, peer: None }
 }
 
 /// Write `state.json` (projects) and `events.jsonl` (history up to `now`) into `home`.
@@ -130,7 +130,7 @@ pub fn seed_history(home: &Path, now: i64) -> usize {
         for _ in 0..rng.range(0, if weekend { 1 } else { 3 }) {
             let t = day + rng.range(9 * 3600, 18 * 3600);
             if t < cutoff {
-                let actor = Actor { kind: ActorKind::Trigger, session: None, name: Some("PR review".into()), trigger: None, via: None };
+                let actor = Actor { kind: ActorKind::Trigger, session: None, name: Some("PR review".into()), trigger: None, via: None, peer: None };
                 log.push(t, "trigger.fired", actor, Some("p_a91c07"), None, json!({"trigger_id": "t_review", "event": "pull_request.opened"}));
             }
         }
