@@ -7,7 +7,9 @@
 //! The keeper closes the pseudoconsole once the shell exits, so the output pipe ends and the
 //! reader drains, and it puts every process the shell starts in the shell's job, so a force
 //! close ends them too, like a hang-up of the process group does on Unix. A keeper that dies
-//! takes its pseudoconsole with it: that terminal ends with "terminal host exited".
+//! takes its pseudoconsole and the shell's job with it: that terminal ends with "terminal host
+//! exited". Keepers a crashed midnad left are ended when the next one starts
+//! ([`end_leftover_keepers`]), until it can re-attach to them.
 //!
 //! The keeper comes from beside midnad.exe ([`keeper_exe`]); it runs `conpty.dll` from beside
 //! itself when it's there, else Windows' own.
@@ -26,7 +28,8 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_TERMINATE, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
+    GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+    WaitForMultipleObjects, WaitForSingleObject,
 };
 
 /// The newer ConPTY's files, which go wherever midnad.exe goes (`install::install_self`; the
@@ -189,7 +192,8 @@ impl Master {
 
     /// Block until the shell exits: `(exit code, None)`. Windows has no signals; a process ended
     /// by TerminateProcess reports the code it was given. If the keeper dies first, the shell
-    /// has lost its console: it's ended, and the result is `(None, Some(HOST_EXITED))`.
+    /// has lost its console: the keeper's job ends it and what it started (it's ended here too,
+    /// should it have left the job), and the result is `(None, Some(HOST_EXITED))`.
     pub fn wait_exit(&self) -> (Option<i32>, Option<i32>) {
         let both = [raw(&self.process), raw(&self.keeper)];
         let r = unsafe { WaitForMultipleObjects(2, both.as_ptr(), 0, INFINITE) };
@@ -216,6 +220,45 @@ impl Master {
             }
         }
     }
+}
+
+/// How long a leftover keeper gets to end its shell's job and exit once asked.
+const LEFTOVER: Duration = Duration::from_secs(3);
+
+/// End the keepers an earlier midnad of `home` left running (it crashed or was killed; one that
+/// stops ends its own), with their shells and whatever those started. No terminal shows them,
+/// and each holds its session's pipe name, so the session couldn't be restarted. Until midnad
+/// can re-attach to them, they're ended: asked to (the keeper ends the job and removes its
+/// record), else terminated, which ends the job too. Returns how many there were.
+pub fn end_leftover_keepers(home: &Path) -> usize {
+    let mut ended = 0;
+    let records = midna_pty::names::records(home);
+    let table = if records.is_empty() { HashMap::new() } else { crate::procs::snapshot() };
+    for (sid, r) in records {
+        // SAFETY: a handle we own from here, so the pid stays this process's while we look.
+        let h = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, r.pid) };
+        let process = (!h.is_null()).then(|| unsafe { OwnedHandle::from_raw_handle(h) });
+        // A record left by a keeper that was killed names a pid that's gone or another program's.
+        let home_s = home.to_string_lossy();
+        let keeper = process.filter(|_| {
+            let name = midna_pty::names::EXE.trim_end_matches(".exe");
+            table.get(&(r.pid as i32)).is_some_and(|(_, n)| n.eq_ignore_ascii_case(name))
+                && crate::procs::command_line(r.pid as i32).is_some_and(|l| l.contains(&*home_s) && l.contains(&format!("--session {sid}")))
+        });
+        if let Some(p) = keeper {
+            eprintln!("midnad: ending keeper {} of session {sid}, left by an earlier midnad, and its shell {}", r.pid, r.shell_pid);
+            let asked = Client::connect(&midna_pty::names::pipe_name(home, &sid), Duration::from_secs(1)).and_then(|c| c.kill()).is_ok();
+            if !asked || unsafe { WaitForSingleObject(raw(&p), LEFTOVER.as_millis() as u32) } != WAIT_OBJECT_0 {
+                unsafe {
+                    TerminateProcess(raw(&p), 1);
+                    WaitForSingleObject(raw(&p), LEFTOVER.as_millis() as u32);
+                }
+            }
+            ended += 1;
+        }
+        let _ = std::fs::remove_file(midna_pty::names::record_path(home, &sid));
+    }
+    ended
 }
 
 pub struct Spawned {
@@ -395,18 +438,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&h);
     }
 
+    /// The hidden `ping -n <count>` the shell started, once it runs, held open so its pid stays
+    /// its own.
+    fn ping_of(count: &str) -> OwnedHandle {
+        for _ in 0..150 {
+            let child = crate::procs::snapshot().into_iter().find(|(p, (_, n))| {
+                n.eq_ignore_ascii_case("ping") && crate::procs::command_line(*p).is_some_and(|l| l.contains(&format!("-n {count} ")))
+            });
+            if let Some((pid, _)) = child {
+                let h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid as u32) };
+                if !h.is_null() {
+                    return unsafe { OwnedHandle::from_raw_handle(h) };
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("no ping -n {count}");
+    }
+
+    fn ends_within(h: &OwnedHandle, ms: u32) -> bool {
+        unsafe { WaitForSingleObject(raw(h), ms) == WAIT_OBJECT_0 }
+    }
+
+    /// A shell that starts a program in its job with a console of its own (hidden), which
+    /// outlives the terminal's console: only the job ends it.
+    fn pinging(count: &str) -> Vec<String> {
+        // No quotes of its own: the argument reaches cmd quoted, and cmd can't take escaped ones.
+        let start = format!("powershell -NoProfile -Command Start-Process -WindowStyle Hidden ping -ArgumentList '-n','{count}','127.0.0.1' & ping -n 300 127.0.0.1");
+        vec!["cmd".into(), "/d".into(), "/c".into(), start]
+    }
+
     #[test]
-    fn a_killed_keeper_ends_its_terminal() {
+    fn a_killed_keeper_ends_its_terminal_and_what_the_shell_started() {
         let h = home("host");
-        let argv: Vec<String> = ["cmd", "/d"].iter().map(|s| s.to_string()).collect();
+        let argv = pinging("311");
         let sp = spawn(&Owner { home: &h, sid: "host", tied: true }, &argv, ".", &[], 80, 24).expect("spawn");
         let m = Arc::new(sp.master);
         let reader = read_all(&m);
         assert!(m.child_alive());
+        let ping = ping_of("311");
         unsafe { TerminateProcess(raw(&m.keeper), 9) };
         assert_eq!(m.wait_exit(), (None, Some(HOST_EXITED)));
         assert!(!m.child_alive(), "the shell outlived its keeper");
+        assert!(ends_within(&ping, 5000), "the shell's child outlived its keeper");
         reader.join().unwrap();
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    /// What a crashed midnad leaves: a keeper nobody is attached to, running a shell. The next
+    /// midnad ends it, its shell and their children, and the session's name is free again.
+    #[test]
+    fn a_starting_midnad_ends_the_keepers_an_earlier_one_left() {
+        let h = home("left");
+        let argv = pinging("312");
+        let shell = Spawn { argv, cwd: ".".into(), env: environment(&[]), cols: 80, rows: 24 };
+        // In the tie job all the same, so a failing test leaves nothing behind.
+        let started = client::start_in(&keeper_exe().unwrap(), &h, "left", shell, tie_job()).expect("start");
+        let keeper = started.keeper.process;
+        drop(started.client);
+        let ping = ping_of("312");
+        for _ in 0..50 {
+            if !midna_pty::names::records(&h).is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(end_leftover_keepers(&h), 1);
+        assert!(ends_within(&keeper, 0), "the keeper is still running");
+        assert!(ends_within(&ping, 5000), "the shell's child is still running");
+        assert!(midna_pty::names::records(&h).is_empty(), "its record is still there");
+        assert_eq!(end_leftover_keepers(&h), 0);
+        let again = spawn(&Owner { home: &h, sid: "left", tied: true }, &["cmd".to_string(), "/d".into(), "/c".into(), "exit 0".into()], ".", &[], 80, 24).expect("again");
+        assert_eq!(again.master.wait_exit(), (Some(0), None));
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    /// A record whose pid is gone, or another program's now, is only removed.
+    #[test]
+    fn a_stale_keeper_record_is_removed_and_its_pid_left_alone() {
+        let h = home("stale");
+        let me = std::process::id();
+        let record = midna_pty::names::Record {
+            pid: me,
+            pipe: midna_pty::names::pipe_name(&h, "stale"),
+            protocol: 1,
+            build: "test".into(),
+            shell_pid: me,
+            exe: "midna-pty.exe".into(),
+        };
+        std::fs::create_dir_all(midna_pty::names::pty_dir(&h)).unwrap();
+        std::fs::write(midna_pty::names::record_path(&h, "stale"), serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(end_leftover_keepers(&h), 0);
+        assert!(midna_pty::names::records(&h).is_empty());
         let _ = std::fs::remove_dir_all(&h);
     }
 

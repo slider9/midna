@@ -198,6 +198,12 @@ pub fn start_with(mut cfg: Config, resume: Option<crate::upgrade::Resume>) -> st
         Some(l) => l,
         None => bind(&d.cfg.socket, &d.cfg.home)?,
     };
+    // Windows: what a crashed midnad's keepers still run is ended before any terminal reopens
+    // (only once the socket is ours, so a running midnad's terminals are never touched).
+    #[cfg(windows)]
+    if resume.is_none() {
+        crate::pty::end_leftover_keepers(&d.cfg.home);
+    }
     #[cfg(unix)]
     d.listener_fd.store(std::os::fd::AsRawFd::as_raw_fd(&listener), Ordering::SeqCst);
     crate::hooks::write_claude_settings(&d);

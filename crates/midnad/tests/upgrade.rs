@@ -77,8 +77,16 @@ impl Bin {
         }
         #[cfg(windows)]
         std::fs::hard_link(built().with_file_name(KEEPER), home.join(KEEPER)).unwrap();
-        let log = std::fs::File::create(home.join("daemon.log")).unwrap();
-        let child = Command::new(home.join(V1))
+        let child = Bin::launch(&home, load1, env);
+        let b = Bin { home, child };
+        wait_for(10, "daemon socket", || Client::connect(b.socket()).ok());
+        b
+    }
+
+    /// Start v1 in `home`, logging to daemon.log (appended to, for a second midnad).
+    fn launch(home: &Path, load1: f64, env: &[(&str, String)]) -> Child {
+        let log = std::fs::OpenOptions::new().create(true).append(true).open(home.join("daemon.log")).unwrap();
+        Command::new(home.join(V1))
             .args(["--foreground", "--home"])
             .arg(&home)
             .env_remove("MIDNA_SOCKET")
@@ -95,10 +103,7 @@ impl Bin {
             .stdout(log.try_clone().unwrap())
             .stderr(log)
             .spawn()
-            .unwrap();
-        let b = Bin { home, child };
-        wait_for(10, "daemon socket", || Client::connect(b.socket()).ok());
-        b
+            .unwrap()
     }
 
     fn socket(&self) -> PathBuf {
@@ -767,7 +772,53 @@ fn a_stopped_midnad_leaves_no_keeper_console_host_or_shell_on_windows() {
     assert!(midna_pty::names::records(&d.home).is_empty(), "keeper records left: {:?}", midna_pty::names::records(&d.home));
 }
 
-/// Run in a terminal by the test above: stalls the console's hang-up (CTRL_CLOSE_EVENT) for as
+/// A midnad that's killed leaves its keepers running, with shells no terminal shows. Until a new
+/// midnad can re-attach to them, it ends them, with what they started, and the sessions they
+/// held can be restarted.
+#[cfg(windows)]
+#[test]
+fn a_killed_midnads_keepers_are_ended_by_the_next_and_its_terminals_restart_on_windows() {
+    let mut d = Bin::start();
+    let mut c = d.human();
+    let id = call(&mut c, "session.open", json!({ "kind": "shell", "cwd": common::tmp(), "command": ["cmd.exe"] }))["id"].as_str().unwrap().to_string();
+    let ping = "powershell -NoProfile -Command \"Start-Process -WindowStyle Hidden ping -ArgumentList '-n','378','127.0.0.1'\"";
+    call(&mut c, "session.input", json!({ "id": id, "text": ping, "enter": true }));
+    let hidden = wait_for(15, "the hidden ping", || {
+        let p: Vec<i32> = midnad::procs::snapshot()
+            .into_iter()
+            .filter(|(p, (_, n))| n.eq_ignore_ascii_case("ping") && midnad::procs::command_line(*p).is_some_and(|l| l.contains("378")))
+            .map(|(p, _)| p)
+            .collect();
+        (!p.is_empty()).then_some(p)
+    });
+    let records = midna_pty::names::records(&d.home);
+    assert_eq!(records.len(), 1, "{records:?}");
+    let (keeper, shell) = (records[0].1.pid as i32, records[0].1.shell_pid as i32);
+    let table = midnad::procs::snapshot();
+    let theirs: Vec<i32> = [keeper, shell].into_iter().chain(hidden).collect();
+    let running = |pids: &[i32]| -> Vec<String> {
+        let now = midnad::procs::snapshot();
+        pids.iter().filter(|p| now.get(p).map(|(_, n)| n) == table.get(p).map(|(_, n)| n)).map(|p| format!("{p} {}", table.get(p).map_or("?", |(_, n)| n.as_str()))).collect()
+    };
+
+    drop(c);
+    d.child.kill().unwrap();
+    d.child.wait().unwrap();
+    assert_eq!(running(&theirs).len(), theirs.len(), "the keeper is meant to outlive midnad");
+
+    d.child = Bin::launch(&d.home, 0., &[]);
+    let mut c = d.human();
+    let left = running(&theirs);
+    assert!(left.is_empty(), "still running after the next midnad started: {left:?}");
+    assert!(midna_pty::names::records(&d.home).is_empty());
+    assert!(d.log().contains("left by an earlier midnad"), "{}", d.log());
+    let s = call(&mut c, "session.restart", json!({ "id": id }));
+    assert_eq!(s["status"]["reason"], "restarted", "{s}");
+    call(&mut c, "session.input", json!({ "id": id, "text": "echo back-again", "enter": true }));
+    wait_for(10, "the restarted terminal", || common::read(&mut c, &id).contains("back-again").then_some(()));
+}
+
+/// Run in a terminal by `a_stopped_midnad_leaves_no_keeper_console_host_or_shell_on_windows`: stalls the console's hang-up (CTRL_CLOSE_EVENT) for as
 /// long as Windows waits for it (about 5 s), so only ending the terminal's job stops it at once.
 #[cfg(windows)]
 #[test]

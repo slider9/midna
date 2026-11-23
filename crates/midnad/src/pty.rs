@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 #[path = "pty_windows.rs"]
 mod windows;
 #[cfg(windows)]
-pub use windows::{FILES as CONPTY_FILES, HOST_EXITED, Master, Owner, Spawned, Writer, command_line, conpty_dll, keeper_exe, spawn, which};
+pub use windows::{FILES as CONPTY_FILES, HOST_EXITED, Master, Owner, Spawned, Writer, command_line, conpty_dll, end_leftover_keepers, keeper_exe, spawn, which};
 
 /// The most unread input a terminal holds. macOS stops taking a write here, wherever in the
 /// write that falls.
