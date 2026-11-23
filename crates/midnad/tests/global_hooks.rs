@@ -92,6 +92,45 @@ fn install_flips_per_launch_hooks_and_uninstall_restores() {
     remove_script(pre.with_extension("agent.sh"));
 }
 
+/// An installed midna updating: the global entries name a CLI path that stays put (the
+/// `bin/current` link; on Windows `bin\midna.exe`, refreshed from the new version), so they stay
+/// current without a reinstall.
+#[test]
+fn installed_hooks_stay_current_across_an_update() {
+    let d = TestDaemon::start();
+    let (claude_dir, codex_dir) = (d.home.join("agent-config/claude"), d.home.join("agent-config/codex"));
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    let bin = d.home.join("bin");
+    let cli = if cfg!(windows) { "midna.exe" } else { "midna" };
+    let point = |v: &str, body: &str| {
+        std::fs::create_dir_all(bin.join(v)).unwrap();
+        std::fs::write(bin.join(v).join(cli), body).unwrap();
+        let tmp = bin.join(".current.test");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(v, &tmp).unwrap();
+        #[cfg(windows)]
+        std::fs::write(&tmp, v).unwrap();
+        std::fs::rename(&tmp, bin.join("current")).unwrap();
+    };
+    point("0.0.1-aaaa", "old");
+    let mut h = d.human();
+    let st = call(&mut h, "hooks.install", json!({}));
+    assert_eq!(st["claude"]["state"], "current", "{st}");
+    assert_eq!(st["codex"]["state"], "current", "{st}");
+    let settings = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+    let toml = std::fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+    assert!(!settings.contains("0.0.1-aaaa") && !toml.contains("0.0.1-aaaa"), "the version's folder isn't named: {settings}
+{toml}");
+
+    point("0.0.2-bbbb", "new version");
+    let st = call(&mut h, "hooks.status", json!({}));
+    assert_eq!(st["claude"]["state"], "current", "{st}");
+    assert_eq!(st["codex"]["state"], "current", "{st}");
+    #[cfg(windows)]
+    assert_eq!(std::fs::read_to_string(bin.join(cli)).unwrap(), "new version");
+}
+
 #[test]
 fn unparseable_settings_are_never_rewritten() {
     let d = TestDaemon::start();

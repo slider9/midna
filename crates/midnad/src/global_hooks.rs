@@ -24,11 +24,26 @@ const GLOBAL_FLAG: &str = "--global";
 /// `$0` of the Codex wrapper script; identifies it in `notify`.
 const CODEX_WRAPPER_NAME: &str = "midna-notify";
 
-/// The CLI path to write into global config: the stable `bin/current/midna` of an installed
-/// midna (it survives updates), else the CLI this daemon uses.
+/// The CLI path to write into global config: one that stays the same across updates when midna
+/// is installed, else the CLI this daemon uses. That's `bin/current/midna`, a link each install
+/// re-points. Windows has no link there (`bin\current` names the versioned folder, which moves),
+/// so it's `bin\midna.exe`, a copy each install refreshes (`install::stable_cli`), brought up to
+/// date here too. With midna.exe there the whole time, Codex's notify entry, which has no shell
+/// to check first, keeps running the previous notify command.
 pub fn global_cli(d: &Daemon) -> String {
     let current = crate::install::current_cli(&d.cfg.home);
-    if current.is_file() { current.to_string_lossy().into_owned() } else { d.cfg.cli_path.clone() }
+    if !current.is_file() {
+        return d.cfg.cli_path.clone();
+    }
+    #[cfg(windows)]
+    {
+        let stable = crate::install::stable_cli(&d.cfg.home);
+        // An out-of-date copy that can't be replaced right now still beats a path that moves.
+        if crate::install::refresh_stable_cli(&d.cfg.home) || stable.is_file() {
+            return stable.to_string_lossy().into_owned();
+        }
+    }
+    current.to_string_lossy().into_owned()
 }
 
 pub fn claude_path(d: &Daemon) -> PathBuf {
