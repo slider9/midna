@@ -6,7 +6,8 @@
 //!
 //! Windows: making a symlink needs a privilege (or Developer Mode), so `bin/current` is a small
 //! text file naming the versioned directory instead, swapped the same way (write + rename). The
-//! newer ConPTY's files beside midnad.exe go with it (`pty::CONPTY_FILES`).
+//! newer ConPTY's files beside midnad.exe go with it (`pty::CONPTY_FILES`), and so does the
+//! terminal keeper, `midna-pty.exe` ([`KEEPER_EXE`]).
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -134,6 +135,17 @@ fn install(exe: &Path, home: &Path) -> std::io::Result<PathBuf> {
             copy_exec(&from, &to)?;
         }
     }
+    // The terminal keeper goes with midnad, so a keeper runs from the folder of the build that
+    // started it and keeps it until its terminal closes. A running one is moved aside rather
+    // than replaced (a dev build can change the keeper without changing midnad).
+    #[cfg(windows)]
+    {
+        let (from, to) = (exe.with_file_name(KEEPER_EXE), dir.join(KEEPER_EXE));
+        if from.is_file() && !same_bytes(&from, &to) {
+            replace_running(&from, &to)?;
+        }
+        clear_aside(&dir);
+    }
     // Atomic swap: a new symlink (Windows: pointer file) renamed over the old one.
     let tmp = root.join(format!(".current.{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
@@ -146,6 +158,43 @@ fn install(exe: &Path, home: &Path) -> std::io::Result<PathBuf> {
     #[cfg(windows)]
     refresh_stable_cli(home);
     Ok(dir)
+}
+
+/// The terminal keeper, `midna-pty.exe` (crates/midna-pty), installed beside midnad.
+#[cfg(windows)]
+pub const KEEPER_EXE: &str = "midna-pty.exe";
+
+/// Copy `from` over `to`, which may be running: Windows won't replace a running program but
+/// will rename it, so a running `to` is renamed to `.<name>.<n>.old` first (and put back if the
+/// copy can't take its place).
+#[cfg(windows)]
+fn replace_running(from: &Path, to: &Path) -> std::io::Result<()> {
+    let tmp = to.with_extension("tmp");
+    std::fs::copy(from, &tmp)?;
+    if std::fs::rename(&tmp, to).is_ok() {
+        return Ok(());
+    }
+    let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let aside = to.with_file_name(format!(".{name}.{}.old", std::process::id()));
+    if let Err(e) = std::fs::rename(to, &aside) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, to).inspect_err(|_| {
+        let _ = std::fs::rename(&aside, to);
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// Remove the copies [`replace_running`] moved aside, once nothing runs them.
+#[cfg(windows)]
+fn clear_aside(dir: &Path) {
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') && name.ends_with(".old") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -260,6 +309,40 @@ mod tests {
             .collect();
         assert_eq!(super::install(&exe, &home).unwrap(), dir);
         drop(held);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The keeper goes with midnad; one a live terminal runs is moved aside for a new copy, and
+    /// cleared away once it has stopped.
+    #[cfg(windows)]
+    #[test]
+    fn the_keeper_goes_with_midnad_even_while_one_runs() {
+        let root = std::env::temp_dir().join(format!("midna-inst-keeper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (bundle, home) = (root.join("bundle"), root.join("home"));
+        std::fs::create_dir_all(&bundle).unwrap();
+        let exe = bundle.join("midnad.exe");
+        std::fs::write(&exe, "midnad").unwrap();
+        let dir = super::install(&exe, &home).unwrap();
+        let keeper = dir.join(super::KEEPER_EXE);
+        assert!(!keeper.exists(), "none beside it, none installed");
+
+        // A real program, since only a running image refuses to be replaced.
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        std::fs::copy(std::path::Path::new(&system).join(r"System32\PING.EXE"), bundle.join(super::KEEPER_EXE)).unwrap();
+        assert_eq!(super::install(&exe, &home).unwrap(), dir);
+        let mut running = std::process::Command::new(&keeper).args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+
+        std::fs::write(bundle.join(super::KEEPER_EXE), "a newer keeper").unwrap();
+        let installed = super::install(&exe, &home);
+        let aside: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".old")).collect();
+        let _ = running.kill();
+        let _ = running.wait();
+        assert_eq!(installed.unwrap(), dir);
+        assert_eq!(std::fs::read_to_string(&keeper).unwrap(), "a newer keeper");
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        super::install(&exe, &home).unwrap();
+        assert!(!dir.join(&aside[0]).exists(), "the old copy is cleared once it stops");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

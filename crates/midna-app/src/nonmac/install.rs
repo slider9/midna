@@ -198,13 +198,14 @@ pub fn start_daemon() -> Result<(), String> {
     }
 }
 
-/// The newer ConPTY's files, which go with midnad (midnad's `pty::CONPTY_FILES`).
+/// What goes with midnad: the newer ConPTY's files (midnad's `pty::CONPTY_FILES`) and the
+/// terminal keeper (midnad's `install::KEEPER_EXE`).
 #[cfg(windows)]
-const CONPTY_FILES: [&str; 2] = ["conpty.dll", "OpenConsole.exe"];
+const BESIDE_MIDNAD: [&str; 3] = ["conpty.dll", "OpenConsole.exe", midna_pty::names::EXE];
 
-/// Install the bundle's midnad (and the `midna` CLI and ConPTY files beside it) into
+/// Install the bundle's midnad (and the `midna` CLI, ConPTY files and keeper beside it) into
 /// `home\bin\<version>-<hash>` and point `bin\current` at it (`midnad --install-self`), unless
-/// that build is already there.
+/// that build is already there; then remove old builds ([`prune_old_installs`]).
 #[cfg(windows)]
 pub fn install_daemon(bundle: &Path, home: &Path) -> Result<PathBuf, String> {
     let src = bundle.join(exe_name("midnad"));
@@ -213,7 +214,7 @@ pub fn install_daemon(bundle: &Path, home: &Path) -> Result<PathBuf, String> {
     }
     let current = current_daemon(home);
     let beside = |name: &str| same_file(&bundle.join(name), &current.with_file_name(name));
-    if same_file(&src, &current) && beside(&exe_name("midna")) && CONPTY_FILES.iter().all(|f| !bundle.join(f).is_file() || beside(f)) {
+    if same_file(&src, &current) && beside(&exe_name("midna")) && BESIDE_MIDNAD.iter().all(|f| !bundle.join(f).is_file() || beside(f)) {
         return Ok(current);
     }
     let mut cmd = Command::new(&src);
@@ -225,7 +226,44 @@ pub fn install_daemon(bundle: &Path, home: &Path) -> Result<PathBuf, String> {
         return Err(format!("midnad --install-self: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
     crate::lifecycle::log(String::from_utf8_lossy(&out.stdout).trim());
+    prune_old_installs(home);
     Ok(current_daemon(home))
+}
+
+/// Keep `bin\current`'s build plus the two most recent others (an upgrade may fall back to the
+/// previous midnad) and remove the rest, except a build a live terminal keeper runs from (it
+/// keeps its build until its terminal closes, and records itself in `MIDNA_HOME\pty`) or one
+/// whose midnad is still running (Windows won't delete a running program, and the rest of its
+/// folder would go).
+#[cfg(windows)]
+pub fn prune_old_installs(home: &Path) {
+    let canon = |p: &Path| midna_proto::paths::canonical(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().to_lowercase();
+    let root = home.join("bin");
+    let current = current_daemon(home).parent().map(canon);
+    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .filter(|e| Some(canon(&e.path())) != current)
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    dirs.sort();
+    let n = dirs.len();
+    let keepers: Vec<String> = midna_pty::client::live_keeper_dirs(home).iter().map(|d| canon(d)).collect();
+    for (_, d) in dirs.into_iter().take(n.saturating_sub(2)) {
+        if keepers.contains(&canon(&d)) {
+            continue;
+        }
+        match std::fs::remove_file(d.join(exe_name("midnad"))) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => continue,
+            _ => {}
+        }
+        if let Err(e) = std::fs::remove_dir_all(&d) {
+            crate::lifecycle::log(&format!("can't remove the old build {}: {e}", d.display()));
+        }
+    }
 }
 
 /// The Start menu entry: `Midna.lnk` (Midna Dev: `Midna Dev.lnk`) in the user's Start menu
@@ -635,6 +673,58 @@ mod tests {
         std::fs::write(d.join("bin").join("current"), "0.9.0-abcd1234\n").unwrap();
         assert_eq!(current_daemon(&d), d.join("bin").join("0.9.0-abcd1234").join("midnad.exe"));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Old builds go, but not the current one, the two newest others, one a live keeper runs
+    /// from, or one whose midnad is running.
+    #[cfg(windows)]
+    #[test]
+    fn pruning_keeps_builds_that_a_keeper_or_a_midnad_runs_from() {
+        use midna_pty::names;
+        let home = scratch("prune");
+        let bin = home.join("bin");
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let ping = Path::new(&system).join(r"System32\PING.EXE");
+        let run = |exe: &Path| Command::new(exe).args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        let record = |session: &str, pid: u32| {
+            let r = names::Record { pid, pipe: "p".into(), protocol: 1, build: "b".into(), shell_pid: 1, exe: String::new() };
+            std::fs::create_dir_all(names::pty_dir(&home)).unwrap();
+            std::fs::write(names::record_path(&home, session), serde_json::to_vec(&r).unwrap()).unwrap();
+        };
+        let mut running = vec![];
+        for v in ["v1", "v2", "v3", "v4", "v5", "v6"] {
+            let d = bin.join(v);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("midna.exe"), v).unwrap();
+            match v {
+                // A live terminal's keeper, recorded in MIDNA_HOME\pty.
+                "v1" => {
+                    std::fs::write(d.join("midnad.exe"), v).unwrap();
+                    std::fs::copy(&ping, d.join(names::EXE)).unwrap();
+                    let p = run(&d.join(names::EXE));
+                    record("s1", p.id());
+                    running.push(p);
+                }
+                // An old midnad still running.
+                "v2" => {
+                    std::fs::copy(&ping, d.join("midnad.exe")).unwrap();
+                    running.push(run(&d.join("midnad.exe")));
+                }
+                _ => std::fs::write(d.join("midnad.exe"), v).unwrap(),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        // A record whose keeper is gone keeps nothing.
+        record("s2", u32::MAX - 3);
+        std::fs::write(bin.join("current"), "v4").unwrap();
+        prune_old_installs(&home);
+        let left: Vec<bool> = ["v1", "v2", "v3", "v4", "v5", "v6"].iter().map(|v| bin.join(v).join("midna.exe").exists()).collect();
+        for mut p in running {
+            let _ = p.kill();
+            let _ = p.wait();
+        }
+        assert_eq!(left, [true, true, false, true, true, true]);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[cfg(windows)]

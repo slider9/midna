@@ -1,8 +1,9 @@
 #!/bin/bash
 # Build release binaries and assemble Midna for Windows: a folder holding midna-app.exe,
-# midnad.exe, midna.exe, Microsoft's newer ConPTY (conpty.dll and OpenConsole.exe, which go
-# wherever midnad.exe goes), the marker that makes midna-app.exe run as an installed Midna
-# (crates/midna-app/src/nonmac/install.rs) and the licenses of the fonts and ConPTY. Copy the
+# midnad.exe, midna.exe, the terminal keeper midna-pty.exe and Microsoft's newer ConPTY
+# (conpty.dll and OpenConsole.exe; these three go wherever midnad.exe goes), the marker that makes
+# midna-app.exe run as an installed Midna (crates/midna-app/src/nonmac/install.rs) and the
+# licenses of the fonts and ConPTY. Copy the
 # folder to %LOCALAPPDATA%\Programs\Midna and run midna-app.exe: it installs midnad into its
 # home, starts it at login and copies the midna CLI into ~\.local\bin. Run from Git Bash.
 #
@@ -72,15 +73,15 @@ if [ "$BUILD" = 1 ]; then
   echo "==> cargo build --release (midna $VERSION, target $TARGET_DIR)"
   unset MIDNA_UPDATE_PUBKEY
   MIDNA_DEV_HOME="$DEV_HOME" MIDNA_BUILD_VERSION="$VERSION" CARGO_TARGET_DIR="$TARGET_DIR" CARGO_BUILD_BUILD_DIR="$TARGET_DIR" \
-    cargo build --release -p midna-app -p midnad -p midna-cli --bin midna-app --bin midnad --bin midna
+    cargo build --release -p midna-app -p midnad -p midna-cli -p midna-pty --bin midna-app --bin midnad --bin midna --bin midna-pty
 fi
-for b in midna-app midnad midna; do [ -f "$BIN/$b.exe" ] || { echo "missing $BIN/$b.exe" >&2; exit 1; }; done
+for b in midna-app midnad midna midna-pty; do [ -f "$BIN/$b.exe" ] || { echo "missing $BIN/$b.exe" >&2; exit 1; }; done
 
 # ---------------------------------------------------------------- assemble
 echo "==> assembling $DEST"
 rm -rf "$DEST"
 mkdir -p "$DEST/Fonts"
-cp "$BIN/midna-app.exe" "$BIN/midnad.exe" "$BIN/midna.exe" "$DEST/"
+cp "$BIN/midna-app.exe" "$BIN/midnad.exe" "$BIN/midna.exe" "$BIN/midna-pty.exe" "$DEST/"
 cp "$CONPTY" "$DEST/conpty.dll"
 cp "$(dirname "$CONPTY")/OpenConsole.exe" "$DEST/"
 cp packaging/assets/conpty-LICENSE.txt "$DEST/ConPTY-LICENSE.txt"
