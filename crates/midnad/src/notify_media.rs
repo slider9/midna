@@ -2,7 +2,7 @@
 //! `MIDNA_HOME/notify/{sounds,images}` (`notify.import`). Settings name a file by its file name
 //! (`notify.sound.<kind>`, `notify.image[.<kind>]`); the notifier resolves names to paths.
 use crate::daemon::Daemon;
-use midna_proto::notify::{IMAGE_EXTS, SOUND_EXTS, SYSTEM_SOUNDS, TWILIGHT, is_builtin_sound, system_sound_path, twilight_path};
+use midna_proto::notify::{IMAGE_EXTS, SOUND_EXTS, SYSTEM_SET, SYSTEM_SOUNDS, TWILIGHT, is_builtin_sound, system_sound_path, twilight_path};
 use midna_proto::*;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -246,8 +246,9 @@ pub fn check_setting(home: &Path, key: &str, value: &Value) -> Result<(), String
             return Ok(());
         }
         return Err(format!(
-            "no sound `{v}`: use none, a Twilight sound ({}), a macOS sound ({}) or a sound from `midna notify media` (import one with `midna notify import <file>`)",
+            "no sound `{v}`: use none, a Twilight sound ({}), a {} sound ({}) or a sound from `midna notify media` (import one with `midna notify import <file>`)",
             TWILIGHT.join(", "),
+            midna_proto::notify::SYSTEM_SET_NAME,
             SYSTEM_SOUNDS.join(", ")
         ));
     }
@@ -290,7 +291,10 @@ pub fn list(d: &Daemon, kind: Option<&str>) -> NotifyMediaResult {
     let media = |kind: &str, name: String, path: String, set: &str| NotifyMedia { kind: kind.into(), used_by: used_by(d, kind, &name), name, path, builtin: !set.is_empty(), set: set.into() };
     let sounds = if kind.is_none_or(|k| k == "sound") {
         let twilight = TWILIGHT.iter().filter_map(|n| twilight_path(home, n).map(|p| media("sound", n.to_string(), p.to_string_lossy().into_owned(), "twilight")));
-        let system = SYSTEM_SOUNDS.iter().filter_map(|n| system_sound_path(n).map(|p| media("sound", n.to_string(), p, "macos")));
+        // Windows: only the ones this copy of Windows has (they've changed between versions).
+        let system = SYSTEM_SOUNDS
+            .iter()
+            .filter_map(|n| system_sound_path(n).filter(|p| cfg!(not(windows)) || Path::new(p).is_file()).map(|p| media("sound", n.to_string(), p, SYSTEM_SET)));
         let mine = imported(home, "sound").into_iter().map(|(n, p)| media("sound", n, p.to_string_lossy().into_owned(), ""));
         twilight.chain(system).chain(mine).collect()
     } else {
@@ -353,7 +357,7 @@ pub fn import(d: &Daemon, actor: Actor, path: &str) -> Result<NotifyMedia, RpcEr
 /// Delete an imported file; returns the settings that used it (the caller resets them).
 pub fn remove(d: &Daemon, actor: Actor, name: &str) -> Result<(String, Vec<String>), RpcError> {
     if is_builtin_sound(name) {
-        return Err(RpcError::bad_params(format!("`{name}` ships with midna or macOS; only imported files can be removed")));
+        return Err(RpcError::bad_params(format!("`{name}` ships with midna or {}; only imported files can be removed", midna_proto::notify::SYSTEM_SET_NAME)));
     }
     let kind = kind_of(Path::new(name)).filter(|_| valid_name(name)).ok_or_else(|| RpcError::not_found(format!("no imported sound or image `{name}`")))?;
     let file = kind_dir(&d.cfg.home, kind).join(name);
@@ -372,7 +376,9 @@ mod tests {
 
     #[test]
     fn names_and_formats() {
-        assert!(valid_name("ding.mp3"));
+        assert!(valid_name("ding.wav"));
+        // Windows plays only WAVs (PlaySoundW).
+        assert_eq!(valid_name("ding.mp3"), !cfg!(windows));
         assert!(!valid_name("../ding.mp3"));
         assert!(!valid_name(".hidden.wav"));
         assert!(!valid_name("notes.txt"));
@@ -382,9 +388,11 @@ mod tests {
         assert!(sniff(Path::new("a.mp3"), b"ID3\x04"));
         assert!(sniff(Path::new("a.m4a"), b"\0\0\0\x20ftypM4A "));
         let home = Path::new("/nonexistent");
-        assert_eq!(sound_path(home, "Glass"), Some(PathBuf::from("/System/Library/Sounds/Glass.aiff")));
+        let system = midna_proto::wording::os("Glass", "chimes");
+        assert_eq!(sound_path(home, system), midna_proto::notify::system_sound_path(system).map(PathBuf::from));
+        assert!(sound_path(home, system).is_some());
         assert_eq!(sound_path(home, "none"), None);
-        assert!(check_setting(home, "notify.sound.approval", &json!("Ping")).is_ok());
+        assert!(check_setting(home, "notify.sound.approval", &json!(midna_proto::wording::os("Ping", "tada"))).is_ok());
         assert!(check_setting(home, "notify.sound.approval", &json!("/etc/passwd")).is_err());
         assert!(check_setting(home, "notify.image", &json!("")).is_ok());
         assert!(check_setting(home, "notify.image.failed", &json!("missing.png")).is_err());

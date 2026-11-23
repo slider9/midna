@@ -968,7 +968,7 @@ fn system(a: &Args, out: OutFn) -> Res {
             };
             out(&v, &print::system_load);
             if held(&v) {
-                return Err(Fail::Pending("the Mac is still busy".into()));
+                return Err(Fail::Pending(format!("the {} is still busy", midna_proto::wording::MAC)));
             }
         }
         "run-anyway" => {
@@ -977,7 +977,7 @@ fn system(a: &Args, out: OutFn) -> Res {
                 None => json!({}),
             };
             out(&call("system.run_anyway", p)?, &|v| {
-                println!("{} goes ahead while the Mac is busy, until the human's next prompt", v["session_id"].as_str().unwrap_or(""))
+                println!("{} goes ahead while the {} is busy, until the human's next prompt", v["session_id"].as_str().unwrap_or(""), midna_proto::wording::MAC)
             })
         }
         "pause" => out(&call("session.pause", json!({ "session_id": sid("terminal id to pause")? }))?, &|v| {
@@ -1745,7 +1745,11 @@ fn notify(a: &Args, out: OutFn) -> Res {
                     println!("{title}{}", if list.is_empty() { " (none imported)" } else { "" });
                     for m in list {
                         let used: Vec<&str> = m["used_by"].as_array().map(|u| u.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
-                        let tag = if m["builtin"] == true { "macOS" } else { "imported" };
+                        let tag = match (m["builtin"] == true, m["set"].as_str()) {
+                            (false, _) => "imported",
+                            (true, Some("twilight")) if !cfg!(target_os = "macos") => "Twilight",
+                            (true, _) => midna_proto::notify::SYSTEM_SET_NAME,
+                        };
                         let used = if used.is_empty() { String::new() } else { format!("  used by {}", used.join(", ")) };
                         println!("  {:<22} {tag:<8}{used}", s_(&m, "name"));
                     }

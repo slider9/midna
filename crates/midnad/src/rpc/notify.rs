@@ -26,7 +26,7 @@ fn listing(d: &Daemon, sid: Option<Id>) -> NotifyListResult {
     let overrides = sid.as_deref().and_then(|s| st.session(s)).map(|s| s.notify.clone()).unwrap_or_default();
     let enabled = st.setting_bool("notify.enabled");
     let muted = overrides.get("enabled") == Some(&false);
-    let builtin = CATEGORIES.iter().map(|c| (c.key, c.label, c.description, c.default));
+    let builtin = CATEGORIES.iter().filter(|c| notify::available(c.key)).map(|c| (c.key, c.label, c.description, c.default));
     let custom = st.notify_kinds.iter().map(|k| (k.key.as_str(), k.label.as_str(), k.description.as_str(), true));
     let categories = builtin
         .chain(custom)

@@ -320,7 +320,10 @@ fn tick_with(d: &Daemon, force: bool) -> KeepAwakeStatus {
             format!("Not keeping awake: battery at {pct}% (below {}%); again at {back}% or on power", s.min_battery)
         }
         NoWork => format!("Ready to keep awake{until}: no work right now"),
+        #[cfg(target_os = "macos")]
         Failed => format!("Couldn't keep awake: macOS refused the power assertion (IOReturn {:#x}); retrying", error.unwrap_or_default()),
+        #[cfg(not(target_os = "macos"))]
+        Failed => format!("Couldn't keep awake: Windows refused the power request (error {:#x}); retrying", error.unwrap_or_default()),
     };
     let status = KeepAwakeStatus {
         held,

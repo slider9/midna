@@ -157,6 +157,16 @@ const SECS: [Sec; 11] =
 #[cfg(not(target_os = "macos"))]
 const SECS: [Sec; 10] = [Sec::General, Sec::Appearance, Sec::Terminal, Sec::Shortcuts, Sec::Agents, Sec::Limits, Sec::Notifications, Sec::Sounds, Sec::Webhooks, Sec::System];
 
+/// Rows for what only macOS has, left out elsewhere: Finder's “Open in Midna”, a Force Touch
+/// trackpad's haptics, waking for scheduled work, noticing a kernel panic, Kass (a macOS app)
+/// and the Accessibility grant (Kass and window moves; Windows has no such grant).
+const MAC_ONLY: &[&str] = &["finder.quick_action", "ui.haptics", "keep_awake.wake", "guard.panic_hold", "@kass", "kass.auto_send", "@accessibility"];
+
+/// Whether `LAYOUT`'s item has a row on this platform.
+fn shown_here(item: &str) -> bool {
+    cfg!(target_os = "macos") || !MAC_ONLY.contains(&item)
+}
+
 impl Sec {
     fn label(self) -> &'static str {
         match self {
@@ -624,7 +634,7 @@ impl SettingsWindow {
 
     /// Every notification kind, built in then yours: (key, name).
     fn kinds(&self) -> Vec<(String, String)> {
-        let builtin = midna_proto::notify::CATEGORIES.iter().map(|c| (c.key.to_string(), c.label.to_string()));
+        let builtin = midna_proto::notify::CATEGORIES.iter().filter(|c| midna_proto::notify::available(c.key)).map(|c| (c.key.to_string(), c.label.to_string()));
         builtin.chain(self.custom.iter().map(|k| (k.key.clone(), k.label.clone()))).collect()
     }
 
@@ -1210,7 +1220,7 @@ pub(crate) fn label_for(key: &str) -> String {
         "insights.colors.waiting" => "Blocked on you color",
         "ui.status.looks" => "Status looks",
         "ui.status.background_ring" => "Background work ring",
-        "terminal.option_as_meta" => "Option as Meta",
+        "terminal.option_as_meta" => os("Option as Meta", "Alt as Meta"),
         "agents.restart_on_update" => "After an agent update",
         "agents.restart_idle_secs" => "Idle before a restart",
         "agents.adopt_typed" => "Adopt agents typed in a shell",
@@ -2040,7 +2050,11 @@ impl SettingsWindow {
                             "Paired devices" => Some("A contact is someone else's Midna: what it sends asks you first. My device is one of your own Macs."),
                             _ => None,
                         },
-                        rows: items.iter().flat_map(|i| if i.starts_with('@') { self.special_rows(t, i) } else { self.key_row(t, i).into_iter().collect() }).collect(),
+                        rows: items
+                            .iter()
+                            .filter(|i| shown_here(i))
+                            .flat_map(|i| if i.starts_with('@') { self.special_rows(t, i) } else { self.key_row(t, i).into_iter().collect() })
+                            .collect(),
                     })
                     .filter(|g| !g.rows.is_empty())
                     .collect();
@@ -3690,6 +3704,36 @@ mod tests {
         }
         for bad in ["relay.example.com", "ftp://relay.example.com", "https://", "https:///hooks", "https://:80", "https://relay example.com"] {
             assert!(relay_url_problem(bad).is_some(), "{bad}");
+        }
+    }
+
+    /// Off macOS what Settings shows names no Mac, macOS, Finder or Mac key: section blurbs, group
+    /// names, and each shown setting's name, line and options. Nearby (no section there) and the
+    /// macOS-only rows aren't shown.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn settings_say_this_platforms_words() {
+        use midna_proto::wording::mac_words;
+        for sec in super::SECS {
+            assert_eq!(mac_words(sec.about()), None, "{:?}", sec.label());
+        }
+        let shown = LAYOUT.iter().filter(|(sec, ..)| super::SECS.contains(sec));
+        for (sec, group, items) in shown {
+            assert_eq!(mac_words(group), None, "{} › {group}", sec.label());
+            for key in items.iter().filter(|i| !i.starts_with('@') && super::shown_here(i)) {
+                let spec = setting(key).unwrap();
+                assert_eq!(mac_words(&super::label_for(key)), None, "{key}'s name");
+                assert_eq!(mac_words(&super::note_for(key)), None, "{key}'s line");
+                if let midna_proto::settings::SettingKind::Enum { options, .. } = spec.ty {
+                    for o in options {
+                        assert_eq!(mac_words(&super::option_label(key, o)), None, "{key} = {o}");
+                    }
+                }
+            }
+        }
+        // every kind's own rows (sounds, colors, bell, …) are named after it
+        for c in midna_proto::notify::CATEGORIES.iter().filter(|c| midna_proto::notify::available(c.key)) {
+            assert_eq!(mac_words(c.label), None, "{}", c.key);
         }
     }
 

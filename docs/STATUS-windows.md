@@ -216,9 +216,17 @@ Settings ▸ System ▸ Notifications), the link menus and previews (Reveal in F
 command bar, the sidebar, the queue and needs-you hints (Alt+↑↓, Alt+Backspace, Ctrl+O), triggers
 and pasted secrets (Credential Manager, not Keychain), the status bar and toasts. A key written as
 a phrase follows the mapping above: a `keys.*` shortcut (⌘K, ⌘T, ⌘E) reads Ctrl+Shift+X, a key in
-an overlay or text field (⌘V, ⌘O) Ctrl+X, ⌥ Alt and ↩ Enter. What stays in macOS wording: Nearby
-and everything about other Macs (hidden on Windows; B123 is the share commands and menu items that
-still show), log lines, and text on paths that only run on macOS (Touch ID, `sips`).
+an overlay or text field (⌘V, ⌘O) Ctrl+X, ⌥ Alt, ↩ Enter and ⇥ Tab (`wording::ENTER`, `TAB`, …),
+and a button that showed ↩ shows no key. The CLI's help (`midna help`, `<verb> --help`) and output,
+midnad's messages (a held agent's "Waiting for the PC", the load and memory guard, keep-awake) and the
+setting descriptions do the same; tests in midna-proto, midna-cli and midna-app check, off macOS, that
+the settings, Settings window and help name no Mac, macOS, Finder or Mac key (`wording::mac_words`).
+Rows for what only macOS has are left out of Settings on Windows: Finder's “Open in Midna”, haptics,
+waking for scheduled work, the kernel-panic hold, Kass and the Accessibility grant. What stays in
+macOS wording: Nearby and everything about other Macs (hidden on Windows: its Settings section, its
+notification kind, the command bar's share commands and the terminal menus' Nearby items), log
+lines, text on paths that only run on macOS (Touch ID, `sips`), and the agents' reference: the RPC
+catalog (`midna explain`), `midna guide` and the skill docs.
 
 ## What works (verified on Windows 10 19045)
 
@@ -255,10 +263,11 @@ still show), log lines, and text on paths that only run on macOS (Touch ID, `sip
 
 In rough order of how much they matter:
 
-1. **macOS wording.** Done: Settings, the setup screen, menus, hints and toasts say Windows' keys
-   and names (see Shortcuts). Rows for what Windows doesn't have yet say so (File Explorer's “Open
-   in Midna”, waking for scheduled work, noticing a crash); the Accessibility row still shows,
-   always granted, and the sound pickers still offer macOS's sounds.
+1. **macOS wording.** Done: Settings, the setup screen, menus, hints, toasts, CLI help and midnad's
+   messages say Windows' keys and names, and Settings leaves out rows for what only macOS has (see
+   Shortcuts). The sound pickers offer midna's Twilight sounds, a few of Windows' own
+   (`%WINDIR%\Media`: Windows Notify, chimes, …, the ones that copy of Windows has) and imported WAVs.
+   Left: the agents' reference (RPC catalog, `midna guide`, skill docs) still describes macOS.
 2. **Integration tests: the product gaps they show.** The tests run on Windows through the helpers in `crates/midnad/tests/common/mod.rs` (and midna-cli's): `tmp()`, `sh()` and `posix_bin()` (Git for Windows' `usr\bin` tools, as 8.3 paths), `script()` (a `.sh` with a `.cmd` that runs it), and a copy of the test binary standing in for `nc -U`. Each test binary sets `MIDNA_SHELL` to Git's `sh`, so one-line commands get a POSIX shell as on macOS. What's Unix only is `cfg(unix)` with its reason: `shell_integration.rs`, in-place upgrade and restart (`upgrade.rs` checks the refusal instead), file modes, `/` as the root, and `adopt.rs`, whose fake agents are sh scripts (`adopt_windows.rs` covers Windows). The tests that still fail do so on the product:
    - **`.cmd` agents** used to get broken arguments: a `.cmd` ran as `cmd /d /s /c "…"`, and cmd drops every argument after a newline (Claude's system hint) and acts on `|`, `<`, `>` and `&` inside them (Codex's hint). Now a `.cmd` or `.bat` that is only a shim (npm's cmd-shim output, as in `claude.cmd` and `codex.cmd`, or one line ending in `%*` such as the tests' fake agents) is read and its program started directly, with the arguments quoted for it (`midna_proto::cmd_shim`). That covers terminals, typed `claude`/`codex` (`midna shim`) and the Codex notify command chained after midna's. npm's shim runs the `node.exe` beside it when there is one, else `node` from PATH. Any other batch file still runs through cmd, with the old limits. agent_args, global_hooks and agent_screen_prompts pass.
    - **Windows 10's own ConPTY**, used when the newer one isn't beside midnad (a cargo build without `.toolchain/conpty`), drops faint text (SGR 2), so Claude's dim placeholder reads as typed text and a queued restart waits forever (restart_queue). It also clears a new terminal's screen, so an exited agent's last screen isn't kept above its shell (shell_on_exit). That screen was also how midna told a "No" typed into Claude's folder-trust dialog from a "Yes"; it now also checks that the agent is still running (`trust::confirm`). It keeps an app's kitty keyboard push, and probably its mouse mode, to itself (prompt jumps in a full-screen view fail; the Enter tests expect legacy keys on it). Its first title is the program's path. The newer ConPTY fixes the rest (the title wasn't checked on it): restart_queue, shell_on_exit, the jumps and the kitty Enter tests pass on it. With real Claude in Midna Dev, a queued prompt and its follow-up were both typed and answered.
@@ -275,7 +284,7 @@ In rough order of how much they matter:
 5. **App stubs.** Twilight, Kass composer, haptics and app link previews are missing. Commands that only exist on macOS (`sips`, `plutil`, `mdfind`, `xed`, `open -a`, `defaults`) do nothing. Notifications show as toasts, but:
    - Starting the app from a click after it quit (on the app's toast or midnad's) is registered by release builds, Midna and Midna Dev (`LocalServer32`), and hasn't been tried. Debug builds don't register it, so a click then does nothing, or starts Midna Dev, whose class they share. A dismissal while the app isn't running isn't reported.
    - A toast holds at most 5 buttons, so `notify send` with 6 loses the last one.
-   - `PlaySoundW` has no volume, and plays one sound at a time. In the app, `volume` 0 silences and anything else is full; midnad's own sounds play at their volume. Only a WAV plays.
+   - `PlaySoundW` has no volume, and plays one sound at a time. In the app, `volume` 0 silences and anything else is full; midnad's own sounds play at their volume. Only a WAV plays, so `notify import` takes only WAVs.
    - Sounds are skipped when Windows reports quiet hours, presentation mode or a full-screen app (`SHQueryUserNotificationState`). Whether Focus assist reports that way hasn't been checked.
    - The floating badge (`ui/badge.rs`, `w32`) is a topmost tool window (no taskbar button) that is never activated: `WS_EX_NOACTIVATE`, and `MA_NOACTIVATE` when it's clicked, so showing, updating, clicking or dragging it leaves the app in front where it is. It has the counts, capsules, list, cards and right-click menu, drags by hand, follows `notify.badge.corner`, `snap` and `inset_x` / `inset_y`, and docks in the front main window. Left out, as they need AppKit: the sling (a drop goes straight into the corner, without the throw) and the screen-reader label. Windows can't say when the screen's shared, so `notify.badge.sharing` `hide` and `count` keep it out of every capture and share (`WDA_EXCLUDEFROMCAPTURE`, Windows 10 2004 and later) and `count` never shows just the number; `show` lets them see it. It stays in while a Direct3D app is full screen (`SHQueryUserNotificationState`) unless it's being dragged; that wasn't tried with a real game. Screens with different scales weren't tried either (both screens it was tried on are at 100%).
 6. **Global hooks.** `bin\current` is a text file, not a link, so the global entries name `bin\midna.exe` instead, a copy of the current `midna.exe` that stays at the same path (`install::stable_cli`, used by `global_hooks::global_cli`). `midnad --install-self` refreshes it after each update, and midnad does it again whenever it finds the copy out of date. A copy a hook is running can't be replaced, so it's renamed aside and removed later. Nothing in midna deletes it, `--uninstall` included (MIDNA_HOME stays). Codex's notify entry calls that midna.exe directly, with no shell to check that it's there first (the macOS sh wrapper checks `-x`), so if someone deletes MIDNA_HOME by hand without `midna hooks uninstall`, the previous notify command stops too. No program built into Windows could stand in for the check: cmd.exe would put Codex's JSON, and the model's text in it, through cmd's parser, and PowerShell 5.1 and cscript drop its quotes. Entries installed before this change name a versioned folder and show as out of date until they're reinstalled once.

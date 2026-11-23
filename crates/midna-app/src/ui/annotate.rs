@@ -751,7 +751,7 @@ pub fn tray<V: 'static>(
                     .flex_1()
                     .min_w_0()
                     .child(div().font_weight(FontWeight::BOLD).child(title))
-                    .child(div().text_size(px(12.)).text_color(t.dim).child("Goes in with your next ↩. Nothing has been typed into the terminal yet.")),
+                    .child(div().text_size(px(12.)).text_color(t.dim).child(os("Goes in with your next ↩. Nothing has been typed into the terminal yet.", "Goes in with your next Enter. Nothing has been typed into the terminal yet."))),
             )
             .child(
                 div()

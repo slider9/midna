@@ -206,7 +206,7 @@ fn ready_is_busy(why: &str) -> bool {
 /// `restored` (a refused prompt Claude put back) counts as empty.
 pub fn readiness(d: &Daemon, sid: &str, check_input_box: bool, restored: Option<&str>) -> Result<Option<String>, String> {
     if crate::admit::is_waiting(d, sid) {
-        return Ok(Some("the Mac to calm down".into()));
+        return Ok(Some(format!("the {} to calm down", midna_proto::wording::MAC)));
     }
     let (rt, agent, title, state, labelled, in_turn, alive) = {
         let core = d.core();

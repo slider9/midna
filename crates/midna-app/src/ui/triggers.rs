@@ -1258,7 +1258,7 @@ impl TriggersView {
                     .on_click(move |_, window, cx| ask(&main, prompt.clone(), window, cx))
                     .child(div().text_color(t.accent).font_weight(FontWeight::BOLD).child("Ask"))
                     .child(div().flex_1().child(s))
-                    .child(kit::mono(t, "↩", 11.).text_color(t.dim)),
+                    .child(kit::mono(t, midna_proto::wording::ENTER, 11.).text_color(t.dim)),
             );
         }
         let arrival = match &self.status {

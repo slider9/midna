@@ -56,7 +56,7 @@ pub(super) fn blurb(key: &str) -> Option<&'static str> {
         "terminal.link_patterns" => "Text that becomes a link, like PROJ-12: `regex = url`, plus a card preview.",
         "terminal.preview_path_click" => "Clicking the path at the top of a preview.",
         "terminal.image_paste" => "Add notes in the image sheet first, or paste the image's path.",
-        "terminal.option_as_meta" => "Option-b moves back a word; off, Option types characters like é.",
+        "terminal.option_as_meta" => os("Option-b moves back a word; off, Option types characters like é.", "Alt+B moves back a word; off, Alt+key types just the key."),
         "terminal.cmd_enter_sends" => os("In Claude Code and Codex, ↩ starts a new line and ⌘↩ sends.", "In Claude Code and Codex, Enter starts a new line and Ctrl+Enter sends."),
         "terminal.prompt_bar" => "Which of your prompts you're reading, on the terminal's top row.",
         // Agents

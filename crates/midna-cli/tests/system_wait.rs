@@ -26,7 +26,7 @@ fn wait_returns_once_the_busy_gate_would_open() {
     // Still busy at the timeout: exit 4, with the load.
     let o = midna(&sock, &["system", "wait", "--timeout", "1"]).output().unwrap();
     assert_eq!(o.status.code(), Some(4), "{o:?}");
-    assert!(String::from_utf8_lossy(&o.stdout).contains("CPU 100% of the Mac: midna's terminals 95%"), "{o:?}");
+    assert!(String::from_utf8_lossy(&o.stdout).contains(&format!("CPU 100% of the {}: midna's terminals 95%", midna_proto::wording::MAC)), "{o:?}");
     assert!(String::from_utf8_lossy(&o.stdout).contains("because of midna's terminals"), "{o:?}");
 
     // It returns as soon as the gate would open: here other apps become the cause, though the

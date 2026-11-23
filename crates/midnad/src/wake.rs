@@ -243,8 +243,8 @@ pub fn sync(d: &Daemon, on: bool, want: Option<&(i64, String)>, now: i64) -> Kee
     let reason = want.map(|(t, what)| format!("{what} at {}", at(*t)));
     let line = match (on, next, &reason) {
         (false, ..) => "Off (midna keep-awake wake on)".to_string(),
-        (true, Some(w), Some(r)) => format!("Waking the Mac {} for {r}", at(w)),
-        (true, Some(w), None) => format!("Waking the Mac {}", at(w)),
+        (true, Some(w), Some(r)) => format!("Waking the {} {} for {r}", midna_proto::wording::MAC, at(w)),
+        (true, Some(w), None) => format!("Waking the {} {}", midna_proto::wording::MAC, at(w)),
         (true, None, Some(r)) if want.is_some_and(|(t, _)| t - LEAD <= now + 30) => format!("Awake for {r}"),
         (true, None, _) if error.is_some() => format!("Couldn't schedule a wake: {}", error.clone().unwrap_or_default()),
         (true, None, _) => "Nothing scheduled inside the hours to wake for".to_string(),

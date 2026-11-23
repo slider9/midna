@@ -20,6 +20,7 @@
 //! plays in the app when its banner is skipped because you're looking at that terminal.
 //! `notify.sounds` turns every sound off; `notify.sounds_in_app` keeps only the ones that come
 //! with a banner. Agents play a sound on purpose with `notify.play`.
+use crate::wording::os;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -95,7 +96,7 @@ pub struct SoundEffect {
 }
 
 macro_rules! fx {
-    ($key:literal, $label:literal, $group:literal, $sound:literal, $vol:literal, $desc:literal) => {
+    ($key:literal, $label:expr, $group:literal, $sound:literal, $vol:literal, $desc:expr) => {
         SoundEffect { key: $key, label: $label, group: $group, sound: $sound, volume: $vol, description: $desc }
     };
 }
@@ -105,11 +106,17 @@ pub static EFFECTS: &[SoundEffect] = &[
     fx!("denied", "You deny", "action", "Settle", 100, "You deny an approval or permission prompt, or keep a rule an agent wanted removed."),
     fx!("queue_sent", "Queued message sent", "action", "Whoosh", 100, "A message you queued went into its terminal (the pill's \"Sent\")."),
     fx!("image_added", "Image added to chat", "action", "Fwip", 100, "You paste, drop or pick an image into the image sheet."),
-    fx!("closed", "Terminal closed", "action", "Tock", 100, "You closed a terminal, or replaced it with a new session (⌘R)."),
+    fx!("closed", "Terminal closed", "action", "Tock", 100, os("You closed a terminal, or replaced it with a new session (⌘R).", "You closed a terminal, or replaced it with a new session (Ctrl+Shift+R).")),
     fx!("switched", "Switch terminal", "ui", "Tick", 100, "You select another terminal."),
-    fx!("command_bar", "Open ⌘K", "ui", "Thump", 100, "The command bar opens."),
+    fx!("command_bar", os("Open ⌘K", "Open Ctrl+Shift+K"), "ui", "Thump", 100, "The command bar opens."),
     fx!("copied", "Copy", "ui", "Tick-tick", 100, "midna copies something for you (a selection, a link, a session id)."),
 ];
+
+/// Whether a built-in kind can happen on this platform. Nearby isn't on Windows yet, so its
+/// answers never come and its kind isn't offered there.
+pub fn available(key: &str) -> bool {
+    cfg!(target_os = "macos") || key != "nearby"
+}
 
 pub fn effect(key: &str) -> Option<&'static SoundEffect> {
     EFFECTS.iter().find(|e| e.key == key)
@@ -247,9 +254,20 @@ pub fn reserved_kind_key(k: &str) -> bool {
     category(k).is_some() || effect(k).is_some() || KIND_FIELDS.contains(&k) || k == "kinds" || crate::settings::setting(&setting_key(k)).is_some()
 }
 
-/// The sounds in /System/Library/Sounds, by name (no extension). A sound setting's value is
-/// one of these, `none`, or an imported sound's file name (which has an extension).
+/// The system's own sounds, by name (no extension): on macOS the ones in /System/Library/Sounds,
+/// on Windows a few of the WAVs in `%WINDIR%\Media`. A sound setting's value is one of these,
+/// `none`, or an imported sound's file name (which has an extension).
+#[cfg(not(windows))]
 pub static SYSTEM_SOUNDS: &[&str] = &["Basso", "Blow", "Bottle", "Frog", "Funk", "Glass", "Hero", "Morse", "Ping", "Pop", "Purr", "Sosumi", "Submarine", "Tink"];
+#[cfg(windows)]
+pub static SYSTEM_SOUNDS: &[&str] = &[
+    "Windows Notify System Generic", "Windows Notify Messaging", "Windows Notify Email", "Windows Notify Calendar", "Windows Notify", "Windows Ding", "Windows Background",
+    "Windows Exclamation", "Windows Proximity Notification", "Windows Message Nudge", "chimes", "chord", "ding", "notify", "tada",
+];
+
+/// The system's sounds as a sound list's group (`NotifyMedia::set`) and its heading.
+pub const SYSTEM_SET: &str = os("macos", "windows");
+pub const SYSTEM_SET_NAME: &str = os("macOS", "Windows");
 
 /// midna's own sounds (the "Twilight" set, synthesized for midna; source in tools/twilight).
 /// midnad ships them inside its binary and writes them to `MIDNA_HOME/notify/twilight/<name>.wav`
@@ -272,17 +290,28 @@ pub fn builtin_sound_named(name: &str) -> Option<&'static str> {
     SYSTEM_SOUNDS.iter().chain(TWILIGHT).find(|s| s.eq_ignore_ascii_case(name)).copied()
 }
 
-/// What `notify.import` takes. Sounds play through NSSound / afplay; images must be formats
-/// macOS shows as a notification attachment.
+/// What `notify.import` takes. Sounds play through NSSound / afplay on macOS, and PlaySound on
+/// Windows, which plays only WAV; images must be formats macOS shows as a notification attachment.
+#[cfg(not(windows))]
 pub static SOUND_EXTS: &[&str] = &["aiff", "aif", "wav", "mp3", "m4a", "caf"];
+#[cfg(windows)]
+pub static SOUND_EXTS: &[&str] = &["wav"];
 pub static IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif"];
 
 /// Where a built-in sound's file is.
+#[cfg(not(windows))]
 pub fn system_sound_path(name: &str) -> Option<String> {
     SYSTEM_SOUNDS.contains(&name).then(|| format!("/System/Library/Sounds/{name}.aiff"))
 }
 
-/// The file a sound setting's value plays: a macOS sound, a Twilight sound, or a sound
+/// Where a built-in sound's file is: `%WINDIR%\Media\<name>.wav`.
+#[cfg(windows)]
+pub fn system_sound_path(name: &str) -> Option<String> {
+    let windir = std::env::var("WINDIR").or_else(|_| std::env::var("SystemRoot")).unwrap_or_else(|_| r"C:\Windows".into());
+    SYSTEM_SOUNDS.contains(&name).then(|| format!(r"{windir}\Media\{name}.wav"))
+}
+
+/// The file a sound setting's value plays: the system's sound (macOS's, or Windows'), a Twilight sound, or a sound
 /// imported into `home` (`MIDNA_HOME`). None: `none`, or a file that isn't there.
 pub fn sound_file(home: &std::path::Path, value: &str) -> Option<std::path::PathBuf> {
     if let Some(p) = system_sound_path(value) {

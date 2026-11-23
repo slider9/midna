@@ -199,7 +199,7 @@ pub fn served_by(d: &Daemon, p: LinksServedByParams) -> R {
     use std::sync::{LazyLock, Mutex};
     use std::time::Instant;
     static CACHE: LazyLock<Mutex<HashMap<u16, (Instant, Option<ServedBy>)>>> = LazyLock::new(Default::default);
-    let port = local_port(&p.url).ok_or_else(|| RpcError::bad_params(format!("not an http(s) link to this Mac: {}", p.url)))?;
+    let port = local_port(&p.url).ok_or_else(|| RpcError::bad_params(format!("not an http(s) link to this {}: {}", midna_proto::wording::MAC, p.url)))?;
     if let Some((at, hit)) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&port) {
         if at.elapsed() < SERVED_BY_TTL {
             return ok(hit.clone());
@@ -415,7 +415,7 @@ pub fn preview(p: LinksPreviewParams) -> R {
     use midna_proto::preview_cmd;
     if let Some(argv) = &p.preview {
         if !was_issued(&p.target, argv) {
-            return Err(RpcError::refused(format!("not a preview command this Mac's link patterns gave for {}", p.target)));
+            return Err(RpcError::refused(format!("not a preview command this {}'s link patterns gave for {}", midna_proto::wording::MAC, p.target)));
         }
         let out = preview_cmd::run_pattern(argv, user_path(), preview_cmd::PATTERN_TIMEOUT);
         return app_card(out, &p.target);

@@ -440,7 +440,7 @@ pub fn system_load(v: &Value) {
         (true, false) => ", because of other apps: agents carry on",
         _ => "",
     };
-    println!("CPU {cpu}% of the Mac: midna's terminals {midna}%, other apps {}%; {state}{cause} (busy at {}%, setting system.busy_cpu)", cpu.saturating_sub(midna), v["busy_cpu_at"]);
+    println!("CPU {cpu}% of the {}: midna's terminals {midna}%, other apps {}%; {state}{cause} (busy at {}%, setting system.busy_cpu)", midna_proto::wording::MAC, cpu.saturating_sub(midna), v["busy_cpu_at"]);
     let upgrades = if v["busy"].as_bool() == Some(true) { "high: daemon upgrades wait" } else { "fine for upgrades" };
     println!(
         "load {:.2} {:.2} {:.2} on {cpus} cores: {}% per core, {upgrades} (at {}%, setting system.busy_load)",
@@ -494,7 +494,7 @@ pub fn system_load(v: &Value) {
     }
     let system = v["system_percent"].as_u64().unwrap_or(0);
     if system > 0 {
-        println!("macOS and other users' processes: {system}%");
+        println!("{} and other users' processes: {system}%", midna_proto::wording::os("macOS", "Windows"));
     }
     if !top.is_empty() {
         println!("pause one with `midna system pause <terminal>`, stop what it started with `midna system stop <terminal>`");

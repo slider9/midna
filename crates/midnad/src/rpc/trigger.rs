@@ -41,11 +41,11 @@ pub(crate) fn validate(d: &Daemon, t: &Trigger) -> Result<(), RpcError> {
         }));
     }
     if action.acts_on_terminal() && !local {
-        return Err(RpcError::bad_params(format!("{} acts on a terminal on this Mac, so it needs source local", crate::local::action_name(action))));
+        return Err(RpcError::bad_params(format!("{} acts on a terminal on this {}, so it needs source local", crate::local::action_name(action), midna_proto::wording::MAC)));
     }
     if let Some(to) = action.to() {
         if !local {
-            return Err(RpcError::bad_params("to names a terminal on this Mac, so it needs source local"));
+            return Err(RpcError::bad_params(midna_proto::wording::os("to names a terminal on this Mac, so it needs source local", "to names a terminal on this PC, so it needs source local")));
         }
         if to.trim().is_empty() {
             return Err(RpcError::bad_params("to must name a terminal (its name or session id), or be left out"));

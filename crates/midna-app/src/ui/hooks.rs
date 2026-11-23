@@ -145,7 +145,7 @@ pub fn render(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> Option
     let primary = if sheet.uninstall || s == Summary::Current {
         None
     } else {
-        Some(if s == Summary::NeedsReinstall { "Reinstall hooks  ↩" } else { "Install hooks  ↩" })
+        Some(if s == Summary::NeedsReinstall { midna_proto::wording::os("Reinstall hooks  ↩", "Reinstall hooks") } else { midna_proto::wording::os("Install hooks  ↩", "Install hooks") })
     };
     let busy = sheet.busy;
     let card = div()

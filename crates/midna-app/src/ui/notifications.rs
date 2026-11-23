@@ -215,7 +215,7 @@ pub fn render(m: &mut MainWindow, t: &Theme, _window: &mut Window, cx: &mut Cont
     let list = shown(m);
     let cur = m.inbox.sel.and_then(|s| list.iter().copied().find(|i| i.seq == s)).or(list.first().copied()).cloned();
     let nearby = m.inbox.tab == Tab::Nearby;
-    let hint = if !nearby && cur.as_ref().is_some_and(|c| terminal(m, c).is_some()) { "↑↓ move · ↵ go to terminal · esc back" } else { "↑↓ move · esc back" };
+    let hint = if !nearby && cur.as_ref().is_some_and(|c| terminal(m, c).is_some()) { midna_proto::wording::os("↑↓ move · ↵ go to terminal · esc back", "↑↓ move · Enter go to terminal · Esc back") } else { midna_proto::wording::os("↑↓ move · esc back", "↑↓ move · Esc back") };
     let new_n = m.inbox.items.iter().filter(|i| is_new(m, i)).count();
     let subtitle = match new_n {
         0 => "Everything midna told you, newest first".to_string(),

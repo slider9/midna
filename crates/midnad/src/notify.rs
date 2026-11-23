@@ -585,8 +585,9 @@ pub fn play(d: &Daemon, session: Option<Id>, what: &str, volume: Option<u8>, rat
                 return Ok(NotifyPlayResult { played: false, sound: name, reason: Some("no_sound".into()) });
             }
             return Err(format!(
-                "no sound or kind `{what}`: a kind (approval, approved, …), a Twilight sound ({}), a macOS sound ({}) or a sound from `midna notify media`",
+                "no sound or kind `{what}`: a kind (approval, approved, …), a Twilight sound ({}), a {} sound ({}) or a sound from `midna notify media`",
                 notify::TWILIGHT.join(", "),
+                notify::SYSTEM_SET_NAME,
                 notify::SYSTEM_SOUNDS.join(", ")
             ));
         };

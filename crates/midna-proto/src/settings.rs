@@ -241,14 +241,23 @@ macro_rules! s {
 }
 
 /// A notification category's sound, volume and image (see `notify::{sound_key, volume_key, image_key}`).
+/// The options are `none`, the Twilight sounds and the system's (`notify::SYSTEM_SOUNDS`).
+#[cfg(not(windows))]
 const SOUNDS: SettingKind = en_path(&[
     "none", "Portal", "Call", "Uh-oh", "Strum", "Hm", "Rise", "Nn-nn", "Whoosh", "Fwip", "Close", "Tick", "Thump", "Tick-tick", "Settle", "Fall", "Step", "Tap-tap", "Tock", "Cascade", "Drop", "Basso", "Blow", "Bottle", "Frog", "Funk",
     "Glass", "Hero", "Morse", "Ping", "Pop", "Purr", "Sosumi", "Submarine", "Tink",
 ]);
+#[cfg(windows)]
+const SOUNDS: SettingKind = en_path(&[
+    "none", "Portal", "Call", "Uh-oh", "Strum", "Hm", "Rise", "Nn-nn", "Whoosh", "Fwip", "Close", "Tick", "Thump", "Tick-tick", "Settle", "Fall", "Step", "Tap-tap", "Tock", "Cascade", "Drop",
+    "Windows Notify System Generic", "Windows Notify Messaging", "Windows Notify Email", "Windows Notify Calendar", "Windows Notify", "Windows Ding", "Windows Background",
+    "Windows Exclamation", "Windows Proximity Notification", "Windows Message Nudge", "chimes", "chord", "ding", "notify", "tada",
+]);
 macro_rules! snd {
     ($cat:literal, $def:literal) => {
         s!(concat!("notify.sound.", $cat), SOUNDS, S($def), "notifications", false,
-            concat!("Sound for “notify.", $cat, "”: none, one of midna's Twilight sounds (Portal, Call, …), a macOS sound (Glass, Ping, …) or a sound imported with `midna notify import <file>` (by its file name)."))
+            os(concat!("Sound for “notify.", $cat, "”: none, one of midna's Twilight sounds (Portal, Call, …), a macOS sound (Glass, Ping, …) or a sound imported with `midna notify import <file>` (by its file name)."),
+                concat!("Sound for “notify.", $cat, "”: none, one of midna's Twilight sounds (Portal, Call, …), a Windows sound (Windows Notify, chimes, …) or a WAV imported with `midna notify import <file>` (by its file name).")))
     };
 }
 macro_rules! vol {
@@ -332,7 +341,7 @@ static CUSTOM_KIND: &[SettingSpec] = &[
     s!("notify.push.<kind>", SettingKind::Bool, B(true), "notifications", false,
         os("Show this kind as a macOS banner (with its sound) for a terminal you aren't looking at. Off: it's still recorded, just not pushed.", "Show this kind as a Windows notification (with its sound) for a terminal you aren't looking at. Off: it's still recorded, just not pushed.")),
     s!("notify.push_focused.<kind>", SettingKind::Bool, B(false), "notifications", false, os("Show this kind as a macOS banner for the terminal you're looking at too.", "Show this kind as a Windows notification for the terminal you're looking at too.")),
-    s!("notify.sound.<kind>", SOUNDS, S("Hm"), "notifications", false, "Sound for this kind: none, a Twilight sound, a macOS sound or an imported sound."),
+    s!("notify.sound.<kind>", SOUNDS, S("Hm"), "notifications", false, os("Sound for this kind: none, a Twilight sound, a macOS sound or an imported sound.", "Sound for this kind: none, a Twilight sound, a Windows sound or an imported sound.")),
     SettingSpec { range: Some((0, 100)), ..s!("notify.volume.<kind>", SettingKind::Int, I(100), "notifications", false, "How loud this kind plays, 0–100 (scaled by notify.volume).") },
     s!("notify.image.<kind>", SettingKind::String, S(""), "notifications", false, "Image on this kind's notifications: empty = notify.image, none, or an imported image."),
     s!("notify.title.<kind>", SettingKind::String, S(""), "notifications", false, "Title of this kind's notifications, as a template: empty = midna's own ({{heading}}: the terminal · its project). {{title}} and {{body}} are what was sent."),
@@ -757,9 +766,9 @@ pub static SETTINGS: &[SettingSpec] = &[
     SettingSpec { range: Some((0, 8)), ..s!("guard.model_slots", SettingKind::Int, I(1), "general", true,
         os("Most local model runs (mflux, MLX tools like mlx_lm and mlx_audio, ollama run/pull, llama.cpp, Hugging Face downloads, Python loading a model) that run at once across every terminal, in their own line apart from guard.build_slots. Each can take many GB of memory, and two at once can run a Mac out of it. Another one waits in line before it starts. 0 = no limit.", "Most local model runs (mflux, MLX tools like mlx_lm and mlx_audio, ollama run/pull, llama.cpp, Hugging Face downloads, Python loading a model) that run at once across every terminal, in their own line apart from guard.build_slots. Each can take many GB of memory, and two at once can run a PC out of it. Another one waits in line before it starts. 0 = no limit.")) },
     s!("guard.panic_hold", SettingKind::Bool, B(true), "general", true,
-        os("When the Mac comes back from a kernel panic, raise a needs-you saying what each terminal was running before it went down, and until you dismiss it, don't let agents start on their own: triggers, other agents and apps like the task board can't open or restart an agent terminal. You still can. Human only.", "When a Mac comes back from a kernel panic, raise a needs-you saying what each terminal was running before it went down, and until you dismiss it, don't let agents start on their own: triggers, other agents and apps like the task board can't open or restart an agent terminal. You still can. Kernel panics are only noticed on macOS: on Windows this does nothing yet. Human only.")),
+        os("When the Mac comes back from a kernel panic, raise a needs-you saying what each terminal was running before it went down, and until you dismiss it, don't let agents start on their own: triggers, other agents and apps like the task board can't open or restart an agent terminal. You still can. Human only.", "After a crash that restarted the computer, raise a needs-you saying what each terminal was running before it went down, and until you dismiss it, don't let agents start on their own: triggers, other agents and apps like the task board can't open or restart an agent terminal. You still can. Not on Windows yet: midna doesn't notice a crash there, so this does nothing. Human only.")),
     SettingSpec { range: Some((0, 5000)), ..s!("guard.hold_agents_at", SettingKind::Int, I(300), "general", true,
-        os("While the Mac's load average is at least this far above its core count (load per core, in percent: 300 = three times as much work waiting as cores to run it) and its CPU is busy (system.busy_cpu), agent terminals that agents, triggers and apps like the task board open wait their turn: the terminal opens at once with the status Waiting for the Mac, and its agent starts once the load drops under 80% of this, one every 10 seconds, first opened first. Ctrl-C in the terminal starts it now. Agents you open start anyway, with a warning. 0 = never hold them. Human only.", "While the PC's load (see system.busy_load) is at least this far above its core count (load per core, in percent: 300 = three times as much work waiting as cores to run it) and its CPU is busy (system.busy_cpu), agent terminals that agents, triggers and apps like the task board open wait their turn: the terminal opens at once with the status Waiting for the Mac, and its agent starts once the load drops under 80% of this, one every 10 seconds, first opened first. Ctrl-C in the terminal starts it now. Agents you open start anyway, with a warning. 0 = never hold them. Human only.")) },
+        os("While the Mac's load average is at least this far above its core count (load per core, in percent: 300 = three times as much work waiting as cores to run it) and its CPU is busy (system.busy_cpu), agent terminals that agents, triggers and apps like the task board open wait their turn: the terminal opens at once with the status Waiting for the Mac, and its agent starts once the load drops under 80% of this, one every 10 seconds, first opened first. Ctrl-C in the terminal starts it now. Agents you open start anyway, with a warning. 0 = never hold them. Human only.", "While the PC's load (see system.busy_load) is at least this far above its core count (load per core, in percent: 300 = three times as much work waiting as cores to run it) and its CPU is busy (system.busy_cpu), agent terminals that agents, triggers and apps like the task board open wait their turn: the terminal opens at once with the status Waiting for the PC, and its agent starts once the load drops under 80% of this, one every 10 seconds, first opened first. Ctrl-C in the terminal starts it now. Agents you open start anyway, with a warning. 0 = never hold them. Human only.")) },
     s!("cleanup.enabled", SettingKind::Bool, B(true), "agents", false,
         "When a terminal closes, have a cheap headless model (cleanup.model) clean up what it left behind: the items in cleanup.items. It removes only what is safe (merged, pushed, nothing uncommitted), never touches cleanup.keep, and says what it kept and why. `midna cleanup runs` lists what it did; `midna close --no-cleanup` skips it once."),
     s!("cleanup.sessions", en(&["agents", "all"]), S("agents"), "agents", false,
@@ -787,7 +796,7 @@ pub static SETTINGS: &[SettingSpec] = &[
     s!("finder.quick_action", SettingKind::Bool, B(true), "general", false,
         os("Show \"Open in Midna\", with Midna's icon, when you right-click a folder in Finder: it opens a terminal in that folder. It's midna's Finder extension, the same switch as System Settings › Login Items & Extensions › Finder.", "Show \"Open in Midna\" when you right-click a folder in File Explorer, to open a terminal there. Not on Windows yet: this does nothing there.")),
     s!("terminal.option_as_meta", SettingKind::Bool, B(true), "terminal", false,
-        "Option (alt) acts as Meta in terminals: option-b sends ESC b (word back in shells). Off = option types macOS characters (option-e e = é)."),
+        os("Option (alt) acts as Meta in terminals: option-b sends ESC b (word back in shells). Off = option types macOS characters (option-e e = é).", "Alt acts as Meta in terminals: Alt+B sends ESC b (word back in shells). Off = Alt+key goes in as the key's own text, without the ESC. AltGr always types its characters.")),
     s!("terminal.cmd_enter_sends", SettingKind::Bool, B(false), "terminal", false,
         os("In Claude Code's and Codex's input, ⌘↩ sends and ↩ starts a new line, as ⇧↩ does. ↩ still confirms the agent's menus, and ⌘↩ still approves a pending approval first (keys.approve). Other terminals are unchanged.", "In Claude Code's and Codex's input, Ctrl+Enter sends and Enter starts a new line, as Shift+Enter does. Enter still confirms the agent's menus, and Ctrl+Enter still approves a pending approval first (keys.approve). Other terminals are unchanged.")),
     s!("terminal.link_preview", en(&["hover", "cmd", "off"]), S("hover"), "terminal", false,
@@ -889,11 +898,11 @@ pub static SETTINGS: &[SettingSpec] = &[
     SettingSpec { range: Some((0, 4000)), ..s!("notify.badge.inset_y", SettingKind::Int, I(14), "notifications", false,
         os("How far the badge sits from the top or bottom of the screen (below the menu bar, above the Dock), in points.", "How far the badge sits from the top or bottom of the screen (clear of the taskbar), in points.")) },
     s!("notify.badge.sharing", en(&["hide", "count", "show"]), S("hide"), "notifications", false,
-        "While your screen is being shared or recorded: hide = no badge until it stops (what came in is counted; the lines aren't replayed), count = the badge and its number only, no lines and no text, show = as usual. midna asks macOS whether something is watching the screen, so it covers Zoom, Meet, Teams, screen recording and Screen Sharing."),
+        os("While your screen is being shared or recorded: hide = no badge until it stops (what came in is counted; the lines aren't replayed), count = the badge and its number only, no lines and no text, show = as usual. midna asks macOS whether something is watching the screen, so it covers Zoom, Meet, Teams, screen recording and Screen Sharing.", "What screen shares and recordings see of the badge. Windows can't tell midna when the screen is shared, so hide and count keep the badge out of every capture and share (Zoom, Meet, Teams, screenshots, recordings) while it stays on your screen as usual; show lets them see it.")),
     s!("notify.badge.idle", SettingKind::Bool, B(false), "notifications", false,
         "Keep the floating badge out when nothing is waiting (it shows 0) instead of hiding it until something comes in (notify.badge always keeps it out regardless). notify.badge off and screen sharing still hide it."),
     s!("notify.when_app_closed", SettingKind::Bool, B(true), "notifications", false,
-        "When the midna app isn't running, midnad posts the notification itself (shown as a system notification; clicking it doesn't open midna)."),
+        os("When the midna app isn't running, midnad posts the notification itself (shown as a system notification; clicking it doesn't open midna).", "When the midna app isn't running, midnad posts the notification itself, as a Windows notification; clicking it starts midna.")),
     s!("keys.command_bar", KB, keys("cmd-k", "ctrl-shift-k"), "keys", false, "Open the command bar."),
     s!("keys.next_needs_you", KB, keys("cmd-j", "ctrl-shift-j"), "keys", false,
         os("Jump to the newest needs-you item on the Mac whose window is in front (this Mac's, or the other Mac's in its window); in the needs-you cards, the next card.", "Jump to the newest needs-you item; in the needs-you cards, the next card.")),
@@ -1030,6 +1039,19 @@ mod tests {
         let SettingKind::Enum { options, .. } = setting("notify.sound.approval").unwrap().ty else { panic!() };
         let builtin: Vec<&str> = crate::notify::TWILIGHT.iter().chain(crate::notify::SYSTEM_SOUNDS).copied().collect();
         assert_eq!(&options[1..], builtin.as_slice());
+    }
+
+    /// Off macOS no setting's description names the Mac, macOS, Finder or a Mac key, except
+    /// Nearby's, which isn't on Windows yet.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn descriptions_say_this_platforms_words() {
+        for s in SETTINGS.iter().filter(|s| !s.key.starts_with("nearby.") && !s.key.ends_with(".nearby")) {
+            assert_eq!(crate::wording::mac_words(s.description), None, "{}: {}", s.key, s.description);
+        }
+        for e in crate::notify::EFFECTS {
+            assert_eq!((crate::wording::mac_words(e.label), crate::wording::mac_words(e.description)), (None, None), "{}", e.key);
+        }
     }
 
     #[test]
