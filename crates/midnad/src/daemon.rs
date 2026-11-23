@@ -330,6 +330,10 @@ impl Daemon {
     }
 
     pub fn save_now(&self) {
+        // A handover wrote the state the next midnad loads (`upgrade::hold`).
+        if crate::upgrade::held() {
+            return;
+        }
         let snapshot = self.core().state.clone();
         if let Err(e) = snapshot.save(&paths::state_path(&self.cfg.home)) {
             eprintln!("midnad: saving state failed: {e}");
@@ -343,7 +347,7 @@ impl Daemon {
     }
 
     pub fn emit(&self, kind: &str, actor: Actor, project: Option<Id>, session: Option<Id>, data: Value) -> Event {
-        self.log.append(kind, actor, project, session, data)
+        crate::upgrade::emit(&self.log, kind, actor, project, session, data)
     }
 
     pub fn setting(&self, key: &str) -> Value {

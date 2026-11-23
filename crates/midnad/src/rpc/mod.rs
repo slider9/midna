@@ -249,6 +249,8 @@ pub fn ok<T: serde::Serialize>(v: T) -> R {
 }
 
 pub fn call(d: &Arc<Daemon>, ctx: &Ctx, method: &str, mut params: Value) -> R {
+    // A handover holds what this midnad would change (Windows: `upgrade::hold`).
+    crate::upgrade::wait_while_held();
     let Some(spec) = midna_proto::method(method) else {
         return Err(RpcError::new(UNKNOWN_METHOD, format!("unknown method `{method}`; call rpc.discover for the catalog")));
     };

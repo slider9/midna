@@ -20,21 +20,43 @@
 //! WATCHDOG_MAX), or is killed then, the watchdog itself execs the old binary with `--resume --fallback` on the
 //! same handoff. It holds the fds, so the terminals survive; the shells are no longer the
 //! daemon's children, so exits are tracked with kqueue and carry no exit code.
+//!
+//! Windows has no exec: its handover starts a new midnad beside the old one, which attaches to
+//! each terminal's keeper (`upgrade_windows.rs`). What both share is here; the rest of this file
+//! is Unix only.
 use crate::daemon::{Config, Daemon};
-use crate::engine::{Engine, TermSnap};
+use crate::engine::Engine;
+#[cfg(unix)]
+use crate::engine::TermSnap;
+#[cfg(unix)]
 use crate::term::{self, EngineMsg};
 use midna_proto::*;
+#[cfg(unix)]
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(unix)]
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::ffi::CString;
+#[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+#[path = "upgrade_windows.rs"]
+mod windows;
+#[cfg(windows)]
+pub use windows::*;
+
+/// The handoff format this binary writes and resumes (`handoff.json`). Each OS has its own: a
+/// Mac's holds fds, Windows' the terminals' keepers.
 pub const HANDOFF_VERSION: u32 = 1;
 const SELFTEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_WATCHDOG_SECS: u64 = 10;
@@ -47,6 +69,67 @@ pub fn watchdog_secs(load1: f64, cpus: u32) -> u64 {
     ((DEFAULT_WATCHDOG_SECS as f64 * per_core.max(1.)).ceil() as u64).min(60)
 }
 
+/// How long the new image gets to resume: `MIDNA_UPGRADE_WATCHDOG_SECS`, else by the load.
+fn watchdog_budget() -> u64 {
+    std::env::var("MIDNA_UPGRADE_WATCHDOG_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+        let (load1, _, _) = crate::guard::loadavg();
+        watchdog_secs(load1, crate::guard::cpus())
+    })
+}
+
+/// Set while a handover has written the state and event log the next midnad loads (Windows: the
+/// old midnad runs on beside the new one until that one has resumed). While it holds, this midnad
+/// saves nothing, every RPC waits (`wait_while_held`) and every event waits (`emit`): a handover
+/// that goes through drops them with this process, one that fails lets them go (`release`).
+static HELD: AtomicBool = AtomicBool::new(false);
+/// The events emitted while held, in order. Its lock also orders `emit` against `release`.
+static HELD_EVENTS: Mutex<Vec<(String, Actor, Option<Id>, Option<Id>, Value)>> = Mutex::new(vec![]);
+
+fn held_events() -> std::sync::MutexGuard<'static, Vec<(String, Actor, Option<Id>, Option<Id>, Value)>> {
+    HELD_EVENTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn hold() {
+    let _order = held_events();
+    HELD.store(true, Ordering::SeqCst);
+}
+
+pub fn held() -> bool {
+    HELD.load(Ordering::SeqCst)
+}
+
+/// A handover that failed: append the events it held back, then let everything go on.
+pub fn release(log: &crate::eventlog::EventLog) {
+    let mut evs = held_events();
+    for (kind, actor, project, session, data) in evs.drain(..) {
+        log.append(&kind, actor, project, session, data);
+    }
+    HELD.store(false, Ordering::SeqCst);
+}
+
+/// `Daemon::emit`: append the event, or, while a handover holds, keep it back (returned with seq
+/// 0, its place in the log not known yet): the next midnad hands out the seqs after the handoff's.
+pub fn emit(log: &crate::eventlog::EventLog, kind: &str, actor: Actor, project: Option<Id>, session: Option<Id>, data: Value) -> Event {
+    let mut evs = held_events();
+    if !held() {
+        drop(evs);
+        return log.append(kind, actor, project, session, data);
+    }
+    let e = Event { seq: 0, at: time::now_rfc3339(), kind: kind.into(), actor: actor.clone(), project_id: project.clone(), session_id: session.clone(), data: data.clone(), stream: None };
+    evs.push((kind.into(), actor, project, session, data));
+    e
+}
+
+/// Every RPC, first: wait while a handover holds. Once it has gone through this process exits,
+/// closing the connection, and the client retries on the next midnad; once it has failed the
+/// call goes on here.
+pub fn wait_while_held() {
+    while held() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Handoff {
     pub version: u32,
@@ -69,6 +152,7 @@ pub struct Handoff {
     pub sessions: Vec<HandoffSession>,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HandoffSession {
     pub id: Id,
@@ -96,6 +180,7 @@ fn log(msg: &str) {
     eprintln!("midnad[{}]: {msg}", std::process::id());
 }
 
+#[cfg(unix)]
 fn set_cloexec(fd: RawFd, on: bool) {
     unsafe {
         let f = libc::fcntl(fd, libc::F_GETFD);
@@ -105,6 +190,7 @@ fn set_cloexec(fd: RawFd, on: bool) {
     }
 }
 
+#[cfg(unix)]
 fn fd_rdev(fd: RawFd) -> Option<(u16, u64)> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_mode & libc::S_IFMT, st.st_rdev as u64))
@@ -113,7 +199,8 @@ fn fd_rdev(fd: RawFd) -> Option<(u16, u64)> {
 // ---------------------------------------------------------------- selftest
 
 /// `midnad --selftest`: prove this binary can run a terminal engine and round-trip a
-/// snapshot, and say which handoff formats it can resume.
+/// snapshot, and say which handoff formats it can resume (on Windows also which restart plans it
+/// can reopen: `upgrade_windows.rs`).
 pub fn selftest() -> Result<Value, String> {
     let mut e = Engine::new(40, 6, None);
     e.feed(b"selftest \x1b[1;32mok\x1b[0m\r\n\x1b]2;midna\x07\x1b[?1049halt\x1b[2;3H\x1b[3", 0);
@@ -122,11 +209,14 @@ pub fn selftest() -> Result<Value, String> {
     if r.plain_lines() != e.plain_lines() || r.cursor() != e.cursor() || r.title() != "midna" {
         return Err("terminal snapshot round-trip mismatch".into());
     }
-    Ok(json!({ "ok": true, "version": midna_proto::VERSION, "pid": std::process::id(), "handoff_versions": [HANDOFF_VERSION] }))
+    let mut v = json!({ "ok": true, "version": midna_proto::VERSION, "pid": std::process::id(), "handoff_versions": [HANDOFF_VERSION] });
+    #[cfg(windows)]
+    windows::selftest_formats(&mut v);
+    Ok(v)
 }
 
-/// Run `<bin> --selftest` (bounded) and check it can resume our handoff format.
-pub fn run_selftest(bin: &Path) -> Result<Value, String> {
+/// Run `<bin> --selftest` (bounded): what it printed, once it says it's ok.
+fn selftest_of(bin: &Path) -> Result<Value, String> {
     let mut child = std::process::Command::new(bin)
         .arg("--selftest")
         .stdin(std::process::Stdio::null())
@@ -157,8 +247,19 @@ pub fn run_selftest(bin: &Path) -> Result<Value, String> {
     if v["ok"] != json!(true) {
         return Err(format!("--selftest reported failure: {v}"));
     }
-    let supported = v["handoff_versions"].as_array().is_some_and(|a| a.iter().any(|x| x.as_u64() == Some(HANDOFF_VERSION as u64)));
-    if !supported {
+    Ok(v)
+}
+
+/// Does a selftest's `key` (`handoff_versions`, `relaunch_versions`) list `version`?
+fn lists(v: &Value, key: &str, version: u32) -> bool {
+    v[key].as_array().is_some_and(|a| a.iter().any(|x| x.as_u64() == Some(version as u64)))
+}
+
+/// Run `<bin> --selftest` (bounded) and check it can resume our handoff format.
+#[cfg(unix)]
+pub fn run_selftest(bin: &Path) -> Result<Value, String> {
+    let v = selftest_of(bin)?;
+    if !lists(&v, "handoff_versions", HANDOFF_VERSION) {
         return Err(format!("new binary can't resume handoff format {HANDOFF_VERSION}: {v}"));
     }
     Ok(v)
@@ -166,10 +267,27 @@ pub fn run_selftest(bin: &Path) -> Result<Value, String> {
 
 // ---------------------------------------------------------------- upgrade (old image)
 
+/// BUSY while the load is at or above `system.busy_load` (guard.rs), unless `force`: under that
+/// load the handoff can time out.
+fn refuse_if_busy(d: &Daemon, bin: &Path, reason: &str, force: bool) -> Result<(), RpcError> {
+    let Some(l) = crate::guard::busy(d).filter(|_| !force) else { return Ok(()) };
+    let msg = format!(
+        "the {} is busy (load {:.1} on {} cores, {}% of system.busy_load {}%): the {reason} waits until it calms down, \
+         because under this load the handoff can time out and hang up every terminal. Pass force to {reason} anyway",
+        midna_proto::wording::MAC,
+        l.load1,
+        l.cpus,
+        l.load_percent,
+        l.busy_at
+    );
+    d.emit(kinds::DAEMON_UPGRADE_POSTPONED, Actor::system(), None, None, json!({ "to": bin, "reason": reason, "load1": l.load1, "cpus": l.cpus, "load_percent": l.load_percent, "busy_at": l.busy_at }));
+    Err(RpcError::new(midna_proto::error::BUSY, msg).with_data(json!(l)))
+}
+
 /// The binary `daemon.restart` / SIGTERM re-exec: `MIDNA_HOME/bin/current/midnad` when we run
 /// from the installed location, else our own executable (which may have been rebuilt).
 pub fn restart_binary(cfg: &Config) -> PathBuf {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("midnad"));
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(if cfg!(windows) { "midnad.exe" } else { "midnad" }));
     let current = crate::install::current_binary(&cfg.home);
     let installed_root = std::fs::canonicalize(cfg.home.join("bin")).unwrap_or_else(|_| cfg.home.join("bin"));
     let exe_canon = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
@@ -182,24 +300,13 @@ pub fn restart_binary(cfg: &Config) -> PathBuf {
 /// `daemon.upgrade` / `daemon.restart`: selftest now (errors go to the caller), then hand off
 /// on a separate thread shortly after, so the caller's answer is flushed before the exec.
 /// Refused with BUSY while the Mac is busy, unless `force`.
+#[cfg(unix)]
 pub fn request(d: &Arc<Daemon>, bin: &Path, reason: &str, force: bool) -> Result<Value, RpcError> {
     if !d.cfg.owns_process {
         return Err(RpcError::conflict("this daemon runs inside another process (tests); it can't re-exec"));
     }
     let bin = std::fs::canonicalize(bin).map_err(|e| RpcError::bad_params(format!("{}: {e}", bin.display())))?;
-    if !force && let Some(l) = crate::guard::busy(d) {
-        let msg = format!(
-            "the {} is busy (load {:.1} on {} cores, {}% of system.busy_load {}%): the {reason} waits until it calms down, \
-             because under this load the handoff can time out and hang up every terminal. Pass force to {reason} anyway",
-            midna_proto::wording::MAC,
-            l.load1,
-            l.cpus,
-            l.load_percent,
-            l.busy_at
-        );
-        d.emit(kinds::DAEMON_UPGRADE_POSTPONED, Actor::system(), None, None, json!({ "to": bin, "reason": reason, "load1": l.load1, "cpus": l.cpus, "load_percent": l.load_percent, "busy_at": l.busy_at }));
-        return Err(RpcError::new(midna_proto::error::BUSY, msg).with_data(json!(l)));
-    }
+    refuse_if_busy(d, &bin, reason, force)?;
     if d.upgrading.swap(true, Ordering::SeqCst) {
         return Err(RpcError::conflict("an upgrade is already in progress"));
     }
@@ -225,6 +332,7 @@ pub fn request(d: &Arc<Daemon>, bin: &Path, reason: &str, force: bool) -> Result
 }
 
 /// Graceful restart on SIGTERM (synchronous). Returns only on failure.
+#[cfg(unix)]
 pub fn restart_now(d: &Arc<Daemon>, reason: &str) -> String {
     if d.upgrading.swap(true, Ordering::SeqCst) {
         return "an upgrade is already in progress".into();
@@ -240,6 +348,7 @@ pub fn restart_now(d: &Arc<Daemon>, reason: &str) -> String {
 
 /// Snapshot, write the handoff, start the watchdog and execv. Returns only on failure, with
 /// everything put back (readers resumed, CLOEXEC restored, watchdog killed, handoff removed).
+#[cfg(unix)]
 pub fn handoff_and_exec(d: &Arc<Daemon>, bin: &Path, reason: &str) -> String {
     let t0 = Instant::now();
     let _spawns = crate::pty::spawn_lock();
@@ -300,10 +409,7 @@ pub fn handoff_and_exec(d: &Arc<Daemon>, bin: &Path, reason: &str) -> String {
             app_path: d.cfg.app_path.clone(),
             listener_fd: listener,
             event_seq: d.log.seq(),
-            watchdog_secs: std::env::var("MIDNA_UPGRADE_WATCHDOG_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
-                let (load1, _, _) = crate::guard::loadavg();
-                watchdog_secs(load1, crate::guard::cpus())
-            }),
+            watchdog_secs: watchdog_budget(),
             sessions,
         };
         let path = dir.join("handoff.json");
@@ -360,6 +466,7 @@ pub fn handoff_and_exec(d: &Arc<Daemon>, bin: &Path, reason: &str) -> String {
 // ---------------------------------------------------------------- resume (new image)
 
 /// A handoff read back, with the VT blobs loaded and every fd checked.
+#[cfg(unix)]
 pub struct Resume {
     pub handoff: Handoff,
     pub path: PathBuf,
@@ -367,6 +474,7 @@ pub struct Resume {
     pub fallback: bool,
 }
 
+#[cfg(unix)]
 pub fn load(path: &Path, fallback: bool) -> Result<Resume, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut h: Handoff = serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -382,6 +490,7 @@ pub fn load(path: &Path, fallback: bool) -> Result<Resume, String> {
 }
 
 /// Apply the handoff's paths to the config (the exec'd image got only `--resume`).
+#[cfg(unix)]
 pub fn apply_config(r: &Resume, cfg: &mut Config) {
     cfg.home = PathBuf::from(&r.handoff.home);
     cfg.socket = PathBuf::from(&r.handoff.socket);
@@ -393,6 +502,7 @@ pub fn apply_config(r: &Resume, cfg: &mut Config) {
 }
 
 /// Session ids that survive (fd inherited and still the same PTY) -> live pid.
+#[cfg(unix)]
 pub fn kept_sessions(r: &Resume) -> HashMap<Id, Option<i32>> {
     r.handoff
         .sessions
@@ -402,11 +512,13 @@ pub fn kept_sessions(r: &Resume) -> HashMap<Id, Option<i32>> {
         .collect()
 }
 
+#[cfg(unix)]
 fn fd_ok(s: &HandoffSession) -> bool {
     matches!(fd_rdev(s.fd), Some((mode, rdev)) if mode == libc::S_IFCHR && rdev == s.rdev)
 }
 
 /// The inherited listening socket, if it really is one.
+#[cfg(unix)]
 pub fn inherited_listener(r: &Resume) -> Option<std::os::unix::net::UnixListener> {
     use std::os::fd::FromRawFd;
     let fd = r.handoff.listener_fd;
@@ -420,6 +532,7 @@ pub fn inherited_listener(r: &Resume) -> Option<std::os::unix::net::UnixListener
 }
 
 /// Re-adopt every surviving session and finish the handoff (marker, watchdog, event).
+#[cfg(unix)]
 pub fn adopt_all(d: &Arc<Daemon>, r: &Resume) {
     let mut kept = 0u32;
     let mut lost = vec![];
@@ -492,6 +605,7 @@ pub fn adopt_all(d: &Arc<Daemon>, r: &Resume) {
 
 /// A plain start found a handoff nobody resumed (the fds died with the process that held
 /// them): keep it for inspection and start clean.
+#[cfg(unix)]
 pub fn set_aside_stale(home: &Path) {
     let dir = handoff_dir(home);
     if dir.join("handoff.json").exists() && !dir.join("resumed").exists() {
@@ -507,6 +621,7 @@ pub fn set_aside_stale(home: &Path) {
 
 /// `midnad --upgrade-watchdog <handoff.json>`: wait for the new image to write `resumed`;
 /// if it dies or stalls, become the old daemon again on the same handoff. Never returns.
+#[cfg(unix)]
 pub fn watchdog_main(path: &Path) -> ! {
     let h: Handoff = match std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
         Some(h) => h,

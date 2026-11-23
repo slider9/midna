@@ -11,6 +11,11 @@
 //! exited". Keepers a crashed midnad left are ended when the next one starts
 //! ([`end_leftover_keepers`]), until it can re-attach to them.
 //!
+//! A handover to a new midnad (`upgrade_windows.rs`) leaves the keepers running: the old midnad
+//! lets go of each keeper's control pipe ([`Master::release_control`]) and the new one attaches
+//! to it ([`attach_to`]), taking its own copies of the pipes and the shell. A handover that fails
+//! gives the old one its connection back ([`Master::reconnect_control`]).
+//!
 //! The keeper comes from beside midnad.exe ([`keeper_exe`]); it runs `conpty.dll` from beside
 //! itself when it's there, else Windows' own.
 use super::ENV_SCRUB;
@@ -21,8 +26,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_NO_DATA, GetLastError, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, GetLastError, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject,
@@ -60,10 +66,17 @@ pub struct Owner<'a> {
     pub tied: bool,
 }
 
+/// How long a midnad taking a terminal over waits for its keeper's pipe to be free.
+const ATTACH_WAIT: Duration = Duration::from_secs(5);
+
 /// A terminal, through its keeper: the copies of its pipes and the shell's process.
 pub struct Master {
-    client: Client,
+    /// The keeper's control connection. None while a handover lends it to the next midnad.
+    client: Mutex<Option<Client>>,
+    /// The keeper's control pipe, to connect to again.
+    pipe: String,
     keeper: Arc<OwnedHandle>,
+    keeper_pid: u32,
     input: OwnedHandle,
     output: OwnedHandle,
     process: OwnedHandle,
@@ -74,10 +87,9 @@ pub struct Master {
 
 impl Drop for Master {
     /// A terminal dropped with its shell still running is hung up, as closing its pseudoconsole
-    /// did; midnad handing its terminals over never drops them.
+    /// did; one whose connection a handover gave to the next midnad isn't this one's to hang up.
     fn drop(&mut self) {
-        if !self.ended.load(Ordering::SeqCst) && self.child_alive() {
-            let _ = self.client.hangup();
+        if !self.ended.load(Ordering::SeqCst) && self.child_alive() && self.control(|c| c.hangup()).is_ok() {
             self.wait_keeper(DROP_HANGUP);
         }
     }
@@ -110,6 +122,65 @@ fn raw(h: &OwnedHandle) -> HANDLE {
 }
 
 impl Master {
+    fn new(client: Client, pipe: String, keeper: Arc<OwnedHandle>, keeper_pid: u32, a: client::Attached) -> Master {
+        Master {
+            client: Mutex::new(Some(client)),
+            pipe,
+            keeper,
+            keeper_pid,
+            input: a.input,
+            output: a.output,
+            process: a.process,
+            shell_pid: a.shell_pid,
+            ended: AtomicBool::new(false),
+        }
+    }
+
+    /// Run `f` on the keeper's control connection: NotConnected while a handover lends it out.
+    fn control<T>(&self, f: impl FnOnce(&Client) -> std::io::Result<T>) -> std::io::Result<T> {
+        match self.client.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(c) => f(c),
+            None => Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "the keeper's connection is handed over")),
+        }
+    }
+
+    /// The keeper's pid, which a handover passes to the next midnad.
+    pub fn keeper_pid(&self) -> u32 {
+        self.keeper_pid
+    }
+
+    /// The keeper's control pipe.
+    pub fn pipe_name(&self) -> &str {
+        &self.pipe
+    }
+
+    /// Let go of the keeper's control connection, so the next midnad can attach (a keeper serves
+    /// one client at a time). The pipes and the shell's process stay ours, so the terminal keeps
+    /// running and a failed handover only has to connect again.
+    pub fn release_control(&self) {
+        drop(self.client.lock().unwrap_or_else(|e| e.into_inner()).take());
+    }
+
+    /// Connect to the keeper again after a handover that failed (the next midnad is gone, so the
+    /// pipe is free again, or soon is).
+    pub fn reconnect_control(&self) -> std::io::Result<()> {
+        let mut slot = self.client.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            return Ok(());
+        }
+        let c = Client::connect(&self.pipe, ATTACH_WAIT)?;
+        c.hello()?;
+        *slot = Some(c);
+        Ok(())
+    }
+
+    /// Make a read waiting on the output give up, with nothing taken ([`read`](Self::read)
+    /// returns Interrupted): a handover pauses the readers so the next midnad reads on from
+    /// where this one stopped.
+    pub fn cancel_read(&self) {
+        unsafe { CancelIoEx(raw(&self.output), std::ptr::null()) };
+    }
+
     /// Write everything, in order (a full pipe blocks until the console host reads).
     pub fn write_all(&self, b: &[u8]) -> bool {
         write_handle(raw(&self.input), b)
@@ -122,7 +193,7 @@ impl Master {
     /// Once the shell has exited the keeper has closed the pseudoconsole and says so; nothing
     /// to resize then.
     pub fn resize(&self, cols: u16, rows: u16) {
-        let _ = self.client.resize(cols, rows);
+        let _ = self.control(|c| c.resize(cols, rows));
     }
 
     /// Reads block (no readiness poll); the reader pause only matters to Unix upgrades.
@@ -131,7 +202,7 @@ impl Master {
     }
 
     /// Ok(0) once the console host has closed its end (the keeper closed the pseudoconsole, or
-    /// died).
+    /// died). Interrupted when [`cancel_read`](Self::cancel_read) cut it short.
     pub fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut n = 0u32;
         let ok = unsafe { ReadFile(raw(&self.output), buf.as_mut_ptr(), buf.len().min(u32::MAX as usize) as u32, &mut n, std::ptr::null_mut()) };
@@ -139,6 +210,9 @@ impl Master {
             let e = unsafe { GetLastError() };
             if e == ERROR_BROKEN_PIPE || e == ERROR_NO_DATA {
                 return Ok(0);
+            }
+            if e == ERROR_OPERATION_ABORTED {
+                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "read cancelled"));
             }
             return Err(std::io::Error::from_raw_os_error(e as i32));
         }
@@ -152,7 +226,7 @@ impl Master {
         self.ended.store(true, Ordering::SeqCst);
         let m = self.clone();
         let _ = std::thread::Builder::new().name("pty-hangup".into()).spawn(move || {
-            let _ = m.client.hangup();
+            let _ = m.control(|c| c.hangup());
         });
     }
 
@@ -162,7 +236,7 @@ impl Master {
         self.ended.store(true, Ordering::SeqCst);
         let m = self.clone();
         let _ = std::thread::Builder::new().name("pty-hangup".into()).spawn(move || {
-            let _ = m.client.hangup_ending_job();
+            let _ = m.control(|c| c.hangup_ending_job());
         });
     }
 
@@ -174,7 +248,7 @@ impl Master {
     /// at least.
     pub fn kill_all(&self) {
         self.ended.store(true, Ordering::SeqCst);
-        if self.client.kill().is_err() && self.child_alive() {
+        if self.control(|c| c.kill()).is_err() && self.child_alive() {
             self.terminate_shell();
         }
     }
@@ -353,7 +427,7 @@ pub fn spawn(owner: &Owner, argv: &[String], cwd: &str, env: &[(String, String)]
     {
         let mut k = keepers().lock().unwrap_or_else(|e| e.into_inner());
         k.retain(|_, h| unsafe { WaitForSingleObject(raw(h), 0) } == WAIT_TIMEOUT);
-        k.insert(pipe, keeper.clone());
+        k.insert(pipe.clone(), keeper.clone());
     }
     let a = match started.client.attach() {
         Ok(a) => a,
@@ -362,8 +436,36 @@ pub fn spawn(owner: &Owner, argv: &[String], cwd: &str, env: &[(String, String)]
             return Err(std::io::Error::new(e.kind(), format!("terminal keeper: {e}")));
         }
     };
-    let master = Master { client: started.client, keeper, input: a.input, output: a.output, process: a.process, shell_pid: a.shell_pid, ended: AtomicBool::new(false) };
-    Ok(Spawned { master, pid: a.shell_pid as i32 })
+    let pid = a.shell_pid as i32;
+    Ok(Spawned { master: Master::new(started.client, pipe, keeper, started.keeper.pid, a), pid })
+}
+
+/// Take over a terminal that another midnad of `owner.home` started and let go of (a handover):
+/// attach to the keeper of `owner.sid`, which must still run the shell `shell_pid` (one whose
+/// shell has exited, or that a new terminal of the session replaced, isn't that terminal any more).
+pub fn attach_to(owner: &Owner, shell_pid: u32) -> std::io::Result<Spawned> {
+    let pipe = midna_pty::names::pipe_name(owner.home, owner.sid);
+    let fail = |what: &str, e: std::io::Error| std::io::Error::new(e.kind(), format!("keeper of {}: {what}: {e}", owner.sid));
+    let client = Client::connect(&pipe, ATTACH_WAIT).map_err(|e| fail("connect", e))?;
+    let hello = client.hello().map_err(|e| fail("hello", e))?;
+    if hello.shell_pid != Some(shell_pid) || !hello.running {
+        let state = if hello.running { "running" } else { "exited" };
+        return Err(std::io::Error::other(format!("keeper of {}: its shell is {:?} ({state}), not {shell_pid}", owner.sid, hello.shell_pid)));
+    }
+    // It's serving us, so the pid is still the keeper's.
+    let h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, hello.pid) };
+    if h.is_null() {
+        return Err(fail("open its process", std::io::Error::last_os_error()));
+    }
+    let keeper = Arc::new(unsafe { OwnedHandle::from_raw_handle(h) });
+    let a = client.attach().map_err(|e| fail("attach", e))?;
+    {
+        let mut k = keepers().lock().unwrap_or_else(|e| e.into_inner());
+        k.retain(|_, h| unsafe { WaitForSingleObject(raw(h), 0) } == WAIT_TIMEOUT);
+        k.insert(pipe.clone(), keeper.clone());
+    }
+    let pid = a.shell_pid as i32;
+    Ok(Spawned { master: Master::new(client, pipe, keeper, hello.pid, a), pid })
 }
 
 #[cfg(test)]
@@ -563,6 +665,66 @@ mod tests {
         std::fs::write(midna_pty::names::record_path(&h, "stale"), serde_json::to_vec(&record).unwrap()).unwrap();
         assert_eq!(end_leftover_keepers(&h), 0);
         assert!(midna_pty::names::records(&h).is_empty());
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    /// What a handover does with one terminal: the reader waiting on the output gives up with
+    /// nothing taken, the control connection is let go, a second client attaches and reads on,
+    /// and once it's gone the first connects again and still drives the shell.
+    #[test]
+    fn a_terminal_is_handed_to_another_client_and_back() {
+        let h = home("handover");
+        let argv: Vec<String> = ["cmd", "/d", "/q", "/k", "prompt $G"].iter().map(|s| s.to_string()).collect();
+        let sp = spawn(&Owner { home: &h, sid: "ho", tied: true }, &argv, ".", &[], 80, 24).expect("spawn");
+        let (old, shell) = (Arc::new(sp.master), sp.pid as u32);
+        let read_until = |m: &Arc<Master>, want: &str| {
+            let (m, want) = (m.clone(), want.to_string());
+            std::thread::spawn(move || {
+                let (mut all, mut buf) = (String::new(), [0u8; 4096]);
+                while !all.contains(&want) {
+                    match m.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => all.push_str(&String::from_utf8_lossy(&buf[..n])),
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return (all, true),
+                        Err(_) => break,
+                    }
+                }
+                (all, false)
+            })
+        };
+        // A reader waits on the shell's output; cancelling it takes nothing.
+        old.write_all(b"echo one-ready\r\n");
+        let (out, cut) = read_until(&old, "one-ready\r\n").join().unwrap();
+        assert!(out.contains("one-ready") && !cut, "{out:?}");
+        let waiting = read_until(&old, "never printed");
+        std::thread::sleep(Duration::from_millis(300));
+        for _ in 0..100 {
+            old.cancel_read();
+            if waiting.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (_, cut) = waiting.join().unwrap();
+        assert!(cut, "the read wasn't cancelled");
+
+        old.release_control();
+        let next = Arc::new(attach_to(&Owner { home: &h, sid: "ho", tied: true }, shell).expect("attach").master);
+        // The wrong shell is refused.
+        assert!(attach_to(&Owner { home: &h, sid: "ho", tied: true }, shell + 1).is_err());
+        next.write_all(b"echo two-ready\r\n");
+        let (out, _) = read_until(&next, "two-ready\r\n").join().unwrap();
+        assert!(out.contains("two-ready"), "{out:?}");
+        next.resize(100, 30);
+        next.release_control();
+        drop(next);
+
+        old.reconnect_control().expect("reconnect");
+        old.write_all(b"echo three-ready\r\n");
+        let (out, _) = read_until(&old, "three-ready\r\n").join().unwrap();
+        assert!(out.contains("three-ready"), "{out:?}");
+        old.hangup();
+        assert!(old.wait_keeper(Duration::from_secs(10)), "the keeper stayed");
         let _ = std::fs::remove_dir_all(&h);
     }
 
