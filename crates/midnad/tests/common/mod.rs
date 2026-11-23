@@ -223,9 +223,10 @@ pub fn python_bin(script: &str) -> String {
 ///
 /// Unix: `path` itself, `#!/bin/sh` and mode 0755. Windows starts nothing by its shebang, so
 /// the sh goes to `path` with a `.sh` extension and a `.cmd` beside it runs that with Git
-/// Bash; the `.cmd` is returned. Its arguments pass through cmd.exe, so a newline ends them,
-/// `%VAR%` expands, and an unquoted `'` (one with no space or `"` in its argument) confuses
-/// Git Bash's own parsing of the command line.
+/// Bash; the `.cmd` is returned. midnad starts it as that Git Bash command
+/// (`midna_proto::cmd_shim`), so its arguments arrive whole, but an unquoted `'` (one with no
+/// space or `"` in its argument) confuses Git Bash's own parsing of the command line. Started
+/// any other way it runs through cmd.exe, where a newline ends the arguments and `%VAR%` expands.
 pub fn script(path: impl AsRef<std::path::Path>, body: &str) -> String {
     let path = path.as_ref();
     #[cfg(unix)]

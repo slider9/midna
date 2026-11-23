@@ -4,6 +4,8 @@ pub mod catalog;
 pub mod cleanup;
 pub mod agent_cli;
 pub mod client;
+#[cfg(windows)]
+pub mod cmd_shim;
 pub mod cron;
 pub mod error;
 pub mod image_chips;

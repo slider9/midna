@@ -263,33 +263,7 @@ pub fn command_line(argv: &[String]) -> String {
     s
 }
 
-/// The extensions `which` tries for a name without one (PATHEXT, else the usual four).
-fn path_exts() -> Vec<String> {
-    std::env::var("PATHEXT")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into())
-        .split(';')
-        .filter(|e| !e.is_empty())
-        .map(|e| e.to_ascii_lowercase())
-        .collect()
-}
-
-fn with_exts(p: &Path) -> Option<PathBuf> {
-    if p.extension().is_some() && p.is_file() {
-        return Some(p.to_path_buf());
-    }
-    path_exts().iter().map(|e| PathBuf::from(format!("{}{e}", p.display()))).find(|c| c.is_file())
-}
-
-/// Resolve a program against `path` (`;`-separated) and PATHEXT.
-pub fn which(prog: &str, path: &str) -> Option<String> {
-    let p = Path::new(prog);
-    if prog.contains(['\\', '/', ':']) {
-        return with_exts(p).map(|p| p.to_string_lossy().into_owned());
-    }
-    path.split(';').filter(|d| !d.is_empty()).find_map(|d| with_exts(&Path::new(d).join(prog))).map(|p| p.to_string_lossy().into_owned())
-}
+pub use midna_proto::cmd_shim::which;
 
 /// The environment block: ours minus [`ENV_SCRUB`], with `env` applied, sorted by name ignoring
 /// case (names are case-insensitive on Windows), as `K=V\0…\0\0` UTF-16.
@@ -339,18 +313,16 @@ pub fn spawn(argv: &[String], cwd: &str, env: &[(String, String)], cols: u16, ro
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"));
     };
     let path = env.iter().find(|(k, _)| k.eq_ignore_ascii_case("PATH")).map(|(_, v)| v.clone()).unwrap_or_else(crate::sys::user_path);
-    let exe = which(prog, &path).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("{prog}: not found on PATH")))?;
-    let lower = exe.to_ascii_lowercase();
+    let all = midna_proto::cmd_shim::resolve(argv, &path).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("{prog}: not found on PATH")))?;
+    let exe = all[0].clone();
     // A batch file runs through cmd.exe (CreateProcess can't start one with a pseudoconsole
-    // and quoted arguments on its own).
-    let line = if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+    // and quoted arguments on its own). cmd ends its arguments at a newline and acts on
+    // `|<>&` in them, so a shim (npm's claude.cmd) has been swapped for what it runs above,
+    // and only another batch file gets here.
+    let line = if midna_proto::cmd_shim::is_batch(&exe) {
         let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into());
-        let mut inner = vec![exe.clone()];
-        inner.extend(argv[1..].iter().cloned());
-        format!("{} /d /s /c \"{}\"", command_line(&[comspec]), command_line(&inner))
+        format!("{} /d /s /c \"{}\"", command_line(&[comspec]), command_line(&all))
     } else {
-        let mut all = vec![exe.clone()];
-        all.extend(argv[1..].iter().cloned());
         command_line(&all)
     };
     let cwd = if Path::new(cwd).is_dir() { PathBuf::from(cwd) } else { midna_proto::paths::user_home() };
