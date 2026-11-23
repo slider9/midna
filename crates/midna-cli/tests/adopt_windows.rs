@@ -3,7 +3,7 @@
 //! The "real" claude is a copy of this test binary, which plays a fake agent when started under
 //! that name: it records its argv, answers `--help` and `--version`, and exits 3 once a `quit`
 //! file appears (`mcp …` exits at once). An .exe, not a .cmd: cmd would cut midna's multi-line
-//! system hint short. No libtest (`harness = false`), since it would refuse Claude's arguments.
+//! system hint short (`a_typed_claude_from_npm_gets_every_argument` checks a `.cmd`). No libtest (`harness = false`), since it would refuse Claude's arguments.
 
 #[cfg(not(windows))]
 fn main() {}
@@ -59,10 +59,11 @@ mod win {
     }
 
     pub fn run_all() {
-        let tests: [(&str, fn()); 3] = [
+        let tests: [(&str, fn()); 4] = [
             ("the_shims_are_copies_of_midna", the_shims_are_copies_of_midna),
             ("typed_claude_in_powershell_runs_under_midna_and_restarts_in_the_same_shell", typed_claude_in_powershell_runs_under_midna_and_restarts_in_the_same_shell),
             ("anything_but_an_interactive_session_runs_as_typed_in_cmd", anything_but_an_interactive_session_runs_as_typed_in_cmd),
+            ("a_typed_claude_from_npm_gets_every_argument", a_typed_claude_from_npm_gets_every_argument),
         ];
         let filter: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
         let mut failed = vec![];
@@ -213,6 +214,31 @@ mod win {
         wait_for(15, "back at the shell", || screen(&mut h, &sid).contains("SHELL-BACK 3").then_some(()));
         let s = wait_for(5, "released", || Some(call(&mut h, "session.get", json!({ "id": sid }))).filter(|s| s["adopted"].is_null()));
         assert!(s["agent"].is_null() && s["agent_info"].is_null() && s["kind"] == "shell", "{s}");
+    }
+
+    /// npm installs `claude.cmd`, a shim that runs node on the package's script. The shim and
+    /// midna start what it runs, not cmd, which would end the system prompt at its first newline
+    /// and act on the `|` and `&`.
+    fn a_typed_claude_from_npm_gets_every_argument() {
+        let d = D::start();
+        let npm = d.fake.join("node_modules");
+        std::fs::create_dir_all(&npm).unwrap();
+        std::fs::rename(d.fake.join("claude.exe"), npm.join("claude.exe")).unwrap();
+        // What npm's cmd-shim writes for a package whose bin is an .exe (for a .js one it runs
+        // node.exe on it; `midna_proto::cmd_shim` has that one).
+        let shim = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\\node_modules\\claude.exe\"   %*\r\n";
+        std::fs::write(d.fake.join("claude.cmd"), shim).unwrap();
+        let launches = || std::fs::read_to_string(npm.join("claude-argv")).unwrap_or_default().lines().map(str::to_string).collect::<Vec<_>>();
+        let mut h = d.human();
+        let sid = d.powershell(&mut h, "claude --append-system-prompt 'You work card 12.' 'a|b&c' 'hello there'");
+        wait_for(15, "fake claude started", || (launches().len() == 1).then_some(()));
+        let first = &launches()[0];
+        // The fake logs a newline as \n: the caller's prompt, then midna's hint after it.
+        assert!(first.contains("--append-system-prompt You work card 12.\\n") && first.ends_with("a|b&c hello there"), "{first}");
+        let s = call(&mut h, "session.get", json!({ "id": sid }));
+        assert!(s["adopted"]["bin"].as_str().unwrap().ends_with("claude.cmd"), "{s}");
+        std::fs::write(npm.join("quit"), "").unwrap();
+        wait_for(15, "back at the shell", || screen(&mut h, &sid).contains("SHELL-BACK 3").then_some(()));
     }
 
     fn anything_but_an_interactive_session_runs_as_typed_in_cmd() {

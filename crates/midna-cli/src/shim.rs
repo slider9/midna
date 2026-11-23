@@ -33,7 +33,10 @@ fn become_real(real: &Path, agent: &str, args: &[String]) -> ! {
 #[cfg(windows)]
 fn become_real(real: &Path, agent: &str, args: &[String]) -> ! {
     forward_signals();
-    match Command::new(real).args(args).status() {
+    let mut argv = vec![real.to_string_lossy().into_owned()];
+    argv.extend(args.iter().cloned());
+    let argv = unbatch(argv, None);
+    match Command::new(&argv[0]).args(&argv[1..]).status() {
         Ok(s) => std::process::exit(s.code().unwrap_or(1)),
         Err(e) => {
             eprintln!("{agent}: {e}");
@@ -103,6 +106,8 @@ fn ask(method: &str, params: &impl serde::Serialize) -> Option<SessionAdoptResul
 /// Run Claude in the foreground (same console) and return its exit code.
 #[cfg(windows)]
 fn run_child(agent: &str, argv: &[String], env: &std::collections::BTreeMap<String, String>, cwd: Option<&str>) -> i32 {
+    let path = env.iter().find(|(k, _)| k.eq_ignore_ascii_case("PATH")).map(|(_, v)| v.as_str());
+    let argv = unbatch(argv.to_vec(), path);
     let Some((bin, args)) = argv.split_first() else { return 127 };
     let mut cmd = Command::new(bin);
     cmd.args(args).envs(env);
@@ -115,6 +120,18 @@ fn run_child(agent: &str, argv: &[String], env: &std::collections::BTreeMap<Stri
             eprintln!("{agent}: {e}");
             126
         }
+    }
+}
+
+/// `argv` with a batch-file shim at its head (npm's `claude.cmd`) swapped for the program it
+/// runs, found on `path` (else ours): through cmd.exe, an argument with a newline (midna's
+/// system hint) would be cut short. As it was when it isn't one.
+#[cfg(windows)]
+pub fn unbatch(argv: Vec<String>, path: Option<&str>) -> Vec<String> {
+    let ours = std::env::var("PATH").unwrap_or_default();
+    match argv.first() {
+        Some(p) if midna_proto::cmd_shim::is_batch(p) => midna_proto::cmd_shim::resolve(&argv, path.unwrap_or(&ours)).unwrap_or(argv),
+        _ => argv,
     }
 }
 

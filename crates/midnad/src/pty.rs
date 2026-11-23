@@ -55,6 +55,10 @@ pub(crate) const ENV_SCRUB: &[&str] = &[
     // stream publishes.
     "MIDNA_TRIGGER",
     "MIDNA_DELIVERY",
+    // Says the agent it's set for carries midna's per-launch hooks (`rpc::session::mark_injected`);
+    // inherited by a midnad started from such an agent, it'd stand down every terminal's global
+    // hooks.
+    "MIDNA_HOOKS_INJECTED",
     "SAGGAR",
     "SAGGAR_SESSION",
     "SAGGAR_CLI_DIR",

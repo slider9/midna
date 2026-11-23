@@ -24,8 +24,12 @@ pub fn run(a: &Args) -> Res {
     let notify = a.pos.get(2).map(String::as_str) == Some("notify");
     let r = report(a, &agent);
     if notify && let Some((payload, previous)) = a.rest.split_last()
-        && let Some((prog, args)) = previous.split_first()
+        && !previous.is_empty()
     {
+        // The payload is JSON, whose `"` and `&` a batch file's cmd would misread.
+        #[cfg(windows)]
+        let previous = crate::shim::unbatch(previous.to_vec(), None);
+        let (prog, args) = previous.split_first().unwrap();
         let code = std::process::Command::new(prog).args(args).arg(payload).status().map_or(127, |s| s.code().unwrap_or(1));
         std::process::exit(code);
     }
