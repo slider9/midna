@@ -223,28 +223,153 @@ pub fn start_with(mut cfg: Config, resume: Option<crate::upgrade::Resume>) -> st
     background(&d);
     let ad = d.clone();
     let accept = std::thread::Builder::new().name("accept".into()).spawn(move || {
-        for conn in listener.incoming() {
+        #[cfg(windows)]
+        let mut listener = listener;
+        #[cfg(windows)]
+        loop {
+            accept_loop(&ad, &listener);
             if ad.shutting_down.load(Ordering::SeqCst) {
-                break;
+                return;
             }
-            let Ok(conn) = conn else { continue };
-            // Each connection costs two threads; a runaway client can't exhaust them.
-            if OPEN_CONNS.fetch_add(1, Ordering::AcqRel) >= MAX_CONNS {
-                OPEN_CONNS.fetch_sub(1, Ordering::AcqRel);
-                drop(conn);
-                continue;
-            }
-            let (cd, id) = (ad.clone(), ad.conn_id());
-            let spawned = std::thread::Builder::new().name(format!("conn-{id}")).spawn(move || {
-                crate::conn::serve(cd, conn, id);
-                OPEN_CONNS.fetch_sub(1, Ordering::AcqRel);
-            });
-            if spawned.is_err() {
-                OPEN_CONNS.fetch_sub(1, Ordering::AcqRel);
+            // A handover asked for the socket: give it up, and take it back if it fails.
+            drop(listener);
+            match socket_gate::closed(&ad) {
+                Some(l) => listener = l,
+                None => return,
             }
         }
+        #[cfg(unix)]
+        accept_loop(&ad, &listener);
     })?;
     Ok(Handle { daemon: d, accept: Some(accept) })
+}
+
+/// Windows' handover gives the socket to the next midnad and, should that fail, takes it back:
+/// [`close_socket`] and [`reopen_socket`], run by the handover, and the accept thread between.
+#[cfg(windows)]
+mod socket_gate {
+    use super::*;
+    use std::sync::{Condvar, Mutex};
+
+    #[derive(Clone, PartialEq)]
+    enum Gate {
+        Serving,
+        /// The handover wants the socket closed.
+        Close,
+        /// Closed, and its file removed.
+        Closed,
+        /// Bind it again.
+        Reopen,
+        Reopened(Result<(), String>),
+    }
+
+    static GATE: Mutex<Gate> = Mutex::new(Gate::Serving);
+    static CV: Condvar = Condvar::new();
+
+    fn set(g: Gate) {
+        *GATE.lock().unwrap_or_else(|e| e.into_inner()) = g;
+        CV.notify_all();
+    }
+
+    fn wait_for(timeout: Duration, done: impl Fn(&Gate) -> bool) -> Option<Gate> {
+        let g = GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let (g, _) = CV.wait_timeout_while(g, timeout, |g| !done(g)).unwrap_or_else(|e| e.into_inner());
+        done(&g).then(|| g.clone())
+    }
+
+    pub fn closing() -> bool {
+        *GATE.lock().unwrap_or_else(|e| e.into_inner()) == Gate::Close
+    }
+
+    /// The accept thread, once the listener is dropped: remove the socket's file and wait to be
+    /// told to bind it again (None: the daemon is stopping, or the handover went through).
+    pub fn closed(d: &Daemon) -> Option<UnixListener> {
+        let _ = std::fs::remove_file(&d.cfg.socket);
+        set(Gate::Closed);
+        loop {
+            wait_for(Duration::from_secs(1), |g| *g == Gate::Reopen);
+            if d.shutting_down.load(Ordering::SeqCst) {
+                return None;
+            }
+            if *GATE.lock().unwrap_or_else(|e| e.into_inner()) != Gate::Reopen {
+                continue;
+            }
+            return match bind(&d.cfg.socket, &d.cfg.home) {
+                Ok(l) => {
+                    set(Gate::Reopened(Ok(())));
+                    Some(l)
+                }
+                Err(e) => {
+                    set(Gate::Reopened(Err(e.to_string())));
+                    None
+                }
+            };
+        }
+    }
+
+    pub fn close(d: &Daemon) -> Result<(), String> {
+        set(Gate::Close);
+        // Wake the accept loop.
+        let _ = UnixStream::connect(&d.cfg.socket);
+        match wait_for(Duration::from_secs(5), |g| *g == Gate::Closed) {
+            Some(_) => Ok(()),
+            None => {
+                set(Gate::Serving);
+                Err("the socket didn't close".into())
+            }
+        }
+    }
+
+    pub fn reopen() -> Result<(), String> {
+        set(Gate::Reopen);
+        let r = match wait_for(Duration::from_secs(10), |g| matches!(g, Gate::Reopened(_))) {
+            Some(Gate::Reopened(r)) => r,
+            _ => Err("the socket wasn't bound again in time".into()),
+        };
+        set(Gate::Serving);
+        r
+    }
+}
+
+/// Windows handover: stop serving, close the socket and remove its file, so the next midnad can
+/// bind it. Connections already open stay open until this process exits.
+#[cfg(windows)]
+pub fn close_socket(d: &Daemon) -> Result<(), String> {
+    socket_gate::close(d)
+}
+
+/// A handover that failed: bind the socket again and serve.
+#[cfg(windows)]
+pub fn reopen_socket() -> Result<(), String> {
+    socket_gate::reopen()
+}
+
+/// Serve connections until the daemon stops (or, on Windows, a handover wants the socket).
+fn accept_loop(ad: &Arc<Daemon>, listener: &UnixListener) {
+    for conn in listener.incoming() {
+        if ad.shutting_down.load(Ordering::SeqCst) {
+            break;
+        }
+        #[cfg(windows)]
+        if socket_gate::closing() {
+            break;
+        }
+        let Ok(conn) = conn else { continue };
+        // Each connection costs two threads; a runaway client can't exhaust them.
+        if OPEN_CONNS.fetch_add(1, Ordering::AcqRel) >= MAX_CONNS {
+            OPEN_CONNS.fetch_sub(1, Ordering::AcqRel);
+            drop(conn);
+            continue;
+        }
+        let (cd, id) = (ad.clone(), ad.conn_id());
+        let spawned = std::thread::Builder::new().name(format!("conn-{id}")).spawn(move || {
+            crate::conn::serve(cd, conn, id);
+            OPEN_CONNS.fetch_sub(1, Ordering::AcqRel);
+        });
+        if spawned.is_err() {
+            OPEN_CONNS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 fn background(d: &Arc<Daemon>) {

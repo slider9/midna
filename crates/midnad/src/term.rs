@@ -280,6 +280,16 @@ pub fn adopt(d: &Arc<Daemon>, sid: &str, master: RawFd, pid: i32, alive: bool, s
     run(d, sid, master, pid, alive, Box::new(move |replies| Engine::restored(&snap, Some(replies))), title)
 }
 
+/// Windows: take over a terminal whose keeper an earlier midnad handed over (`upgrade_windows.rs`),
+/// on its screen as that midnad snapshotted it. The shell's process is ours to wait on, so its
+/// exit and exit code are reported as for a terminal this midnad started.
+#[cfg(windows)]
+pub fn adopt(d: &Arc<Daemon>, sid: &str, master: pty::Master, pid: i32, snap: &crate::engine::TermSnap) -> RtHandle {
+    let snap = snap.clone();
+    let title = snap.title.clone();
+    run(d, sid, master, pid, true, Box::new(move |replies| Engine::restored(&snap, Some(replies))), title)
+}
+
 /// Builds the engine on its own thread (libghostty's Terminal is !Send), given the session's
 /// input queue for its replies to the app.
 type MakeEngine = Box<dyn FnOnce(Sender<Vec<u8>>) -> Engine + Send>;
@@ -308,6 +318,11 @@ static READS_PAUSED: AtomicBool = AtomicBool::new(false);
 /// Readers between "poll said readable" and "bytes handed to the engine".
 static READS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
+/// Windows: every terminal a reader waits on. A read there blocks (no readiness poll), so a pause
+/// cancels the reads waiting.
+#[cfg(windows)]
+static READERS: std::sync::Mutex<Vec<Weak<PtyFd>>> = std::sync::Mutex::new(Vec::new());
+
 /// Stop every PTY reader from taking more bytes (they stay in the kernel buffer for the next
 /// image). Returns once no reader holds bytes the engines haven't been sent yet.
 pub fn pause_readers(timeout: std::time::Duration) -> bool {
@@ -316,6 +331,12 @@ pub fn pause_readers(timeout: std::time::Duration) -> bool {
     while READS_IN_FLIGHT.load(Ordering::SeqCst) != 0 {
         if t0.elapsed() > timeout {
             return false;
+        }
+        // A read that took bytes before the cancel hands them over as usual. One that starts
+        // after it isn't cancelled, so cancel again until every reader is out.
+        #[cfg(windows)]
+        for fd in READERS.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(Weak::upgrade) {
+            fd.cancel_read();
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -329,6 +350,12 @@ pub fn resume_readers() {
 /// The returned receiver disconnects once the reader has handed its last bytes to the engine.
 fn reader_thread(fd: Arc<PtyFd>, tx: SyncSender<EngineMsg>, activity: Arc<AtomicI64>) -> Receiver<()> {
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    #[cfg(windows)]
+    {
+        let mut r = READERS.lock().unwrap_or_else(|e| e.into_inner());
+        r.retain(|w| w.strong_count() > 0);
+        r.push(Arc::downgrade(&fd));
+    }
     let _ = std::thread::Builder::new().name("pty-reader".into()).spawn(move || {
         let _done = done_tx;
         let mut buf = vec![0u8; 65536];

@@ -61,10 +61,6 @@ pub mod subagent_log;
 pub mod summary;
 pub mod term;
 pub mod trust;
-#[cfg(unix)]
-pub mod upgrade;
-#[cfg(windows)]
-#[path = "upgrade_windows.rs"]
 pub mod upgrade;
 pub mod usage;
 pub mod wake;

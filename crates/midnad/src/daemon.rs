@@ -330,6 +330,10 @@ impl Daemon {
     }
 
     pub fn save_now(&self) {
+        // A handover wrote the state the next midnad loads (`upgrade::hold_saves`).
+        if crate::upgrade::saves_held() {
+            return;
+        }
         let snapshot = self.core().state.clone();
         if let Err(e) = snapshot.save(&paths::state_path(&self.cfg.home)) {
             eprintln!("midnad: saving state failed: {e}");
