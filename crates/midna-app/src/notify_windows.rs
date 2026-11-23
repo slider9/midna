@@ -7,15 +7,18 @@
 //! That needs no installer or Start menu shortcut.
 //!
 //! A toast's group is its terminal, so `clear` takes a terminal's toasts away; its tag is
-//! `notify.send`'s id, so a later one with that id replaces it and `withdraw` finds it.
+//! `notify.send`'s id, so a later one with that id replaces it and `withdraw` finds it. Its XML
+//! and arguments come from `midna_proto::toast`, which midnad's own toasts (posted while no app is
+//! connected) use too, so a click on one of those reaches the app the same way.
 //!
 //! Clicks and buttons: the app id names a COM class (`CustomActivator`) that midna serves while it
 //! runs ([`Activator`]). Windows calls it for a click on a toast or one of its buttons, from the
 //! banner or from Action Center; the toast's own `Activated` event never fires for a click on its
 //! body in Action Center. Each toast carries what a click reports (its terminal, needs-you item,
-//! id and URL) as JSON in its arguments. A release build also registers itself as the class's
-//! server, so a click after midna quit starts it (`-Embedding`) and then delivers the click.
-//! Debug builds don't: a click on one of theirs while they're not running does nothing.
+//! id and URL) as JSON in its arguments. A release build (Midna Dev too) also registers itself as
+//! the class's server, so a click after midna quit starts it (`-Embedding`) and then delivers the
+//! click. Debug builds don't: a click on one of theirs while they're not running does nothing (or
+//! starts Midna Dev, whose class they share, if it registered).
 //! Dismissals come from the toast's own `Dismissed` event, while midna runs. All of them reach
 //! the app as `Clicked`, on the channel macOS's delegate uses.
 //!
@@ -28,6 +31,7 @@
 //! Windows' notification sound.
 use super::{Clicked, Permission};
 use midna_proto::notify::{Posted, Response, ResponseKind};
+use midna_proto::toast::{self, About, group_for, parse_args, tag_for};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 use std::sync::{OnceLock, mpsc};
@@ -48,10 +52,6 @@ static WORKER: OnceLock<mpsc::Sender<Cmd>> = OnceLock::new();
 
 /// Toasts held on to, newest last: a toast's `Dismissed` event fires only while something holds it.
 const KEEP: usize = 64;
-/// Windows' limit on a toast's tag and on its group.
-const TAG_MAX: usize = 64;
-/// Windows shows at most this many buttons.
-const ACTIONS_MAX: usize = 5;
 /// The COM class Windows calls when one of midna's toasts is clicked.
 const ACTIVATOR: GUID = GUID::from_u128(0x71fc9e00_807f_45b6_a69b_8163f48f5562);
 /// Midna Dev's and debug builds' class.
@@ -60,7 +60,7 @@ const ACTIVATOR_DEV: GUID = GUID::from_u128(0xb130edb7_f2f7_45b7_8aa1_ff07b076ee
 /// The AppUserModelID midna's toasts are posted under. Midna Dev and debug builds (run from
 /// `target\`) have their own, so a build from source never shows as, or changes, Midna's.
 fn app_id() -> &'static str {
-    if dev() { "com.mrgnhnt.midna.dev" } else { midna_proto::paths::BUNDLE_ID }
+    toast::app_id(dev())
 }
 
 fn activator() -> GUID {
@@ -86,15 +86,6 @@ struct Toast {
     /// A sound file to play with it, and how loud (0–100).
     play: Option<(String, u8)>,
     about: About,
-}
-
-/// What a click on a toast reports.
-#[derive(Clone, Debug, Default, PartialEq)]
-struct About {
-    session: String,
-    needs_you: Option<String>,
-    id: Option<String>,
-    open: Option<String>,
 }
 
 /// Whether Windows shows midna's toasts (Settings ▸ System ▸ Notifications & actions). There's
@@ -135,7 +126,7 @@ pub fn post(p: &Posted, session: Option<&str>) {
     let body = midna_proto::notify::plain_body(&p.body);
     let about = About { session: session.unwrap_or_default().to_string(), needs_you: p.needs_you_id.clone(), id: p.id.clone(), open: p.open.clone() };
     send(Cmd::Post(Toast {
-        xml: toast_xml(&p.title, &body, p.image.as_deref(), &p.actions, p.sound && file.is_none(), &about),
+        xml: toast::xml(&p.title, &body, p.image.as_deref(), &p.actions, p.sound && file.is_none(), &about),
         tag,
         group: group_for(session),
         play: file.map(|f| (f, p.volume.unwrap_or(100))),
@@ -332,17 +323,6 @@ impl IClassFactory_Impl for Factory_Impl {
     }
 }
 
-/// A toast's (or a button's) arguments: what a click reports, and the button's label.
-fn click_args(about: &About, action: Option<&str>) -> String {
-    serde_json::json!({ "s": about.session, "n": about.needs_you, "i": about.id, "o": about.open, "a": action }).to_string()
-}
-
-fn parse_args(args: &str) -> Option<(About, Option<String>)> {
-    let v: serde_json::Value = serde_json::from_str(args).ok()?;
-    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
-    Some((About { session: s("s").unwrap_or_default(), needs_you: s("n"), id: s("i"), open: s("o") }, s("a")))
-}
-
 /// Is Windows taking notifications now (not quiet hours, presentation mode or a full-screen
 /// app)? Yes when it can't say.
 fn taking_notifications() -> bool {
@@ -378,8 +358,8 @@ fn register() {
     set_value(&app, Some("IconUri"), &icon.to_string_lossy());
     set_value(&app, Some("CustomActivator"), &clsid);
     // A debug build started from a toast would run on the default home, not the one it was
-    // tried on.
-    if !dev()
+    // tried on. Midna Dev has its home built in.
+    if !cfg!(debug_assertions)
         && let Ok(exe) = std::env::current_exe()
     {
         set_value(&format!("Software\\Classes\\CLSID\\{clsid}\\LocalServer32"), None, &format!("\"{}\"", exe.display()));
@@ -405,69 +385,6 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// The tag for a `notify.send` id.
-fn tag_for(id: &str) -> String {
-    short(&format!("id:{id}"))
-}
-
-/// The group for a terminal's toasts (`midna`: none in particular).
-fn group_for(session: Option<&str>) -> String {
-    short(session.unwrap_or("midna"))
-}
-
-/// `s`, or a hash of it when it's longer than a tag may be.
-fn short(s: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    if s.encode_utf16().count() <= TAG_MAX {
-        return s.to_string();
-    }
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    format!("h:{:016x}", h.finish())
-}
-
-/// A toast's XML: a title, the body, an image below them, buttons, and Windows' sound or none.
-/// A click on it, or on a button, hands Windows `about` (and the button's label) to pass back.
-fn toast_xml(title: &str, body: &str, image: Option<&str>, actions: &[String], sound: bool, about: &About) -> String {
-    let mut x = format!("<toast launch=\"{}\"><visual><binding template=\"ToastGeneric\"><text>{}</text>", esc(&click_args(about, None)), esc(title));
-    if !body.is_empty() {
-        x += &format!("<text>{}</text>", esc(body));
-    }
-    if let Some(path) = image {
-        x += &format!("<image src=\"{}\"/>", esc(&format!("file:///{}", path.replace('\\', "/"))));
-    }
-    x += "</binding></visual>";
-    if !actions.is_empty() {
-        x += "<actions>";
-        for a in actions.iter().take(ACTIONS_MAX) {
-            x += &format!("<action content=\"{}\" arguments=\"{}\"/>", esc(a), esc(&click_args(about, Some(a))));
-        }
-        x += "</actions>";
-    }
-    if !sound {
-        x += "<audio silent=\"true\"/>";
-    }
-    x + "</toast>"
-}
-
-/// Text for XML: markup escaped, and control characters XML can't hold dropped.
-fn esc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out += "&amp;",
-            '<' => out += "&lt;",
-            '>' => out += "&gt;",
-            '"' => out += "&quot;",
-            '\'' => out += "&apos;",
-            '\t' | '\n' | '\r' => out.push(c),
-            c if c.is_control() => {}
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,44 +404,24 @@ mod tests {
     }
 
     #[test]
-    fn a_toast_escapes_what_it_shows() {
-        let x = toast_xml("Approve <rm -rf>?", "a & b \"c\"\u{1b}[0m", None, &[], true, &About::default());
-        assert!(x.contains("<text>Approve &lt;rm -rf&gt;?</text><text>a &amp; b &quot;c&quot;[0m</text>"), "{x}");
-        assert!(!x.contains("<audio"), "{x}");
-        // Every toast midna makes is XML Windows takes.
+    fn every_toast_is_xml_windows_takes() {
+        // midna_proto::toast tests what goes in; this is what Windows' own parser makes of it.
+        let actions: Vec<String> = ["Yes", "a\"b"].map(String::from).to_vec();
+        let x = toast::xml("Approve <rm -rf>?", "a & b \"c\"\u{1b}[0m", Some(r"C:\Users\me\img 1.png"), &actions, false, &About::default());
         args_in(&x, None);
-    }
-
-    #[test]
-    fn buttons_image_and_silence() {
-        let actions: Vec<String> = ["Yes", "No", "a\"b", "4", "5", "6"].map(String::from).to_vec();
-        let x = toast_xml("t", "", Some(r"C:\Users\me\img 1.png"), &actions, false, &About::default());
-        assert!(x.contains("<image src=\"file:///C:/Users/me/img 1.png\"/>"), "{x}");
-        assert_eq!(x.matches("<action ").count(), ACTIONS_MAX);
-        assert_eq!(x.matches("<text>").count(), 1, "no body, no second line: {x}");
-        assert!(x.ends_with("<audio silent=\"true\"/></toast>"), "{x}");
+        args_in(&x, Some("a\"b"));
     }
 
     #[test]
     fn a_click_hands_back_what_it_reports() {
         let about = About { session: "595bd00a".into(), needs_you: Some("n-1".into()), id: Some("deploy \"1\" & <2>".into()), open: Some("https://x.test/?a=1&b=2".into()) };
-        let x = toast_xml("t", "b", None, &["Deploy".into(), "Skip: \"later\"".into()], true, &about);
+        let x = toast::xml("t", "b", None, &["Deploy".into(), "Skip: \"later\"".into()], true, &about);
         assert_eq!(parse_args(&args_in(&x, None)), Some((about.clone(), None)));
         assert_eq!(parse_args(&args_in(&x, Some("Skip: \"later\""))), Some((about.clone(), Some("Skip: \"later\"".into()))));
-        let none = About::default();
-        assert_eq!(parse_args(&click_args(&none, None)), Some((none, None)));
-        assert_eq!(parse_args(""), None, "midna's own name clicked in Action Center");
     }
 
     #[test]
-    fn tags_groups_and_class_ids() {
-        assert_eq!(tag_for("build-1"), "id:build-1");
-        assert_eq!(group_for(None), "midna");
-        assert_eq!(group_for(Some("s-1")), "s-1");
-        let long = "x".repeat(100);
-        assert!(tag_for(&long).len() <= TAG_MAX);
-        assert_eq!(tag_for(&long), tag_for(&long));
-        assert_ne!(tag_for(&long), tag_for(&"y".repeat(100)));
+    fn class_ids() {
         assert_eq!(braced(&ACTIVATOR), "{71FC9E00-807F-45B6-A69B-8163F48F5562}");
         assert_eq!(braced(&ACTIVATOR_DEV), "{B130EDB7-F2F7-45B7-8AA1-FF07B076EE68}");
     }

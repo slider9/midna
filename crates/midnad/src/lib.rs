@@ -36,6 +36,8 @@ pub mod local;
 pub mod queue;
 pub mod notify;
 pub mod notify_media;
+#[cfg(windows)]
+pub mod notify_windows;
 pub mod panic;
 pub mod peer;
 pub mod policy;

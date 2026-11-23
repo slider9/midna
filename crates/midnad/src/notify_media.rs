@@ -108,8 +108,10 @@ const MAX_SECS: usize = 30;
 const CACHE_DAYS: u64 = 30;
 
 /// `file` at `volume` (1–100) as the 16-bit WAV a notification names, so macOS plays it with
-/// the banner (`UNNotificationSound` has no volume of its own). Converted with `afconvert`,
-/// scaled, cut to 30 s, and kept in `notify/cache` by file and volume. None if that fails.
+/// the banner (`UNNotificationSound` has no volume of its own), and Windows' `PlaySoundW` (no
+/// volume either) plays it at that volume. Converted with `afconvert` (elsewhere only a WAV is
+/// taken, as it is), scaled, cut to 30 s, and kept in `notify/cache` by file and volume. None if
+/// that fails.
 pub fn rendered(home: &Path, file: &str, volume: u8) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
     let meta = std::fs::metadata(file).ok()?;
@@ -126,6 +128,7 @@ pub fn rendered(home: &Path, file: &str, volume: u8) -> Option<PathBuf> {
     prune(&cache);
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = cache.join(format!(".{}-{}.wav", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    #[cfg(target_os = "macos")]
     let converted = std::process::Command::new("/usr/bin/afconvert")
         .args(["-f", "WAVE", "-d", "LEI16"])
         .arg(file)
@@ -135,6 +138,9 @@ pub fn rendered(home: &Path, file: &str, volume: u8) -> Option<PathBuf> {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success());
+    // scale_wav takes only a 16-bit PCM WAV.
+    #[cfg(not(target_os = "macos"))]
+    let converted = std::fs::copy(file, &tmp).is_ok();
     let done = converted
         .then(|| std::fs::read(&tmp).ok())
         .flatten()

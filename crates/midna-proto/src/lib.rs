@@ -29,6 +29,7 @@ pub mod summary;
 pub mod system;
 pub mod themes;
 pub mod time;
+pub mod toast;
 pub mod types;
 
 pub use catalog::{MethodSpec, catalog, method};
