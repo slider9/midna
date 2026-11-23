@@ -36,7 +36,7 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_TERMINATE, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
+    GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 /// The newer ConPTY's files, which go wherever midnad.exe goes (`install::install_self`; the
@@ -123,7 +123,7 @@ fn raw(h: &OwnedHandle) -> HANDLE {
 }
 
 impl Master {
-    fn new(client: Client, pipe: String, keeper: Arc<OwnedHandle>, keeper_pid: u32, a: client::Attached) -> Master {
+    pub(super) fn new(client: Client, pipe: String, keeper: Arc<OwnedHandle>, keeper_pid: u32, a: client::Attached) -> Master {
         Master {
             client: Mutex::new(Some(client)),
             pipe,
@@ -433,7 +433,6 @@ pub fn attach_to(owner: &Owner, shell_pid: u32) -> std::io::Result<Spawned> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
 
     #[test]
     fn quotes_like_the_msvc_runtime() {

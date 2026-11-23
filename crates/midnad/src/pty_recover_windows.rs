@@ -26,7 +26,6 @@ use std::collections::HashMap;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
@@ -176,7 +175,7 @@ fn attach(d: &Arc<Daemon>, home: &Path, f: &Found) -> std::io::Result<()> {
     let keeper = Arc::new(f.process.try_clone()?);
     keepers().lock().unwrap_or_else(|e| e.into_inner()).insert(f.record.pipe.clone(), keeper.clone());
     let shell_pid = a.shell_pid;
-    let master = Master { client, keeper, input: a.input, output: a.output, process: a.process, shell_pid, ended: AtomicBool::new(false) };
+    let master = Master::new(client, f.record.pipe.clone(), keeper, hello.pid, a);
     let (cols, rows, vt) = match snap {
         Some(s) => (s.cols, s.rows, s.to_vt().into_bytes()),
         None => (100, 30, vec![]),
