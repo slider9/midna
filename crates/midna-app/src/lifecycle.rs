@@ -500,9 +500,12 @@ impl Worker {
     }
 
     /// The running daemon must be `bin/current/midnad`; if not (the app was just updated),
-    /// upgrade it in place. Terminals survive (same-PID execv with the PTYs handed over). A busy
-    /// Mac postpones it unless `force`. Windows has no in-place upgrade: midnad restarts once
-    /// every agent is idle (at once with `force`) and reopens the terminals.
+    /// upgrade it in place. Terminals survive: macOS execs the new midnad in the same process
+    /// with the PTYs handed over; Windows starts it and hands it each terminal's keeper
+    /// (`midnad/src/upgrade_windows.rs`), so midnad's pid changes. A busy machine postpones it
+    /// unless `force`. When the running or the new Windows midnad is from before the keepers,
+    /// midnad instead restarts once every agent is idle (at once with `force`) and reopens the
+    /// terminals ([`waiting_for`]).
     fn ensure_daemon_current(&self, home: &Path, force: bool) -> Upgrade {
         let want = install::current_daemon(home);
         let fail = |e: String| {

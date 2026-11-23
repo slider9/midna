@@ -1807,13 +1807,10 @@ impl SettingsWindow {
                                 if names.is_empty() { String::new() } else { format!(" (waiting for {})", names.join(", ")) }
                             )),
                         ),
-                        (None, None, None) => (
-                            t.err,
-                            Some(os(
-                                "Doesn't match the app. Update it in place: your terminals keep running.",
-                                "Doesn't match the app; updating it reopens your terminals once agents are idle. Whatever runs in a shell is stopped.",
-                            ).into()),
-                        ),
+                        // Windows too: each terminal's keeper outlives midnad, so the new one
+                        // takes them over (when either midnad is from before the keepers, the
+                        // answer is the idle wait above instead).
+                        (None, None, None) => (t.err, Some("Doesn't match the app. Update it in place: your terminals keep running.".into())),
                     },
                 };
                 let mut daemon_row = status("Daemon version", dot, daemon.unwrap_or("not connected").into(), if daemon.is_some() { t.fg } else { t.dim }, note, "midna info");
