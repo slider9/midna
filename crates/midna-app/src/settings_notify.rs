@@ -414,7 +414,7 @@ impl SettingsWindow {
             }))
             .child(div().w(px(12.)).flex_none().child(Icon::Plus.el(11., t.dim)))
             .child(if kind == "sound" { "Import sound…" } else { "Import image…" })
-            .child(div().text_size(px(11.)).text_color(t.dim).child(if kind == "sound" { "aiff wav mp3 m4a caf" } else { "png jpg gif" }));
+            .child(div().text_size(px(11.)).text_color(t.dim).child(if kind == "sound" { midna_proto::wording::os("aiff wav mp3 m4a caf", "wav") } else { "png jpg gif" }));
         deferred(
             anchored().offset(point(px(0.), px(30.))).snap_to_window_with_margin(px(8.)).child(
                 crate::ui::sidebar::menu_box(t)
