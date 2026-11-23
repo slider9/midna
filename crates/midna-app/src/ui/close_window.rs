@@ -158,7 +158,7 @@ pub fn render(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> Option
                 .gap(px(8.))
                 .child(btn(t, "close-cancel", "Cancel").on_click(cx.listener(|m, _, w, cx| cancel(m, w, cx))))
                 .child(btn_danger(t, "close-terms", format!("Close {terms}"), 28.).on_click(cx.listener(|m, _, w, cx| decide(m, Choice::Close, w, cx))))
-                .child(btn_primary(t, "close-move", "Move to other window  ↩").on_click(cx.listener(|m, _, w, cx| decide(m, Choice::Move, w, cx)))),
+                .child(btn_primary(t, "close-move", midna_proto::wording::os("Move to other window  ↩", "Move to other window")).on_click(cx.listener(|m, _, w, cx| decide(m, Choice::Move, w, cx)))),
         )
         .child(div().text_size(px(11.)).text_color(t.dim).child("You can change the remembered answer in Settings ▸ General."));
     Some(

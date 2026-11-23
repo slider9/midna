@@ -43,7 +43,7 @@ fn agents_others_open_wait_for_the_mac_to_calm() {
     // An agent's open succeeds at once, but its agent doesn't start.
     let first = open_agent(&mut a);
     let s1 = first["id"].as_str().unwrap().to_string();
-    assert_eq!(first["custom_status"]["label"], "Waiting for the Mac", "{first}");
+    assert_eq!(first["custom_status"]["label"], midnad::admit::WAITING, "{first}");
     let screen = wait_for(5, "the waiting message", || Some(read(&mut h, &s1)).filter(|s| s.contains("Ctrl-C")));
     assert!(screen.contains("overloaded"), "{screen}");
     // Its queued messages wait too: nothing is typed into the wrapper.
@@ -55,7 +55,7 @@ fn agents_others_open_wait_for_the_mac_to_calm() {
     wait_for(5, "the human's agent", || started(&mine).then_some(()));
     assert!(status(&mut h, &mine).is_null());
     let screen = read(&mut h, &mine);
-    assert!(screen.contains("midna: the Mac is overloaded"), "{screen}");
+    assert!(screen.contains(&format!("midna: the {} is overloaded", midna_proto::wording::MAC)), "{screen}");
 
     // Another joins the line; one more is started by Ctrl-C in its terminal.
     let s2 = open_agent(&mut a)["id"].as_str().unwrap().to_string();
@@ -74,7 +74,7 @@ fn agents_others_open_wait_for_the_mac_to_calm() {
     wait_for(8, "the first in line starts", || started(&s1).then_some(()));
     assert!(status(&mut h, &s1).is_null());
     assert!(!started(&s2), "one at a time");
-    assert_eq!(status(&mut h, &s2)["label"], "Waiting for the Mac");
+    assert_eq!(status(&mut h, &s2)["label"], midnad::admit::WAITING);
     wait_for(20, "the next one starts", || started(&s2).then_some(()));
     let _ = std::fs::remove_dir_all(&marks);
 }

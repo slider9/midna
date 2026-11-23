@@ -5,6 +5,11 @@ use common::*;
 use midna_proto::Client;
 use serde_json::{Value, json};
 
+/// Three of the system's own sounds: macOS's, or Windows' (`%WINDIR%\Media`).
+const SUBMARINE: &str = midna_proto::wording::os("Submarine", "chimes");
+const GLASS: &str = midna_proto::wording::os("Glass", "Windows Ding");
+const POP: &str = midna_proto::wording::os("Pop", "tada");
+
 fn hook(a: &mut Client, ev: &str, payload: Value) {
     call(a, "agent.hook", json!({ "agent": "claude", "event": ev, "payload": payload }));
 }
@@ -186,7 +191,7 @@ fn each_kind_has_its_sound_and_volume() {
     assert_eq!((path(&n["sound_file"]), n["volume"].as_u64()), (Some(d.home.join("notify/twilight/Portal.wav").as_path()), Some(100)), "{n}");
 
     // Another sound, 50% of a 50% master: plays at 25.
-    call(&mut h, "settings.set", json!({ "key": "notify.sound.turn_done", "value": "Submarine" }));
+    call(&mut h, "settings.set", json!({ "key": "notify.sound.turn_done", "value": SUBMARINE }));
     call(&mut h, "settings.set", json!({ "key": "notify.volume.turn_done", "value": 50 }));
     call(&mut h, "settings.set", json!({ "key": "notify.volume", "value": "50%" }));
     hook(&mut a, "UserPromptSubmit", json!({ "session_id": "c1", "prompt": "go" }));
@@ -194,10 +199,10 @@ fn each_kind_has_its_sound_and_volume() {
     let p = wait_posted(&mut h, 2);
     let n = &p[1]["data"];
     assert_eq!((n["category"].as_str(), n["sound"].as_bool(), n["volume"].as_u64()), (Some("turn_done"), Some(true), Some(25)), "{n}");
-    assert_eq!(n["sound_file"], "/System/Library/Sounds/Submarine.aiff");
+    assert_eq!(n["sound_file"].as_str(), midna_proto::notify::system_sound_path(SUBMARINE).as_deref(), "{n}");
     // What macOS plays with the banner: that sound rendered at 25%, named (a full path plays the
     // default sound). Tests keep it in the daemon's home rather than ~/Library/Sounds.
-    // Windows has no Submarine (a macOS system sound) to render, so there's none.
+    // Windows plays the sound itself rather than with the toast, so there's none.
     if cfg!(windows) {
         assert!(n["notification_sound"].is_null(), "{n}");
     } else {
@@ -265,7 +270,7 @@ fn imported_sounds_and_images() {
     let r = call(&mut h, "notify.remove", json!({ "name": "ding.wav" }));
     assert_eq!(r["reset"], json!(["notify.sound.approval", "notify.sound.failed"]));
     assert_eq!(call(&mut h, "settings.get", json!({ "key": "notify.sound.approval" }))["value"], "Portal");
-    assert_eq!(call_err(&mut h, "notify.remove", json!({ "name": "Glass" })).code, -32602);
+    assert_eq!(call_err(&mut h, "notify.remove", json!({ "name": GLASS })).code, -32602);
     assert_eq!(call_err(&mut h, "notify.remove", json!({ "name": "Portal" })).code, -32602);
     assert_eq!(call_err(&mut h, "notify.remove", json!({ "name": "../state.json" })).code, midna_proto::error::NOT_FOUND);
 }
@@ -294,11 +299,11 @@ fn agents_play_sounds_by_kind_or_name() {
 
     // A kind plays its sound at its volume, times the master; a name at full (or --volume).
     assert_eq!(call(&mut a, "notify.play", json!({ "sound": "approved" })), json!({ "played": false, "sound": "Rise", "reason": "no_app" }));
-    call(&mut a, "notify.play", json!({ "sound": "glass", "volume": 40 }));
+    call(&mut a, "notify.play", json!({ "sound": GLASS.to_lowercase(), "volume": 40 }));
     let p = played(&mut h);
     let rise = d.home.join("notify/twilight/Rise.wav");
     assert_eq!((path(&p[0]["data"]["file"]), p[0]["data"]["volume"].as_u64(), p[0]["data"]["kind"].as_str()), (Some(rise.as_path()), Some(50), Some("approved")));
-    assert_eq!((p[1]["data"]["sound"].as_str(), p[1]["data"]["volume"].as_u64(), p[1].get("session_id").and_then(Value::as_str)), (Some("Glass"), Some(20), Some(sid.as_str())));
+    assert_eq!((p[1]["data"]["sound"].as_str(), p[1]["data"]["volume"].as_u64(), p[1].get("session_id").and_then(Value::as_str)), (Some(GLASS), Some(20), Some(sid.as_str())));
 
     // A kind with no sound, unknown names, and the switches.
     call(&mut h, "settings.set", json!({ "key": "notify.sound.switched", "value": "none" }));
@@ -306,16 +311,16 @@ fn agents_play_sounds_by_kind_or_name() {
     assert_eq!(call(&mut h, "notify.play", json!({ "sound": "uh-oh" }))["sound"], "Uh-oh", "Twilight names in any case");
     assert_eq!(call_err(&mut a, "notify.play", json!({ "sound": "nope" })).code, -32602);
     call(&mut h, "settings.set", json!({ "key": "notify.sounds", "value": false }));
-    assert_eq!(call(&mut a, "notify.play", json!({ "sound": "Pop" }))["reason"], "sounds_off");
+    assert_eq!(call(&mut a, "notify.play", json!({ "sound": POP }))["reason"], "sounds_off");
     call(&mut h, "notify.test", json!({ "category": "approval" }));
     assert_eq!(wait_posted(&mut h, 1)[0]["data"]["sound"], false, "notify.sounds off silences banners too");
     call(&mut h, "settings.set", json!({ "key": "notify.sounds", "value": true }));
 
     // Agents: 6 a minute (2 played above); the human isn't limited.
-    let reasons: Vec<Value> = (0..5).map(|_| call(&mut a, "notify.play", json!({ "sound": "Pop" }))["reason"].clone()).collect();
+    let reasons: Vec<Value> = (0..5).map(|_| call(&mut a, "notify.play", json!({ "sound": POP }))["reason"].clone()).collect();
     assert_eq!(reasons[3], "no_app");
     assert_eq!(reasons[4], "rate_limited");
-    assert_eq!(call(&mut h, "notify.play", json!({ "sound": "Pop", "session": sid }))["reason"], "no_app");
+    assert_eq!(call(&mut h, "notify.play", json!({ "sound": POP, "session": sid }))["reason"], "no_app");
 }
 
 #[test]
@@ -415,8 +420,8 @@ fn kinds_you_add_get_their_own_settings_and_can_be_sent_to() {
     assert_eq!(call_err(&mut h, "notify.kinds.add", json!({ "key": "deploys", "settings": { "color": "pink" } })).code, -32602);
     assert_eq!(call(&mut h, "notify.kinds.list", json!({}))["kinds"], json!([]));
 
-    let k = call(&mut a, "notify.kinds.add", json!({ "key": "deploys", "label": "Deploys", "settings": { "stay": 0, "color": "ok", "sound": "Glass" } }));
-    assert_eq!(k, json!({ "key": "deploys", "label": "Deploys", "description": "", "enabled": true, "stay": 0, "color": "ok", "sound": "Glass", "push": true }));
+    let k = call(&mut a, "notify.kinds.add", json!({ "key": "deploys", "label": "Deploys", "settings": { "stay": 0, "color": "ok", "sound": GLASS } }));
+    assert_eq!(k, json!({ "key": "deploys", "label": "Deploys", "description": "", "enabled": true, "stay": 0, "color": "ok", "sound": GLASS, "push": true }));
     assert_eq!(call_err(&mut a, "notify.kinds.add", json!({ "key": "deploys" })).code, -32602);
     assert_eq!(call(&mut a, "notify.kinds.add", json!({ "key": "deploys", "label": "Ships", "replace": true }))["label"], "Ships");
     let changed = call(&mut h, "events.list", json!({ "filter": { "kinds": ["notify.kinds_changed"] } }));
@@ -427,7 +432,7 @@ fn kinds_you_add_get_their_own_settings_and_can_be_sent_to() {
     let entry = |k: &str| all.as_array().unwrap().iter().find(|e| e["key"] == k).cloned().unwrap_or_else(|| panic!("no {k} in settings.list"));
     assert_eq!((entry("notify.deploys")["value"].clone(), entry("notify.stay.deploys")["value"].clone()), (json!(true), json!(0)));
     assert_eq!(entry("notify.volume.deploys")["value"], 100);
-    assert_eq!(call(&mut h, "settings.get", json!({ "key": "notify.sound.deploys" }))["value"], "Glass");
+    assert_eq!(call(&mut h, "settings.get", json!({ "key": "notify.sound.deploys" }))["value"], GLASS);
     assert_eq!(call_err(&mut h, "settings.set", json!({ "key": "notify.volume.deploys", "value": 101 })).code, -32602);
     let unknown = call_err(&mut h, "settings.get", json!({ "key": "notify.stay.nope" })).code;
     let listed = call(&mut h, "notify.list", json!({ "global": true }));

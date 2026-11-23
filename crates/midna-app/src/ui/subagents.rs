@@ -176,7 +176,7 @@ pub fn popover(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> impl 
         .border_color(t.line)
         .text_size(px(11.5))
         .text_color(t.dim)
-        .child(div().flex().gap(px(5.)).child(div().font_family(t.mono_font.clone()).child("↩")).child("open in a window"))
+        .child(div().flex().gap(px(5.)).child(div().font_family(t.mono_font.clone()).child(midna_proto::wording::ENTER)).child("open in a window"))
         .child(div().flex_1())
         .child(div().text_color(t.dim).child("read-only"));
 

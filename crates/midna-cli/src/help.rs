@@ -2,6 +2,7 @@
 //! `midna <verb> --help` prints the entry, so the two can't drift apart. Each entry names the
 //! RPC methods it calls, so `--help` also says which steps are human only.
 use midna_proto::catalog;
+use midna_proto::wording::os;
 
 pub struct Verb {
     pub name: &'static str,
@@ -77,13 +78,19 @@ pub static VERBS: &[Verb] = &[
         aliases: &[],
         usage: "daemon info | restart [--force] | stop | upgrade <path> [--force] | reset [--drop-rules]",
         summary: "manage midnad itself",
-        details: "restart  graceful restart; terminals keep running (anyone may)\n\
+        details: os("restart  graceful restart; terminals keep running (anyone may)\n\
                   stop     stop midnad and hang up every terminal (human only: asks the human)\n\
                   upgrade  replace midnad in place with another binary (human only: asks the human)\n\
                   \x20        restart and upgrade wait while the Mac is busy (system.busy_load; `midna system`):\n\
                   \x20        a handoff under heavy load can time out and hang up every terminal. --force: go anyway\n\
                   reset    close every terminal, remove projects, triggers and needs-you items, reset settings;\n\
-                  \x20        keeps the event log and rules (--drop-rules removes rules too). Human only: asks the human",
+                  \x20        keeps the event log and rules (--drop-rules removes rules too). Human only: asks the human", "restart  graceful restart; terminals keep running (anyone may)\n\
+                  stop     stop midnad and hang up every terminal (human only: asks the human)\n\
+                  upgrade  replace midnad in place with another binary (human only: asks the human)\n\
+                  \x20        restart and upgrade wait while the PC is busy (system.busy_load; `midna system`):\n\
+                  \x20        a handoff under heavy load can time out and hang up every terminal. --force: go anyway\n\
+                  reset    close every terminal, remove projects, triggers and needs-you items, reset settings;\n\
+                  \x20        keeps the event log and rules (--drop-rules removes rules too). Human only: asks the human"),
         methods: &["daemon.info", "daemon.restart", "daemon.stop", "daemon.upgrade", "daemon.reset"],
     },
     // ---------------------------------------------------------------- projects / terminals
@@ -224,8 +231,9 @@ pub static VERBS: &[Verb] = &[
         aliases: &["subagents"],
         usage: "subagent <terminal-id> <agent-id>",
         summary: "read one of an agent terminal's subagents: its prompt, tool calls and what it said",
-        details: "From the subagent's own transcript (Claude). Ids are in `midna procs <terminal-id>` (running and\n\
-                  finished this turn). The human opens the same thing from the header's subagents chip (⌥⌘A).",
+        details: os("From the subagent's own transcript (Claude). Ids are in `midna procs <terminal-id>` (running and\n\
+                  finished this turn). The human opens the same thing from the header's subagents chip (⌥⌘A).", "From the subagent's own transcript (Claude). Ids are in `midna procs <terminal-id>` (running and\n\
+                  finished this turn). The human opens the same thing from the header's subagents chip (Alt+Shift+A)."),
         methods: &["session.subagent_log"],
     },
     Verb {
@@ -243,7 +251,7 @@ pub static VERBS: &[Verb] = &[
                 links actions register --owner <app> --file <menus.json|->\n       \
                 links actions clear <owner>",
         summary: "the links, PRs, artifacts and files that came up in an agent terminal's conversation",
-        details: "midna collects them from the agent's transcript as it works: URLs the human pasted or you wrote or\n\
+        details: os("midna collects them from the agent's transcript as it works: URLs the human pasted or you wrote or\n\
                   fetched, PRs and artifacts your tools printed, files you created or edited. The human sees them\n\
                   under the header's links button (⌘L). Pin what they will want to come back to (the PR, the\n\
                   design, the doc they sent); `add` puts in something the transcript wouldn't show as a link, pinned\n\
@@ -269,7 +277,33 @@ pub static VERBS: &[Verb] = &[
                   (argv in a new terminal in the link's project) or prompt (text for a new agent terminal), or\n\
                   {\"divider\": true}. Open and copy items work at once; run, terminal and prompt items stay hidden\n\
                   until the human approves them, and again whenever those commands change. `register` replaces the\n\
-                  owner's menus; `clear` removes them and forgets the approval.",
+                  owner's menus; `clear` removes them and forgets the approval.", "midna collects them from the agent's transcript as it works: URLs the human pasted or you wrote or\n\
+                  fetched, PRs and artifacts your tools printed, files you created or edited. The human sees them\n\
+                  under the header's links button (Ctrl+Shift+L). Pin what they will want to come back to (the PR, the\n\
+                  design, the doc they sent); `add` puts in something the transcript wouldn't show as a link, pinned\n\
+                  unless --no-pin, with an optional title and --why it matters (shown under it); `remove` drops one\n\
+                  for good (only `add` brings it back). Each link knows the prompts it came up in (numbered as in\n\
+                  `midna prompts`); --turn keeps one, e.g.\n\
+                  `midna links --kind file --turn last` = the files edited since the last prompt. Defaults to your own terminal.\n\
+                  `refresh` tells the app a pull request or run changed (you merged it, re-ran it), so its color and\n\
+                  hover card update now instead of in a minute or two.\n\
+                  `patterns` is for apps: one registers the refs it owns (e.g. T42 -> myapp://task/T42) so they turn\n\
+                  into links in terminal text, alongside the human's terminal.link_patterns and in the same rule\n\
+                  format. `set` replaces that owner's patterns wholesale and they survive a restart; `clear` removes\n\
+                  them. Settings shows them read-only under Links and paths. A rule ending in preview:\"<cmd> $1\" fills the\n\
+                  hover card: the command prints JSON {\"title\": \"…\", \"lines\": [\"In Progress\", …]} and the card\n\
+                  shows it (5s limit, kept 15s; on failure the card shows the plain URL).\n\
+                  `actions` is for apps too: one adds its own items to the menu a click on a link opens. The file\n\
+                  holds {\"menus\": [{\"links\": \"^myapp://task/(T\\\\d+)$\", \"own\": true, \"title\": \"$1\", \"items\": [\n\
+                  {\"label\": \"Go to its terminal\", \"run\": [\"myapp\", \"focus\", \"$1\"]}]}]}: `links` is a regex over the\n\
+                  link's URL (or a pattern's matched text) whose captures ($0 $1 ${name}) fill the fields; `own`\n\
+                  makes the app's menu the whole menu (midna keeps Open, Copy link and Add to links), `section`:\n\
+                  \"<label>\" adds a labelled group to midna's own menu instead. An item is {label, keys?, detail?,\n\
+                  style?: \"danger\", confirm?} with one of open (URL), copy (text), run (argv, no shell), terminal\n\
+                  (argv in a new terminal in the link's project) or prompt (text for a new agent terminal), or\n\
+                  {\"divider\": true}. Open and copy items work at once; run, terminal and prompt items stay hidden\n\
+                  until the human approves them, and again whenever those commands change. `register` replaces the\n\
+                  owner's menus; `clear` removes them and forgets the approval."),
         methods: &["links.list", "links.pin", "links.remove", "links.add", "links.refresh", "links.patterns.list", "links.patterns.register", "links.actions.list", "links.actions.register"],
     },
     Verb {
@@ -280,7 +314,7 @@ pub static VERBS: &[Verb] = &[
                 summary remove <closed-id> | --project <id|name>\n       \
                 summary annotate <terminal-id> --owner <app> --file <panel.json|-> | --clear",
         summary: "the terminals that closed in a project lately: what they did, how they ended, and apps' panels on them",
-        details: "When a terminal in a project closes, midna keeps a record of it for summary.keep_days (7 by default):\n\
+        details: os("When a terminal in a project closes, midna keeps a record of it for summary.keep_days (7 by default):\n\
                   its name, agent, conversation, worktree and branch, when it opened and closed, who closed it, its\n\
                   status then, the prompts the human sent, its cost and its links. The human sees them on the\n\
                   project's Summary (its … menu, ⌥⌘Y); a project whose terminals have all closed keeps a Summary row\n\
@@ -292,7 +326,19 @@ pub static VERBS: &[Verb] = &[
                   \"line\": \"T731 Done\", \"buttons\": [{\"label\": \"Open task\", \"open\": \"taskboard://task/T731\"}]}; only\n\
                   title is required. `line` is the record's second line in the Summary's list, in `color` (a status\n\
                   color or #rrggbb). Links and buttons only open URLs. Annotate a running terminal and the panel\n\
-                  carries over when it closes; annotate again when your state changes (a task done, a PR merged).",
+                  carries over when it closes; annotate again when your state changes (a task done, a PR merged).", "When a terminal in a project closes, midna keeps a record of it for summary.keep_days (7 by default):\n\
+                  its name, agent, conversation, worktree and branch, when it opened and closed, who closed it, its\n\
+                  status then, the prompts the human sent, its cost and its links. The human sees them on the\n\
+                  project's Summary (its … menu, Alt+Shift+Y); a project whose terminals have all closed keeps a Summary row\n\
+                  in the sidebar. `resume` opens one again in its conversation and folder; `remove` drops one, or\n\
+                  with --project clears that project's Summary.\n\
+                  `annotate` is for apps: it puts your panel on a terminal's record, replacing your earlier one. The\n\
+                  file holds {\"title\": \"T731 Dropped files type their path\", \"url\": \"taskboard://task/T731\",\n\
+                  \"badge\": \"Done\", \"color\": \"green\", \"subtitle\": \"G12 Drag and drop · 3/5\", \"subtitle_url\": \"…\",\n\
+                  \"line\": \"T731 Done\", \"buttons\": [{\"label\": \"Open task\", \"open\": \"taskboard://task/T731\"}]}; only\n\
+                  title is required. `line` is the record's second line in the Summary's list, in `color` (a status\n\
+                  color or #rrggbb). Links and buttons only open URLs. Annotate a running terminal and the panel\n\
+                  carries over when it closes; annotate again when your state changes (a task done, a PR merged)."),
         methods: &["summary.list", "summary.remove", "summary.resume", "summary.annotate"],
     },
     Verb {
@@ -343,8 +389,8 @@ pub static VERBS: &[Verb] = &[
                 notify play <kind>|<sound> [--volume 0-100] [--session <id>]\n       \
                 notify clear [--session <id>]\n       \
                 notify history [--unread] [--limit <n>] [--session <id>] | read [<seq>]",
-        summary: "which macOS notifications midna posts, per terminal or globally; send the human one",
-        details: "Lists each kind (approval, attention, failed, turn_done, agent, requests, background, pr_checks,\n\
+        summary: os("which macOS notifications midna posts, per terminal or globally; send the human one", "which Windows notifications midna posts, per terminal or globally; send the human one"),
+        details: os("Lists each kind (approval, attention, failed, turn_done, agent, requests, background, pr_checks,\n\
                   exited, triggers, restarted), whether it's on globally and for the terminal (default: yours).\n\
                   `set` overrides a kind for one terminal (default drops the override); --global changes the\n\
                   `notify.<key>` setting. `mute` silences a terminal. Change these when the human asks (\"tell me\n\
@@ -400,7 +446,63 @@ pub static VERBS: &[Verb] = &[
                   `history` lists what midna recorded, newest first, with its seq (• = unread, - = withdrawn;\n\
                   --unread shows only those). Kinds that don't push a banner (failures, finished turns) show up\n\
                   only here. `read` marks every notification so far read, or those up to <seq>; it never marks\n\
-                  any unread again. The app does it when the human opens Notifications; only do it when asked.",
+                  any unread again. The app does it when the human opens Notifications; only do it when asked.", "Lists each kind (approval, attention, failed, turn_done, agent, requests, background, pr_checks,\n\
+                  exited, triggers, restarted), whether it's on globally and for the terminal (default: yours).\n\
+                  `set` overrides a kind for one terminal (default drops the override); --global changes the\n\
+                  `notify.<key>` setting. `mute` silences a terminal. Change these when the human asks (\"tell me\n\
+                  when every turn ends here\"), and don't turn off something they rely on. `send` notifies the human on purpose: when they asked to be told, or\n\
+                  a result needs them while they may be away. Not for routine progress; approvals, failures and long\n\
+                  turns already notify. At most 6 a minute (--sound plays the human's sound for agent notifications).\n\
+                  It works from outside midna terminals too (a background server, a cron job). In --detail, URLs and\n\
+                  [text](https://…) links can be clicked on the Notifications screen (banners show just the text).\n\
+                  --open <url> makes a click open that URL instead of selecting the terminal. --id <id> names it:\n\
+                  sending again with the same id replaces the one still showing (a repeating alert), and\n\
+                  `withdraw <id>` takes it away once it no longer applies. --action <label> (up to 6, 24 characters\n\
+                  each) adds buttons; ones sharing a first word, or the text before \": \" (\"Later: 1 hour\"), fold into one split button\n\
+                  whose face is the first of them, so put the usual pick first; a response is always the full label. --wait 10m blocks until the human\n\
+                  picks one, clicks or dismisses it and prints the label, `clicked`, `dismissed` or `no response`;\n\
+                  without --wait, `response <id>` asks later, and every response is a `notify.responded` event\n\
+                  (`midna trigger add --event notify.responded --match action='Snooze*' …` reacts to it). Buttons\n\
+                  and clicks need the app running.\n\
+                  --on <label> runs an action the moment the human picks that button (or `clicked`, `dismissed`),\n\
+                  with nothing waiting on it: the flags after it, up to the next --on, are a trigger's action\n\
+                  (--run CMD [--headless|--background] [--project P], --attention MSG, --send TEXT, --notify TITLE,\n\
+                  --agent A --prompt T, --set-status …, --clear-status, --action-json JSON). --project defaults to\n\
+                  the terminal's project. It runs once, survives a midnad restart, shows in `triggers deliveries`, and\n\
+                  `response <id>` (or --wait) also prints what it did. e.g. notify send \"Deploy staging?\"\n\
+                  --action Deploy --action Skip --on Deploy --run ./deploy.sh --headless --on clicked --attention \"Deploy?\"\n\
+                  `kinds` lists the kinds the human added (deploys, ci, …); `send --kind <key>` sends as one, with its\n\
+                  own sound, color and switch. `kinds add` makes one when the human asks (--stay 0 = it stays on\n\
+                  screen until handled; --color a theme color need|ok|err|work|accent|dim or #rrggbb; --set\n\
+                  sound=chimes, push=false, …); `kinds rm` removes it and its settings.\n\
+                  Every kind also has notify.stay.<kind> (seconds on screen in the floating badge and the in-app\n\
+                  card, 0 = until handled) and notify.color.<kind>. notify.badge (background|always|off) shows or\n\
+                  hides the floating badge; notify.badge.corner says which corner it sits in.\n\
+                  Each kind has a sound, a volume and an image: settings notify.sound.<kind> (none, one of midna's\n\
+                  Twilight sounds, the defaults: Portal, Call, Uh-oh, Strum, Hm, Rise, Settle, Whoosh, Fwip, Tock,\n\
+                  Tick, Thump, Tick-tick, plus Nn-nn, Close, Fall, Step, Tap-tap, Cascade, Drop; a Windows sound like\n\
+                  chimes; or an imported file), notify.volume.<kind>\n\
+                  (0-100, times the master notify.volume) and notify.image.<kind> (empty = notify.image, every\n\
+                  notification's image). `import` copies a sound\n\
+                  (wav) or image (png, jpg, gif) into midna, --for sets it for those kinds;\n\
+                  `media` lists what's there; `test` shows a kind's notification even when it's off. Pick sounds\n\
+                  and images only when the human asks.\n\
+                  A kind's title and text are templates: `settings set notify.body.turn_done \"{{elapsed}} · {{reply}}\"`,\n\
+                  notify.title.<kind> likewise (empty = midna's own; a body of `none` shows the title only; a title\n\
+                  can't be empty). Each has {{text}} and {{heading}} (midna's own body and title), {{project}},\n\
+                  {{session.name}} and its own variables (in the setting's description, `settings list --json`);\n\
+                  `notify test <kind>` shows it with sample values.\n\
+                  Sound effects play in the app with no banner and use the same settings: approved, denied,\n\
+                  queue_sent, image_added, closed (what the human does) and switched, command_bar, copied (UI cues).\n\
+                  notify.sounds turns every sound off; notify.sounds_in_app off silences sounds while midna is the\n\
+                  frontmost app. `play`\n\
+                  plays a kind's sound or a sound by name now (at most 6 a minute), when the human asks for one.\n\
+                  `clear` removes every midna notification from Action Center (--session: only that\n\
+                  terminal's); opening a terminal already removes its own.\n\
+                  `history` lists what midna recorded, newest first, with its seq (• = unread, - = withdrawn;\n\
+                  --unread shows only those). Kinds that don't push a banner (failures, finished turns) show up\n\
+                  only here. `read` marks every notification so far read, or those up to <seq>; it never marks\n\
+                  any unread again. The app does it when the human opens Notifications; only do it when asked."),
         methods: &["notify.list", "notify.set", "notify.send", "notify.kinds.list", "notify.kinds.add", "notify.kinds.remove", "notify.media", "notify.import", "notify.remove", "notify.test", "notify.play", "notify.clear", "notify.withdraw", "notify.response", "notify.history", "notify.read"],
     },
     Verb {
@@ -530,7 +632,7 @@ pub static VERBS: &[Verb] = &[
                 triggers test <id> [--payload FILE|-|JSON] [--event E] [--session ID]\n       \
                 triggers test <id> --stream NAME --kind KIND [--id ID] [--data JSON|@file|-]",
         summary: "triggers: GitHub/Bitbucket webhooks, or local agent hooks / midna events / idle terminals / schedules, that act",
-        details: "Webhook triggers: agents draft freely; they start as needs_secret. Only the human pastes the signing\n\
+        details: os("Webhook triggers: agents draft freely; they start as needs_secret. Only the human pastes the signing\n\
                   secret and enables one (`enable` from an agent asks the human). Anyone may pause.\n\
                   Templates: {{pr.number}} {{pr.title}} {{repo}} {{branch}} {{sender}} {{url}} or any payload path.\n\
                   --run opens a monitor terminal as a tab; --background opens it in the sidebar's Background group;\n\
@@ -571,7 +673,48 @@ pub static VERBS: &[Verb] = &[
                   Templates: {{last_prompt}} {{event}} {{session.id|name|project_id|agent|status}} {{data.<path>}} or {{<path>}}.\n\
                   Example: triggers add --name \"Auto-compact\" --event agent.prompt_blocked \\\n\
                   \x20 --match 'message=*Compact first*' --send /compact --send '{{last_prompt}}' --enable\n\
-                  `midna explain triggers` has the full rules.",
+                  `midna explain triggers` has the full rules.", "Webhook triggers: agents draft freely; they start as needs_secret. Only the human pastes the signing\n\
+                  secret and enables one (`enable` from an agent asks the human). Anyone may pause.\n\
+                  Templates: {{pr.number}} {{pr.title}} {{repo}} {{branch}} {{sender}} {{url}} or any payload path.\n\
+                  --run opens a monitor terminal as a tab; --background opens it in the sidebar's Background group;\n\
+                  --headless runs it with no terminal: `deliveries` / `replay` show its exit code and output tail\n\
+                  (stopped after --timeout, default 30m). On update, --background/--headless alone change the current\n\
+                  command; --run CMD alone makes it a tab again.\n\
+                  Agents a webhook trigger starts are supervised (setting triggers.agent_mode); a local trigger's use\n\
+                  your normal agent config. --permission-mode (default, manual, auto, acceptEdits, plan, dontAsk,\n\
+                  bypassPermissions) and --allow-tool TOOL (repeatable, e.g. mcp__claude_ai_Slack__slack_send_message)\n\
+                  set that for one Claude trigger's agents only; they're human only (an agent asks the human). On\n\
+                  update, alone they change the current agent; an empty value clears one. --prompt TEMPLATE alone\n\
+                  replaces the current agent's prompt and keeps the rest.\n\
+                  \n\
+                  Local triggers (source local; inferred for hook.*, agent.*, session.*, needs_you.*, stream.*, idle, schedule,\n\
+                  or any local-only flag) fire on this PC and act on the terminal that fired. Agents may add, enable\n\
+                  (--enable) and disable them when the human asked for one. --send steps run in order, each waiting\n\
+                  until the agent is ready. --match path=glob (repeatable) matches the hook payload / event data,\n\
+                  case-insensitive; the same path twice needs both globs, in any order. An empty glob removes the key\n\
+                  on update; an empty value clears a filter flag.\n\
+                  Durations: 90s, 55m, 1h30m; a bare number is minutes for --idle-for, seconds for --cooldown.\n\
+                  --cron (implies --event schedule): minute hour day-of-month month day-of-week in local time, or\n\
+                  @hourly/@daily/@weekly/@monthly/@yearly, or @every 55m for an interval cron can't say (*/55 is\n\
+                  :00 and :55; @every counts from --starts, or runs one interval after it's added). Without\n\
+                  --session/--in-project/--for-agent it fires once about no terminal (notify, attention, run, agent);\n\
+                  with one it acts on each running match.\n\
+                  Schedules also take --between HH:MM-HH:MM (local, end not included; may wrap midnight), --starts\n\
+                  and --ends (local `2026-10-06 13:00` or a date), --max-runs N (1 = once; a new limit counts again).\n\
+                  --wake would wake a sleeping PC for each run; that isn't on Windows yet, where it only keeps the\n\
+                  PC awake while the work goes on (--no-wake on update).\n\
+                  stream.<name>.<kind> (globs: stream.slack.*) fires on what a program hands midna with `midna stream\n\
+                  publish`; such an event has no terminal, and its envelope is {{stream.name|kind|id}}. `test\n\
+                  --stream slack --kind message --data JSON` dry-runs one without publishing it; `midna stream events\n\
+                  <name> --replay SEQ|ID` runs a recorded one through the triggers again.\n\
+                  --to NAME|ID makes --send, --set-status, --clear-status, --notify and --attention act on that\n\
+                  terminal instead of the one that fired (for stream and schedule events, which have none): an\n\
+                  exact name, else a session id, looked up when it fires (in --in-project's project when set; of\n\
+                  several, the most recently active). No such terminal: nothing happens; the delivery says why.\n\
+                  Templates: {{last_prompt}} {{event}} {{session.id|name|project_id|agent|status}} {{data.<path>}} or {{<path>}}.\n\
+                  Example: triggers add --name \"Auto-compact\" --event agent.prompt_blocked \\\n\
+                  \x20 --match 'message=*Compact first*' --send /compact --send '{{last_prompt}}' --enable\n\
+                  `midna explain triggers` has the full rules."),
         methods: &[
             "trigger.list", "trigger.add", "trigger.update", "trigger.set_enabled", "trigger.set_secret", "trigger.remove",
             "trigger.deliveries", "trigger.replay", "trigger.test",
@@ -581,7 +724,7 @@ pub static VERBS: &[Verb] = &[
         name: "webhooks",
         aliases: &["webhook"],
         usage: "webhooks status | reconcile\n       webhooks configure <tailscale_funnel|self_relay|midna_relay|off> [--port N] [--relay-url U]   (human only)",
-        summary: "how webhooks reach this Mac",
+        summary: os("how webhooks reach this Mac", "how webhooks reach this PC"),
         details: "status shows the path, health and the public URL to paste into GitHub. reconcile asks GitHub\n\
                   (via `gh`) for deliveries midnad missed. configure is human only: it asks the human.",
         methods: &["webhooks.status", "webhooks.reconcile", "webhooks.configure"],
@@ -642,8 +785,8 @@ pub static VERBS: &[Verb] = &[
                 stream add <name> [--project P] [--secret NAME]... [--cwd DIR] -- <command...>\n       \
                 stream update <name> [--project P] [--secret NAME]... [--no-secrets] [--cwd DIR] [-- <command...>]\n       \
                 stream list | pause <name> | resume <name> | restart <name> | remove <name>",
-        summary: "hand midna an event from a program on this Mac, for local triggers",
-        details: "Logs event `stream.<name>.<kind>` with the JSON object as its data (at most 64 KB; --data left out\n\
+        summary: os("hand midna an event from a program on this Mac, for local triggers", "hand midna an event from a program on this PC, for local triggers"),
+        details: os("Logs event `stream.<name>.<kind>` with the JSON object as its data (at most 64 KB; --data left out\n\
                   reads stdin, `{}` from a terminal). Local triggers react to it like any midna event:\n\
                   `midna triggers add --event 'stream.slack.*' --match text='*failed*' --notify '{{data.text}}'`.\n\
                   name: a-z 0-9 - (1-32); kind: a-z 0-9 _ . - (1-64); --id: yours for the event ({{stream.id}}).\n\
@@ -672,7 +815,36 @@ pub static VERBS: &[Verb] = &[
                   \x20       restarts, last exit and last event.\n\
                   pause/resume/restart/remove  stop it and keep it stopped / start it / start it again now / stop\n\
                   \x20       and forget it. Stopping one stops everything it started. Agents may pause, resume an\n\
-                  \x20       approved stream, restart, and remove a paused one; removing a running one asks the human.",
+                  \x20       approved stream, restart, and remove a paused one; removing a running one asks the human.", "Logs event `stream.<name>.<kind>` with the JSON object as its data (at most 64 KB; --data left out\n\
+                  reads stdin, `{}` from a terminal). Local triggers react to it like any midna event:\n\
+                  `midna triggers add --event 'stream.slack.*' --match text='*failed*' --notify '{{data.text}}'`.\n\
+                  name: a-z 0-9 - (1-32); kind: a-z 0-9 _ . - (1-64); --id: yours for the event ({{stream.id}}).\n\
+                  Local only: it goes over midna's socket; nothing listens on the network.\n\
+                  Per stream: an --id taken in the last 24 hours is a duplicate (not published again); over 60\n\
+                  events a minute (bursts of 20), or with 1000 events waiting, a publish is dropped (exit 1); a\n\
+                  trigger fires on every event unless it sets --cooldown (then at most once per it, per stream).\n\
+                  events  the stream's last 200 publishes, newest first, with what midna did with each:\n\
+                  \x20       accepted, duplicate, rate_limited, too_large, busy or refused.\n\
+                  --replay  run a recorded event (its seq or --id) through the local triggers again, past dedupe\n\
+                  \x20         and cooldown; each firing is a delivery marked replayed. Events a trigger caused\n\
+                  \x20         still fire nothing. Test a trigger first: `midna triggers test <id> --stream …`.\n\
+                  add     midnad runs <command> (in --cwd, else the project's folder, else here) and keeps it\n\
+                  \x20       running: each stdout line {{\"kind\":\"…\",\"id\":\"…\",\"data\":{{…}}}} is published like\n\
+                  \x20       `stream publish`. Other lines and stderr go to $MIDNA_HOME/streams/<name>.log (1 MB, one\n\
+                  \x20       older file kept). On exit it starts again after 1s, doubling to 5 minutes (back to 1s after\n\
+                  \x20       10 minutes up); every stream starts again when midnad starts and after the PC wakes.\n\
+                  \x20       --secret NAME (repeatable): the stored secret goes in its environment as $NAME, resolved\n\
+                  \x20       like `secret exec` (--project first); only the names are saved, and the values are masked\n\
+                  \x20       in what it prints. An agent's stream waits, paused, for the human's approval: one\n\
+                  \x20       needs-you naming its command, cwd, project and secrets (`midna approve <id>` runs it).\n\
+                  update  change its command (after --), --cwd, --project or secrets (--secret replaces them,\n\
+                  \x20       --no-secrets drops them); a running one starts again with them. An agent's change pauses\n\
+                  \x20       it and asks the human again, even if it was approved before.\n\
+                  list    each stream's state (starting, running, backoff, failing, paused, awaiting_approval), pid,\n\
+                  \x20       restarts, last exit and last event.\n\
+                  pause/resume/restart/remove  stop it and keep it stopped / start it / start it again now / stop\n\
+                  \x20       and forget it. Stopping one stops everything it started. Agents may pause, resume an\n\
+                  \x20       approved stream, restart, and remove a paused one; removing a running one asks the human."),
         methods: &["streams.publish", "streams.events", "trigger.replay", "streams.add", "streams.update", "streams.list", "streams.set_enabled", "streams.restart", "streams.remove"],
     },
     Verb {
@@ -691,8 +863,8 @@ pub static VERBS: &[Verb] = &[
         name: "system",
         aliases: &["load"],
         usage: "system [load] | wait [--timeout S] | run-anyway [terminal] | pause <terminal> | resume <terminal> | stop <terminal> [pid …]",
-        summary: "the Mac's load, and pausing or stopping terminals that hog it",
-        details: "load    the Mac's CPU in use (all cores) and what midna's terminals and other apps use of it\n\
+        summary: os("the Mac's load, and pausing or stopping terminals that hog it", "the PC's load, and pausing or stopping terminals that hog it"),
+        details: os("load    the Mac's CPU in use (all cores) and what midna's terminals and other apps use of it\n\
                   \x20       (busiest processes: rustc ×14), busy/overloaded, and the load average. Busy =\n\
                   \x20       system.busy_cpu (90% by default); busy for guard.overload_secs fires system.overloaded and\n\
                   \x20       the app says whether terminals or other apps are the cause. Agents are only held back when\n\
@@ -716,7 +888,31 @@ pub static VERBS: &[Verb] = &[
                   builds/tests/installs (guard.busy_gate; `system wait` waits it out). An agent runs at most guard.max_subagents subagents at once.\n\
                   At most guard.build_slots builds/tests/installs (2 by default) run at once across every terminal:\n\
                   another waits in line before it starts and goes when a slot frees, in the order they asked. A\n\
-                  build sent to the background holds its slot until it ends. `system load` lists who holds and waits.",
+                  build sent to the background holds its slot until it ends. `system load` lists who holds and waits.", "load    the PC's CPU in use (all cores) and what midna's terminals and other apps use of it\n\
+                  \x20       (busiest processes: rustc ×14), busy/overloaded, and the load average. Busy =\n\
+                  \x20       system.busy_cpu (90% by default); busy for guard.overload_secs fires system.overloaded and\n\
+                  \x20       the app says whether terminals or other apps are the cause. Agents are only held back when\n\
+                  \x20       midna's terminals use at least half of the CPU in use. Memory: Windows' memory load as\n\
+                  \x20       pressure (warning at 85% in use, critical at 95%), and the terminals using the most. Pressure at system.busy_memory\n\
+                  \x20       (warning by default) holds heavy work back whoever uses it.\n\
+                  wait    block until agents aren't held back (the busy gate's own check: CPU or memory), then\n\
+                  \x20       print the load.\n\
+                  \x20       Exit 4 if still held at --timeout seconds (default: no limit). When a build, test or\n\
+                  \x20       subagent is held, run it as a background command and retry once it ends; midnad never\n\
+                  \x20       stops it.\n\
+                  run-anyway  the human said to go ahead though the PC is busy: the busy gate lets this terminal\n\
+                  \x20       (or the one given) through until the human's next prompt. Only when the human asked\n\
+                  pause   stop (SIGSTOP) the terminal's whole process tree, agent included, until resumed. Human only\n\
+                  resume  continue it\n\
+                  stop    end what the terminal started (or only the pids given, with their children): SIGTERM,\n\
+                  \x20       SIGKILL after 3s. Its shell or agent keeps running. Human only\n\
+                  midnad also stops agents' background poll loops (`until … sleep`) older than guard.loop_max_hours.\n\
+                  While busy, what the heaviest agent terminals start runs at low priority\n\
+                  (guard.background_agents; \"slowed\" in the list), and agents are denied new subagents and\n\
+                  builds/tests/installs (guard.busy_gate; `system wait` waits it out). An agent runs at most guard.max_subagents subagents at once.\n\
+                  At most guard.build_slots builds/tests/installs (2 by default) run at once across every terminal:\n\
+                  another waits in line before it starts and goes when a slot frees, in the order they asked. A\n\
+                  build sent to the background holds its slot until it ends. `system load` lists who holds and waits."),
         methods: &["system.load", "system.run_anyway", "session.pause", "session.resume", "session.stop_processes"],
     },
     Verb {
@@ -762,7 +958,7 @@ pub static VERBS: &[Verb] = &[
                 \x20     | forget <name|id> | tier <name|id> --as contact|my-device | auto-accept <name|id> <kinds|all> on|off\n\
                 \x20     | agent-send <name|id> <kinds|all> on|off | drive <name|id> on|off\n\
                 \x20     | visibility off|paired|everyone | name [<name>]",
-        summary: "other Midnas on the same network (Nearby), and who can find this Mac",
+        summary: os("other Midnas on the same network (Nearby), and who can find this Mac", "other Midnas on the same network (Nearby), not on Windows yet"),
         details: "list        this Mac's name, device id and visibility, then the Midnas it can see over Bonjour.\n\
                   \x20           A device id (SHA-256 of the device's key) is what tells devices apart; names can repeat.\n\
                   sessions    the agent terminals open on one of your own devices (kept as my-device): id, name,\n\
@@ -879,15 +1075,21 @@ pub static VERBS: &[Verb] = &[
     Verb {
         name: "keep-awake",
         aliases: &["awake"],
-        usage: "keep-awake [status] | on | off\n       \
+        usage: os("keep-awake [status] | on | off\n       \
                 keep-awake hours <start> <end> [days]   (8am 6pm weekdays)\n       \
                 keep-awake days <days> | day <days> <9am-3pm|off|all day|default>\n       \
                 keep-awake today off|on|until <time>|for <hours>|clear\n       \
                 keep-awake for <hours> | until <time>   (5h, 90 min; 1am: on past midnight)\n       \
                 keep-awake mode with_work|always | battery <percent> | linger <minutes>\n       \
-                keep-awake wake [on|off|setup|remove]   (wake the Mac for work scheduled inside the hours)",
-        summary: "keep the Mac from idle-sleeping during work hours while agents have work",
-        details: "Whether midnad holds its power assertion now, why or why not, and when the hours next open or\n\
+                keep-awake wake [on|off|setup|remove]   (wake the Mac for work scheduled inside the hours)", "keep-awake [status] | on | off\n       \
+                keep-awake hours <start> <end> [days]   (8am 6pm weekdays)\n       \
+                keep-awake days <days> | day <days> <9am-3pm|off|all day|default>\n       \
+                keep-awake today off|on|until <time>|for <hours>|clear\n       \
+                keep-awake for <hours> | until <time>   (5h, 90 min; 1am: on past midnight)\n       \
+                keep-awake mode with_work|always | battery <percent> | linger <minutes>\n       \
+                keep-awake wake [on|off|setup|remove]   (not on Windows yet: would wake the PC for scheduled work)"),
+        summary: os("keep the Mac from idle-sleeping during work hours while agents have work", "keep the PC from idle-sleeping during work hours while agents have work"),
+        details: os("Whether midnad holds its power assertion now, why or why not, and when the hours next open or\n\
                   close. Inside the hours (keep_awake.start/end/days, per-day keep_awake.hours) it holds one while\n\
                   there is work: an agent working, queued input, an agent waiting to resume, a schedule trigger or\n\
                   wakeup due (mode always: the whole time). Only idle sleep: the display sleeps and the lid still\n\
@@ -899,7 +1101,16 @@ pub static VERBS: &[Verb] = &[
                   `wake` (keep_awake.wake) also wakes a sleeping Mac 2 minutes before the next work due inside the\n\
                   hours (a schedule trigger, a message queued --at a time, an agent's wakeup) and holds it until the\n\
                   work runs. `wake setup` asks for an admin password once to install a helper that can only schedule\n\
-                  midna's own wakes; `wake remove` takes it out. A closed lid keeps a laptop asleep.",
+                  midna's own wakes; `wake remove` takes it out. A closed lid keeps a laptop asleep.", "Whether midnad holds its power request now, why or why not, and when the hours next open or\n\
+                  close. Inside the hours (keep_awake.start/end/days, per-day keep_awake.hours) it holds one while\n\
+                  there is work: an agent working, queued input, an agent waiting to resume, a schedule trigger or\n\
+                  wakeup due (mode always: the whole time). Only idle sleep: the display sleeps and the lid still\n\
+                  sleeps the PC. On battery it lets go below keep_awake.min_battery (again 5 points above, or on\n\
+                  power). `today off` is off for the rest of today; `on` is on until midnight; on until a time\n\
+                  (`until 5pm`, `for 5h`, or past midnight: `until 1am`; 24 hours at most) is on until then, and\n\
+                  the schedule takes over after.\n\
+                  Times: 8am, 5:30pm, 17:30. Days: weekdays, weekends, daily, mon-fri, mon,wed,fri.\n\
+                  `wake` (keep_awake.wake) isn't on Windows yet: midna doesn't wake a sleeping PC for scheduled work."),
         methods: &["keep_awake.status", "keep_awake.set", "keep_awake.wake_setup"],
     },
     Verb {
@@ -921,7 +1132,7 @@ pub static VERBS: &[Verb] = &[
                 commands add --title T (--rpc METHOD [--params JSON] | --screen S | --prefill TEXT | --focus ID)\n            \
                 [--keywords K] [--sub S] [--icon I] [--featured HEADING] [--danger WHY] [--id ID] [--replace]\n       \
                 commands remove <id>",
-        summary: "user commands in the human's ⌘K palette ($MIDNA_HOME/commands.json)",
+        summary: os("user commands in the human's ⌘K palette ($MIDNA_HOME/commands.json)", "user commands in the human's Ctrl+Shift+K palette ($MIDNA_HOME/commands.json)"),
         details: "Add commands for workflows the human repeats; they show up in the palette at once. --rpc runs\n\
                   a daemon method as the human when they pick it (human-only methods always ask twice).\n\
                   Per-project scripts belong in `midna projects add-command` instead.\n\
@@ -933,10 +1144,13 @@ pub static VERBS: &[Verb] = &[
         aliases: &["theme"],
         usage: "themes [list] | use <id|system> | format",
         summary: "color themes: the eight built-ins and custom ones in $MIDNA_HOME/themes",
-        details: "list shows every theme (* = showing now) and custom theme files that failed to load. use <id>\n\
+        details: os("list shows every theme (* = showing now) and custom theme files that failed to load. use <id>\n\
                   switches (settings theme; system follows macOS with theme.dark / theme.light). format prints\n\
                   the custom theme file shape. One color on top of any theme: setting theme.colors\n\
-                  (`midna settings set theme.colors \"accent = #FF79C6\"`).",
+                  (`midna settings set theme.colors \"accent = #FF79C6\"`).", "list shows every theme (* = showing now) and custom theme files that failed to load. use <id>\n\
+                  switches (settings theme; system follows Windows with theme.dark / theme.light). format prints\n\
+                  the custom theme file shape. One color on top of any theme: setting theme.colors\n\
+                  (`midna settings set theme.colors \"accent = #FF79C6\"`)."),
         methods: &["themes.list"],
     },
     Verb {
@@ -952,10 +1166,11 @@ pub static VERBS: &[Verb] = &[
     Verb {
         name: "permissions",
         aliases: &["permission"],
-        usage: "permissions [status] | open <accessibility|notifications|login-items>",
-        summary: "macOS permissions midna uses, and the System Settings pane for each",
-        details: "status says what midnad can see. open opens the pane in System Settings; only the human can\n\
-                  grant anything there (from an agent, raise `midna attention` to ask).",
+        usage: os("permissions [status] | open <accessibility|notifications|login-items>", "permissions [status] | open <notifications|login-items>"),
+        summary: os("macOS permissions midna uses, and the System Settings pane for each", "Windows settings midna uses, and the Settings page for each"),
+        details: os("status says what midnad can see. open opens the pane in System Settings; only the human can\n\
+                  grant anything there (from an agent, raise `midna attention` to ask).", "status says what midnad can see. open opens its page in Settings; only the human can\n\
+                  grant anything there (from an agent, raise `midna attention` to ask)."),
         methods: &["permissions.status"],
     },
     Verb {
@@ -1093,6 +1308,24 @@ pub fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Off macOS help names no Mac, macOS, Finder or Mac key, except Nearby's verbs (peers'
+    /// details, share and inbox), which aren't on Windows yet.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn help_says_this_platforms_words() {
+        use midna_proto::wording::mac_words;
+        for v in VERBS {
+            let nearby = matches!(v.name, "share" | "inbox");
+            assert_eq!(mac_words(v.summary), None, "{}: {}", v.name, v.summary);
+            if !nearby {
+                assert_eq!(mac_words(v.usage), None, "{}: {}", v.name, v.usage);
+            }
+            if !nearby && v.name != "peers" {
+                assert_eq!(mac_words(v.details), None, "{}: {}", v.name, v.details);
+            }
+        }
+    }
 
     #[test]
     fn every_method_in_help_exists_and_every_reachable_method_has_a_verb() {

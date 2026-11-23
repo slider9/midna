@@ -3215,7 +3215,7 @@ impl Render for TerminalView {
                         .child(div().text_color(dim).child("Find"))
                         .child(div().min_w(px(140.)).font_family(self.font_family.clone()).text_color(theme.fg).child(format!("{}▏", f.query)))
                         .child(div().text_color(if f.total == 0 && !f.query.is_empty() { theme.err } else { dim }).child(count))
-                        .child(div().text_color(dim).child("↩ older · ⇧↩ newer · esc")),
+                        .child(div().text_color(dim).child(midna_proto::wording::os("↩ older · ⇧↩ newer · esc", "Enter older · Shift+Enter newer · Esc"))),
                 )
             })
             .children(not_running)

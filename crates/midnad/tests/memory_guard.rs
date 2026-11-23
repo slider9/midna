@@ -43,7 +43,8 @@ fn memory_pressure_holds_heavy_work_back_and_says_so() {
         let list = call(&mut h, "needs_you.list", json!({}));
         list.as_array().unwrap().iter().find(|n| n["title"].as_str().is_some_and(|t| t.contains("short of memory"))).cloned()
     });
-    assert!(item["detail"].as_str().unwrap().contains("pressure is warning"), "{item}");
+    let said = midna_proto::wording::os("pressure is warning", "memory load is warning");
+    assert!(item["detail"].as_str().unwrap().contains(said), "{item}");
     let events = call(&mut h, "events.list", json!({ "filter": { "kinds": ["system.memory_pressure"] } }));
     assert_eq!(events.as_array().unwrap().len(), 1, "{events}");
     // Only at critical: warning goes ahead.

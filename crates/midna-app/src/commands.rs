@@ -654,6 +654,8 @@ pub fn build(s: &Snapshot) -> Vec<Command> {
             .kw("secret new store keychain token api key password credential env")
             .cli("<command> | midna secret save NAME"),
     );
+    // Nearby isn't on Windows yet (midnad refuses share.*), so its commands are macOS only.
+    #[cfg(target_os = "macos")]
     for (what, title, sub) in [
         ("selection", "Share selection with a nearby Mac…", "sends the focused terminal's selected text to one of your paired Macs"),
         ("clipboard", "Share clipboard with a nearby Mac…", "sends the text or link you copied to one of your paired Macs"),
@@ -666,18 +668,21 @@ pub fn build(s: &Snapshot) -> Vec<Command> {
                 .cli("midna share send <name> <text>"),
         );
     }
+    #[cfg(target_os = "macos")]
     out.push(
         Command::new("share.tab", CmdIcon::Run, "Send this tab to a nearby Mac…", Run::Share { what: "tab".into() })
             .sub("opens there as a new shell in its checkout of this terminal's project, with this tab's scrollback")
             .kw("nearby share send tab terminal scrollback handoff move remote mac peer paired device")
             .cli("midna share send <name> --tab"),
     );
+    #[cfg(target_os = "macos")]
     out.push(
         Command::new("share.file", CmdIcon::Run, "Send a file to a nearby Mac…", Run::Share { what: "file".into() })
             .sub("pick a file or folder; it lands in their downloads folder once they accept it (or drop one on Notifications › Nearby)")
             .kw("nearby share send file folder upload transfer airdrop remote mac peer paired device")
             .cli("midna share send <name> <path>"),
     );
+    #[cfg(target_os = "macos")]
     out.push(
         Command::new("share.agent", CmdIcon::Run, "Ask an agent on a nearby Mac…", Run::Share { what: "agent".into() })
             .sub("starts an agent on one of your paired Macs in its checkout of this terminal's project; its answer comes back")
@@ -1430,7 +1435,7 @@ pub fn folder_rows(query: &str, home: &str, roots: &[String]) -> Option<Vec<Comm
     let sep = last_sep.map_or('/', |i| typed.as_bytes()[i] as char);
     for n in subs.into_iter().take(FOLDER_ROWS) {
         let next = format!("{typed_dir}{n}{sep}");
-        out.push(Command::new(format!("folder.go:{next}"), CmdIcon::Project, next.clone(), Run::Prefill { text: format!("{FOLDER_PREFIX}{next}") }).sub("↩ to look inside"));
+        out.push(Command::new(format!("folder.go:{next}"), CmdIcon::Project, next.clone(), Run::Prefill { text: format!("{FOLDER_PREFIX}{next}") }).sub(os("↩ to look inside", "Enter to look inside")));
     }
     Some(out)
 }

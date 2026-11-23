@@ -140,9 +140,11 @@ mod tests {
         assert_eq!(resolve(&s, &home, "switched", true), Some((home.join("notify/twilight/Tick.wav"), 20)));
         assert_eq!(resolve(&s, &home, "failed", true), Some((home.join("notify/twilight/Uh-oh.wav"), 50)));
         assert_eq!(resolve(&s, &home, "nope", true), None);
-        // A macOS sound, and none.
-        let mac = with(&[("notify.sound.approved", json!("Tink")), ("notify.sound.copied", json!("none"))]);
-        assert_eq!(resolve(&mac, &home, "approved", true), Some(("/System/Library/Sounds/Tink.aiff".into(), 100)));
+        // One of the system's sounds (macOS's, or Windows' own), and none.
+        let system = midna_proto::wording::os("Tink", "chimes");
+        let mac = with(&[("notify.sound.approved", json!(system)), ("notify.sound.copied", json!("none"))]);
+        let file = notify::system_sound_path(system).unwrap();
+        assert_eq!(resolve(&mac, &home, "approved", true), Some((file.into(), 100)));
         assert_eq!(resolve(&mac, &home, "copied", true), None);
         // Before midnad installed them, Twilight sounds play nothing.
         assert_eq!(resolve(&s, Path::new("/nonexistent"), "approved", true), None);

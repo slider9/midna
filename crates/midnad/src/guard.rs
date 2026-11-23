@@ -679,18 +679,28 @@ pub fn hold(d: &Daemon, a: &PolicyAction, gone: &dyn Fn() -> bool) -> Option<Str
         };
         let why = if l.memory_held {
             let biggest = l.memory_top.first().map(|t| format!("; `{}` ({}) uses the most, {}", t.name, t.session_id, sys::bytes_label(t.memory_bytes))).unwrap_or_default();
-            format!(
+            #[cfg(target_os = "macos")]
+            let why = format!(
                 "the Mac is short of memory: macOS's memory pressure is {} ({} compressed, {} of swap in use; busy from {}, setting system.busy_memory){biggest}",
                 l.memory_pressure.as_str(),
                 sys::bytes_label(l.compressed_bytes),
                 sys::bytes_label(l.swap_used_bytes),
                 l.busy_memory_at
-            )
+            );
+            #[cfg(not(target_os = "macos"))]
+            let why = format!(
+                "the PC is short of memory: Windows' memory load is {} ({} of the page file in use beyond memory; busy from {}, setting system.busy_memory){biggest}",
+                l.memory_pressure.as_str(),
+                sys::bytes_label(l.swap_used_bytes),
+                l.busy_memory_at
+            );
+            why
         } else {
-            format!("the Mac is busy: {}% of its CPU is in use, {}% of it by midna's terminals (busy from {}%)", l.cpu_percent, l.midna_percent, l.busy_cpu_at)
+            format!("the {} is busy: {}% of its CPU is in use, {}% of it by midna's terminals (busy from {}%)", midna_proto::wording::MAC, l.cpu_percent, l.midna_percent, l.busy_cpu_at)
         };
         Some(format!(
-            "{why}. Don't start {what} now: tell the human you're waiting for the Mac to calm down, run `midna system wait` as a background command (it returns once it has) and try again when it finishes. Work already running carries on. If the human tells you to go ahead anyway, run `midna system run-anyway` first, then retry: it lets this terminal through until their next prompt."
+            "{why}. Don't start {what} now: tell the human you're waiting for the {mac} to calm down, run `midna system wait` as a background command (it returns once it has) and try again when it finishes. Work already running carries on. If the human tells you to go ahead anyway, run `midna system run-anyway` first, then retry: it lets this terminal through until their next prompt.",
+            mac = midna_proto::wording::MAC
         ))
     });
     if reason.is_some() && subagent {
@@ -789,7 +799,11 @@ fn build_slot(d: &Daemon, sid: &str, command: &str, program: String, model: bool
             }
             let ahead = g.line.iter().take_while(|w| w.ticket != ticket).filter(|w| w.parked.is_none() && w.model == model).count();
             let running = g.builds.iter().filter(|b| b.model == model).count();
-            let what = if model { "local model runs already run across the Mac's terminals (guard.model_slots" } else { "builds and tests already run across the Mac's terminals (guard.build_slots" };
+            let what = if model {
+                midna_proto::wording::os("local model runs already run across the Mac's terminals (guard.model_slots", "local model runs already run across the PC's terminals (guard.model_slots")
+            } else {
+                midna_proto::wording::os("builds and tests already run across the Mac's terminals (guard.build_slots", "builds and tests already run across the PC's terminals (guard.build_slots")
+            };
             return Some(format!(
                 "{running} {what} = {slots}) and {ahead} more are ahead of this one. Run the same command again now: it keeps its place in line and starts when a slot frees. Don't sleep or poll first."
             ));
@@ -1068,7 +1082,7 @@ fn memory_alert(d: &Daemon) {
     }
     let biggest = l.memory_top.first();
     let item = alert.then(|| {
-        let title = format!("The Mac is short of memory (pressure {})", l.memory_pressure.as_str());
+        let title = format!("The {} is short of memory (pressure {})", midna_proto::wording::MAC, l.memory_pressure.as_str());
         let mut item = d.new_needs_you(NeedsYouKind::Note, title, Actor::system(), biggest.map(|t| t.session_id.clone()));
         item.detail = memory_detail(&l);
         item.bulk_safe = true;
@@ -1083,10 +1097,18 @@ fn memory_alert(d: &Daemon) {
 
 /// What the memory needs-you says: how short the Mac is, and who uses the most.
 fn memory_detail(l: &SystemLoad) -> String {
+    #[cfg(target_os = "macos")]
     let mut s = format!(
         "macOS's memory pressure is {} ({} compressed, {} of swap in use, {} in all). New builds, tests, model runs and subagents wait until it drops (system.busy_memory). Past critical the Mac can hang and kernel-panic.",
         l.memory_pressure.as_str(),
         sys::bytes_label(l.compressed_bytes),
+        sys::bytes_label(l.swap_used_bytes),
+        sys::bytes_label(l.memory_total_bytes)
+    );
+    #[cfg(not(target_os = "macos"))]
+    let mut s = format!(
+        "Windows' memory load is {} ({} of the page file in use beyond the {} of memory). New builds, tests, model runs and subagents wait until it drops (system.busy_memory). Past critical the PC can slow to a crawl as Windows pages memory out.",
+        l.memory_pressure.as_str(),
         sys::bytes_label(l.swap_used_bytes),
         sys::bytes_label(l.memory_total_bytes)
     );

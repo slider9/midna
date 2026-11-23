@@ -511,7 +511,7 @@ impl Render for QueueView {
             .py(px(10.))
             .border_t_1()
             .border_color(t.line)
-            .when(editing, |d| d.child(div().px(px(2.)).text_size(px(11.5)).text_color(t.accent).child("Editing · ↩ to save, esc to cancel")))
+            .when(editing, |d| d.child(div().px(px(2.)).text_size(px(11.5)).text_color(t.accent).child(os("Editing · ↩ to save, esc to cancel", "Editing · Enter to save, Esc to cancel"))))
             .child(
                 div()
                     .flex()
@@ -546,7 +546,7 @@ impl Render for QueueView {
                             .text_size(px(12.))
                             .cursor_pointer()
                             .hover(|st| st.bg(t.panel))
-                            .tooltip(super::header::tip_fixed("When it goes in", "⇥"))
+                            .tooltip(super::header::tip_fixed("When it goes in", midna_proto::wording::TAB))
                             .on_click(cx.listener(|v, _, _, cx| {
                                 v.when = (v.when + 1) % WHENS.len();
                                 cx.notify();
@@ -586,9 +586,9 @@ impl Render for QueueView {
             .border_color(t.line)
             .text_size(px(11.5))
             .text_color(t.dim)
-            .child(key("↑↓ ↩", "edit"))
+            .child(key(os("↑↓ ↩", "↑↓ Enter"), "edit"))
             .child(key(os("⌥↑↓", "Alt+↑↓"), "reorder"))
-            .child(key("⇧↩", "send now"))
+            .child(key(midna_proto::wording::SHIFT_ENTER, "send now"))
             .child(key(os("⌥⌫", "Alt+Backspace"), "remove"))
             .child(div().flex_1())
             .child(key(&crate::actions::label(cx, "keys.queue"), ""));
@@ -699,10 +699,10 @@ impl QueueView {
                         .flex_none()
                         .gap(px(2.))
                         .opacity(if selected { 1. } else { 0.55 })
-                        .child(btn(format!("queue-now-{}", q.id), Icon::SendNow, "Send now", "⇧↩").on_click(cx.listener(move |v, _, _, cx| {
+                        .child(btn(format!("queue-now-{}", q.id), Icon::SendNow, "Send now", midna_proto::wording::SHIFT_ENTER).on_click(cx.listener(move |v, _, _, cx| {
                             v.call("queue.send_now", json!({ "id": q2 }), cx);
                         })))
-                        .child(btn(format!("queue-edit-{}", q.id), Icon::Pencil, "Edit", "↩").on_click(cx.listener(move |v, _, window, cx| v.edit(&q1, window, cx))))
+                        .child(btn(format!("queue-edit-{}", q.id), Icon::Pencil, "Edit", midna_proto::wording::ENTER).on_click(cx.listener(move |v, _, window, cx| v.edit(&q1, window, cx))))
                         .child(btn(format!("queue-rm-{}", q.id), Icon::Cross, "Remove", os("⌥⌫", "Alt+Backspace")).on_click(cx.listener(move |v, _, _, cx| v.remove(&q3, cx)))),
                 )
             })

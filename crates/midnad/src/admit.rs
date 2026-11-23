@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The custom status a held terminal shows.
-pub const WAITING: &str = "Waiting for the Mac";
+pub const WAITING: &str = midna_proto::wording::os("Waiting for the Mac", "Waiting for the PC");
 /// The wrapper's `$0`: how a terminal still waiting is told from one whose agent runs.
 const WRAPPER: &str = "midna-wait";
 const TICK: Duration = Duration::from_secs(2);
@@ -95,7 +95,8 @@ pub fn admission(d: &Daemon, ctx: &Ctx) -> Admission {
     if ctx.is_human() {
         return match over(&l, at) {
             true => Admission::Warn(format!(
-                "\x1b[33mmidna: the Mac is overloaded ({}). This agent starts anyway because you opened it; agents others start wait their turn (guard.hold_agents_at).\x1b[0m\r\n",
+                "\x1b[33mmidna: the {} is overloaded ({}). This agent starts anyway because you opened it; agents others start wait their turn (guard.hold_agents_at).\x1b[0m\r\n",
+                midna_proto::wording::MAC,
                 describe(&l)
             )),
             false => Admission::Start,
@@ -113,7 +114,8 @@ pub fn wrap(d: &Daemon, sid: &str, l: &SystemLoad, argv: Vec<String>) -> Vec<Str
     }
     let _ = std::fs::remove_file(&go);
     let msg = format!(
-        "\x1b[33mmidna: the Mac is overloaded ({}), so this agent waits its turn and starts once it calms down (guard.hold_agents_at). Press Ctrl-C to start it now.\x1b[0m",
+        "\x1b[33mmidna: the {} is overloaded ({}), so this agent waits its turn and starts once it calms down (guard.hold_agents_at). Press Ctrl-C to start it now.\x1b[0m",
+        midna_proto::wording::MAC,
         describe(l)
     );
     let mut v = vec![crate::sys::posix_sh(), "-c".into(), SCRIPT.into(), WRAPPER.into(), go.to_string_lossy().into_owned(), msg];
@@ -138,7 +140,7 @@ pub fn hold(d: &Daemon, sid: &str, l: &SystemLoad) {
         base: StatusState::Idle,
         clear_on: StatusClear::Never,
         trigger_id: None,
-        detail: Some(format!("The Mac is overloaded ({}). This agent starts once it calms down; Ctrl-C in the terminal starts it now.", describe(l))),
+        detail: Some(format!("The {} is overloaded ({}). This agent starts once it calms down; Ctrl-C in the terminal starts it now.", midna_proto::wording::MAC, describe(l))),
         needs_you_id: None,
         since: time::now_rfc3339(),
     };

@@ -1470,7 +1470,8 @@ fn project_menu(
                         cx.notify();
                     }),
                 ))
-                .when_some(ask, |d, sid| {
+                // Nearby isn't on Windows yet, as the terminal menu's Share item isn't.
+                .when_some(ask.filter(|_| cfg!(target_os = "macos")), |d, sid| {
                     let tab = sid.clone();
                     d.child(menu_item(t, "ask-nearby", "Ask an agent on a nearby Mac…", "", cx.listener(move |m, _, w, cx| {
                         m.menu = Menu::None;

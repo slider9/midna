@@ -516,7 +516,7 @@ pub const FIXED: &[Fixed] = &[
     fixed(&["enter"], "Send to the terminal", Some(crate::composer::CTX_COMPOSER)),
     #[cfg(target_os = "macos")]
     fixed(&["cmd-z", "cmd-shift-z"], "Undo / redo", Some(crate::composer::CTX_COMPOSER)),
-    fixed(pick_all(&["cmd-k", "cmd-f"], &["ctrl-k", "ctrl-f"]), "Search settings (↩ asks an agent instead)", Some(CTX_SETTINGS)),
+    fixed(pick_all(&["cmd-k", "cmd-f"], &["ctrl-k", "ctrl-f"]), midna_proto::wording::os("Search settings (↩ asks an agent instead)", "Search settings (Enter asks an agent instead)"), Some(CTX_SETTINGS)),
     fixed(pick_all(&["cmd-[", "cmd-]"], &["ctrl-[", "ctrl-]"]), "Previous / next section", Some(CTX_SETTINGS)),
     fixed(pick_all(&["cmd-alt-k"], &["ctrl-alt-k"]), "Record keys: find a shortcut by pressing it", Some(CTX_SETTINGS)),
 ];

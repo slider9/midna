@@ -23,7 +23,7 @@ fn left(ts: &str) -> String {
 
 pub fn print_list(v: &Value) {
     let me = &v["me"];
-    println!("This Mac: {}  (id {})", s(me, "name"), short_fingerprint(me["fingerprint"].as_str().unwrap_or("")));
+    println!("This {}: {}  (id {})", midna_proto::wording::MAC, s(me, "name"), short_fingerprint(me["fingerprint"].as_str().unwrap_or("")));
     let who = match me["visibility"].as_str() {
         Some("off") => "no one (Nearby is off)".to_string(),
         Some("everyone") => match me["everyone_until"].as_str() {

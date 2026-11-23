@@ -189,9 +189,13 @@ pub fn request(d: &Arc<Daemon>, bin: &Path, reason: &str, force: bool) -> Result
     let bin = std::fs::canonicalize(bin).map_err(|e| RpcError::bad_params(format!("{}: {e}", bin.display())))?;
     if !force && let Some(l) = crate::guard::busy(d) {
         let msg = format!(
-            "the Mac is busy (load {:.1} on {} cores, {}% of system.busy_load {}%): the {reason} waits until it calms down, \
+            "the {} is busy (load {:.1} on {} cores, {}% of system.busy_load {}%): the {reason} waits until it calms down, \
              because under this load the handoff can time out and hang up every terminal. Pass force to {reason} anyway",
-            l.load1, l.cpus, l.load_percent, l.busy_at
+            midna_proto::wording::MAC,
+            l.load1,
+            l.cpus,
+            l.load_percent,
+            l.busy_at
         );
         d.emit(kinds::DAEMON_UPGRADE_POSTPONED, Actor::system(), None, None, json!({ "to": bin, "reason": reason, "load1": l.load1, "cpus": l.cpus, "load_percent": l.load_percent, "busy_at": l.busy_at }));
         return Err(RpcError::new(midna_proto::error::BUSY, msg).with_data(json!(l)));

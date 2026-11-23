@@ -1030,7 +1030,7 @@ impl Backend for FakeBackend {
                     .iter()
                     .map(|n| json!({ "kind": "sound", "name": n, "path": twilight.join(format!("{n}.wav")), "builtin": true, "set": "twilight" }))
                     .chain(midna_proto::notify::SYSTEM_SOUNDS.iter().map(|n| {
-                        json!({ "kind": "sound", "name": n, "path": midna_proto::notify::system_sound_path(n), "builtin": true, "set": "macos" })
+                        json!({ "kind": "sound", "name": n, "path": midna_proto::notify::system_sound_path(n), "builtin": true, "set": midna_proto::notify::SYSTEM_SET })
                     }))
                     .collect();
                 json!({ "sounds": sounds, "images": [], "dir": "/tmp/midna-fake/notify" })

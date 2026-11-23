@@ -461,7 +461,7 @@ pub fn apply(d: &Daemon, agents: &[AgentKind], uninstall: bool) -> Result<HooksS
     let mut errors = vec![];
     for a in targets(d, agents) {
         if !uninstall && !dir_of(d, a).is_dir() {
-            errors.push(format!("{} isn't set up on this Mac ({} doesn't exist)", a.as_str(), dir_of(d, a).display()));
+            errors.push(format!("{} isn't set up on this {} ({} doesn't exist)", a.as_str(), midna_proto::wording::MAC, dir_of(d, a).display()));
             continue;
         }
         let path = path_of(d, a);

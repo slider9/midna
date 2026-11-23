@@ -471,7 +471,15 @@ impl TerminalView {
                     cx.notify();
                 }))
         });
-        let store_label = if s.busy { "Storing…".to_string() } else if adding { "Store  ↩".into() } else if n == 1 { "Store and paste reference  ↩".into() } else { "Store checked and paste  ↩".into() };
+        let store_label = if s.busy {
+            "Storing…".to_string()
+        } else if adding {
+            os("Store  ↩", "Store").into()
+        } else if n == 1 {
+            os("Store and paste reference  ↩", "Store and paste reference").into()
+        } else {
+            os("Store checked and paste  ↩", "Store checked and paste").into()
+        };
         let card = div()
             .id("secret-sheet-card")
             .occlude()

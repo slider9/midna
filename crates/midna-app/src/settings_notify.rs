@@ -51,7 +51,7 @@ impl SettingsWindow {
         list.iter()
             .filter_map(|m| {
                 // A daemon from before the Twilight set marks macOS sounds only as builtin.
-                let set = m["set"].as_str().unwrap_or(if m["builtin"] == true { "macos" } else { "" });
+                let set = m["set"].as_str().unwrap_or(if m["builtin"] == true { midna_proto::notify::SYSTEM_SET } else { "" });
                 Some((m["name"].as_str()?.to_string(), set.to_string()))
             })
             .collect()
@@ -231,11 +231,11 @@ impl SettingsWindow {
         let value = self.text_of(&key);
         let silent = value == "none";
         let label = if silent { "None".to_string() } else { value.clone() };
-        // Yours first, then midna's Twilight sounds, then the macOS ones.
+        // Yours first, then midna's Twilight sounds, then the system's (macOS's or Windows').
         let names = self.media_names("sound");
         let mut picks = vec![Pick::new("None", "none")];
         picks.extend(names.iter().filter(|(_, set)| set.is_empty()).map(|(n, _)| Pick { imported: true, ..Pick::new(n, n) }));
-        for (set, title) in [("twilight", "Twilight"), ("macos", "macOS")] {
+        for (set, title) in [("twilight", "Twilight"), (midna_proto::notify::SYSTEM_SET, midna_proto::notify::SYSTEM_SET_NAME)] {
             let group: Vec<Pick> = names.iter().filter(|(_, s)| s == set).map(|(n, _)| Pick::new(n, n)).collect();
             if !group.is_empty() {
                 picks.push(Pick::heading(title));
@@ -414,7 +414,7 @@ impl SettingsWindow {
             }))
             .child(div().w(px(12.)).flex_none().child(Icon::Plus.el(11., t.dim)))
             .child(if kind == "sound" { "Import sound…" } else { "Import image…" })
-            .child(div().text_size(px(11.)).text_color(t.dim).child(if kind == "sound" { "aiff wav mp3 m4a caf" } else { "png jpg gif" }));
+            .child(div().text_size(px(11.)).text_color(t.dim).child(if kind == "sound" { midna_proto::wording::os("aiff wav mp3 m4a caf", "wav") } else { "png jpg gif" }));
         deferred(
             anchored().offset(point(px(0.), px(30.))).snap_to_window_with_margin(px(8.)).child(
                 crate::ui::sidebar::menu_box(t)

@@ -171,7 +171,7 @@ fn wakes_the_mac_before_work_due_inside_the_hours() {
     let s = status(&mut h);
     assert_eq!(s["wake"]["next"].as_str().and_then(time::parse_rfc3339), Some(opens - 120), "{s}");
     assert!(s["wake"]["reason"].as_str().unwrap().starts_with("Morning kickoff at "), "{s}");
-    assert!(s["wake"]["line"].as_str().unwrap().starts_with("Waking the Mac "), "{s}");
+    assert!(s["wake"]["line"].as_str().unwrap().starts_with(&format!("Waking the {} ", midna_proto::wording::MAC)), "{s}");
     let date = |t: i64| {
         let (y, mo, d, h, mi, _) = time::local_parts(t);
         format!("{mo:02}/{d:02}/{:02} {h:02}:{mi:02}:00", y % 100)

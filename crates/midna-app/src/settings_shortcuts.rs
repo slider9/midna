@@ -277,7 +277,7 @@ impl SettingsWindow {
                     Some(k) => crate::ui::header::key_chip(t, pretty(k).into()).text_size(px(12.)).text_color(t.fg).into_any_element(),
                     None => div().text_size(px(12.)).text_color(t.accent).child("Press keys…").into_any_element(),
                 })
-                .child(div().text_size(px(11.)).text_color(t.dim).whitespace_nowrap().child(if e.keys.is_some() { "↩ save · ⎋ cancel" } else { "⎋ cancel" }))
+                .child(div().text_size(px(11.)).text_color(t.dim).whitespace_nowrap().child(if e.keys.is_some() { os("↩ save · ⎋ cancel", "Enter save · Esc cancel") } else { os("⎋ cancel", "Esc cancel") }))
                 .into_any_element();
         }
         let current = value_text(&self.value(setting));

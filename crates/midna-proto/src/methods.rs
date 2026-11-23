@@ -701,10 +701,12 @@ pub struct NotifyMedia {
     /// sound's name, or an imported file's name.
     pub name: String,
     pub path: String,
-    /// Ships with midna or macOS (can't be removed).
+    #[cfg_attr(target_os = "macos", doc = "Ships with midna or macOS (can't be removed).")]
+    #[cfg_attr(not(target_os = "macos"), doc = "Ships with midna or Windows (can't be removed).")]
     #[serde(default)]
     pub builtin: bool,
-    /// Which set a built-in sound belongs to: `twilight` (midna's own) or `macos`.
+    #[cfg_attr(target_os = "macos", doc = "Which set a built-in sound belongs to: `twilight` (midna's own) or `macos`.")]
+    #[cfg_attr(not(target_os = "macos"), doc = "Which set a built-in sound belongs to: `twilight` (midna's own) or `windows`.")]
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub set: String,
     /// Settings that use it now.
@@ -722,7 +724,8 @@ pub struct NotifyMediaResult {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct NotifyImportParams {
-    /// Absolute path to a sound (aiff, aif, wav, mp3, m4a, caf; up to 10 MB) or an image (png,
+    #[cfg_attr(target_os = "macos", doc = "Absolute path to a sound (aiff, aif, wav, mp3, m4a, caf; up to 10 MB) or an image (png,")]
+    #[cfg_attr(not(target_os = "macos"), doc = "Absolute path to a sound (wav; up to 10 MB) or an image (png,")]
     /// jpg, jpeg, gif; up to 10 MB). The file is copied; the original can go.
     pub path: String,
     /// Use it right away for these settings, e.g. `["notify.sound.approval"]` or `["notify.image"]`.
@@ -822,8 +825,10 @@ pub struct NotifyTestParams {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct NotifyPlayParams {
     /// A kind, to play its sound at its volume: a notification category (approval, failed, …)
-    /// or a sound effect (approved, denied, queue_sent, …). Or a sound's name: a macOS sound
-    /// (Glass, Pop, …) or an imported file's name (see notify.media).
+    #[cfg_attr(target_os = "macos", doc = "or a sound effect (approved, denied, queue_sent, …). Or a sound's name: a macOS sound")]
+    #[cfg_attr(target_os = "macos", doc = "(Glass, Pop, …) or an imported file's name (see notify.media).")]
+    #[cfg_attr(not(target_os = "macos"), doc = "or a sound effect (approved, denied, queue_sent, …). Or a sound's name: a Windows sound")]
+    #[cfg_attr(not(target_os = "macos"), doc = "(chimes, tada, …) or an imported file's name (see notify.media).")]
     pub sound: String,
     /// 0–100 instead of the kind's volume (still scaled by `notify.volume`).
     #[serde(default, skip_serializing_if = "Option::is_none")]

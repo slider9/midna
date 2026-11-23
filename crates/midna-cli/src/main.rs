@@ -968,7 +968,7 @@ fn system(a: &Args, out: OutFn) -> Res {
             };
             out(&v, &print::system_load);
             if held(&v) {
-                return Err(Fail::Pending("the Mac is still busy".into()));
+                return Err(Fail::Pending(format!("the {} is still busy", midna_proto::wording::MAC)));
             }
         }
         "run-anyway" => {
@@ -977,7 +977,7 @@ fn system(a: &Args, out: OutFn) -> Res {
                 None => json!({}),
             };
             out(&call("system.run_anyway", p)?, &|v| {
-                println!("{} goes ahead while the Mac is busy, until the human's next prompt", v["session_id"].as_str().unwrap_or(""))
+                println!("{} goes ahead while the {} is busy, until the human's next prompt", v["session_id"].as_str().unwrap_or(""), midna_proto::wording::MAC)
             })
         }
         "pause" => out(&call("session.pause", json!({ "session_id": sid("terminal id to pause")? }))?, &|v| {
@@ -1712,7 +1712,7 @@ fn notify(a: &Args, out: OutFn) -> Res {
                 verb @ ("add" | "update" | "edit") => {
                     a.check(&["label", "description", "color", "stay", "set"])?;
                     let key = a.need(3, "a kind key (deploys)")?;
-                    // --stay 0 = stays until handled; --set field=value for the rest (sound=Glass, push=false, …)
+                    // --stay 0 = stays until handled; --set field=value for the rest (sound=Glass or chimes, push=false, …)
                     let mut settings = serde_json::Map::new();
                     for (f, v) in [("color", a.get("color")), ("stay", a.get("stay"))] {
                         if let Some(v) = v {
@@ -1720,7 +1720,7 @@ fn notify(a: &Args, out: OutFn) -> Res {
                         }
                     }
                     for s in a.all("set") {
-                        let (f, v) = s.split_once('=').ok_or_else(|| Fail::Usage(format!("--set `{s}`: expected field=value (stay=0, sound=Glass, push=false)")))?;
+                        let (f, v) = s.split_once('=').ok_or_else(|| Fail::Usage(format!("--set `{s}`: expected field=value (stay=0, sound={}, push=false)", midna_proto::wording::os("Glass", "chimes"))))?;
                         settings.insert(f.trim().into(), json!(v.trim()));
                     }
                     let p = json!({ "key": key, "label": a.get("label"), "description": a.get("description"), "settings": settings, "replace": verb != "add" });
@@ -1745,7 +1745,11 @@ fn notify(a: &Args, out: OutFn) -> Res {
                     println!("{title}{}", if list.is_empty() { " (none imported)" } else { "" });
                     for m in list {
                         let used: Vec<&str> = m["used_by"].as_array().map(|u| u.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
-                        let tag = if m["builtin"] == true { "macOS" } else { "imported" };
+                        let tag = match (m["builtin"] == true, m["set"].as_str()) {
+                            (false, _) => "imported",
+                            (true, Some("twilight")) if !cfg!(target_os = "macos") => "Twilight",
+                            (true, _) => midna_proto::notify::SYSTEM_SET_NAME,
+                        };
                         let used = if used.is_empty() { String::new() } else { format!("  used by {}", used.join(", ")) };
                         println!("  {:<22} {tag:<8}{used}", s_(&m, "name"));
                     }
@@ -1837,7 +1841,7 @@ fn notify(a: &Args, out: OutFn) -> Res {
                 Some(v) => Some(v.trim_end_matches('%').parse::<u8>().ok().filter(|v| *v <= 100).ok_or_else(|| Fail::Usage(format!("--volume `{v}`: expected 0-100")))?),
                 None => None,
             };
-            let v = call("notify.play", json!({ "session": session, "sound": a.need(2, "a kind (approved, failed, …) or a sound (Glass, Pop, …)")?, "volume": volume }))?;
+            let v = call("notify.play", json!({ "session": session, "sound": a.need(2, midna_proto::wording::os("a kind (approved, failed, …) or a sound (Glass, Pop, …)", "a kind (approved, failed, …) or a sound (chimes, tada, …)"))?, "volume": volume }))?;
             out(&v, &|v| match v["reason"].as_str() {
                 None => println!("played {}", s_(v, "sound")),
                 Some(r) => println!("not played: {r}"),

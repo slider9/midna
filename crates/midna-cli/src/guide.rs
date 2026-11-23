@@ -704,7 +704,7 @@ fn explain_trigger(call: Caller, id: &str, surface: Surface) -> Result<String, R
         let who = if name == "*" { "any stream".to_string() } else { format!("stream `{name}`") };
         format!("{id} “{}”: when {who} publishes {what} (`{event}`, from `midna stream publish` or streams.publish)", s(&t, "name"))
     } else if local {
-        format!("{id} “{}”: when `{}` happens on this Mac", s(&t, "name"), s(&t, "event"))
+        format!("{id} “{}”: when `{}` happens on this {}", s(&t, "name"), s(&t, "event"), midna_proto::wording::MAC)
     } else {
         format!("{id} “{}”: when {} sends `{}`", s(&t, "name"), s(&t, "source"), s(&t, "event"))
     };

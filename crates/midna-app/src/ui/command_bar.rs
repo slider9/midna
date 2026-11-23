@@ -12,6 +12,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use midna_proto::wording::os;
 
 actions!(
     midna,
@@ -831,7 +832,7 @@ pub fn render(m: &MainWindow, t: &Theme, _window: &mut Window, cx: &mut Context<
     } else if none && folders {
         list = list.child(div().px(px(12.)).py(px(14.)).text_color(t.dim).child("No folder here."));
     } else if none {
-        list = list.child(div().px(px(12.)).py(px(14.)).text_color(t.dim).child(format!("No command matches “{q}”. Press ↩ to hand it to an agent.")));
+        list = list.child(div().px(px(12.)).py(px(14.)).text_color(t.dim).child(format!("No command matches “{q}”. Press {} to hand it to an agent.", midna_proto::wording::ENTER)));
     }
 
     // ---- ask an agent
@@ -872,7 +873,7 @@ pub fn render(m: &MainWindow, t: &Theme, _window: &mut Window, cx: &mut Context<
             .border_t_1()
             .border_color(t.line)
             .bg(if none { t.accent_soft } else { t.raised })
-            .child(div().px(px(4.)).text_size(px(11.)).font_weight(FontWeight::BOLD).text_color(t.dim).child(if none { "ASK AN AGENT · ↩" } else { "OR ASK AN AGENT" }))
+            .child(div().px(px(4.)).text_size(px(11.)).font_weight(FontWeight::BOLD).text_color(t.dim).child(if none { os("ASK AN AGENT · ↩", "ASK AN AGENT · ENTER") } else { "OR ASK AN AGENT" }))
             .child(
                 div()
                     .id("ask-run")
@@ -901,7 +902,7 @@ pub fn render(m: &MainWindow, t: &Theme, _window: &mut Window, cx: &mut Context<
                             .child(div().flex_none().text_color(t.dim).child("with"))
                             .child(div().min_w_0().truncate().child(format!("“{q}”"))),
                     )
-                    .child(kbd(t, if none { "↩" } else { "⇧↩" })),
+                    .child(kbd(t, if none { midna_proto::wording::ENTER } else { midna_proto::wording::SHIFT_ENTER })),
             )
             .child(div().flex().items_center().gap(px(10.)).px(px(2.)).child(agent_opts).child(scope_opts).child(
                 div().flex_1().min_w_0().truncate().font_family(t.mono_font.clone()).text_size(px(11.)).text_color(t.dim).child(commands::ask_cli(agent, project.as_deref(), &q)),
@@ -960,7 +961,7 @@ pub fn render(m: &MainWindow, t: &Theme, _window: &mut Window, cx: &mut Context<
     } else if none {
         "ask agent"
     } else if sel_danger {
-        "arm, ↩ again to run"
+        os("arm, ↩ again to run", "arm, Enter again to run")
     } else {
         "run"
     };
@@ -978,13 +979,13 @@ pub fn render(m: &MainWindow, t: &Theme, _window: &mut Window, cx: &mut Context<
         .text_size(px(11.5))
         .text_color(t.dim)
         .child("↑↓ select")
-        .child(format!("↩ {enter_label}"))
+        .child(format!("{} {enter_label}", midna_proto::wording::ENTER))
         .when(sel_project && !prompts_mode, |d| d.child(other_label))
         .when(prompts_mode, |d| d.child("prompts sent before a /clear can't be jumped to"))
-        .when(matches!(mac_agent, Some(commands::MacAgentStep::Prompt { .. })), |d| d.child("⇥ agent"))
+        .when(matches!(mac_agent, Some(commands::MacAgentStep::Prompt { .. })), |d| d.child(os("⇥ agent", "Tab agent")))
         .when(!prompts_mode && mac_agent.is_none(), |d| {
-            d.child("⇧↩ ask instead")
-                .child("⇥ agent · ⇧⇥ scope")
+            d.child(os("⇧↩ ask instead", "Shift+Enter ask instead"))
+                .child(os("⇥ agent · ⇧⇥ scope", "Tab agent · Shift+Tab scope"))
                 .child(div().flex_1())
                 .child(legend(t.err, "destructive"))
                 .child(legend(t.need, "needs approval"))
@@ -1167,7 +1168,7 @@ fn row(m: &MainWindow, t: &Theme, r: &Row, n: usize, on: bool, cx: &mut Context<
                     .gap(px(4.))
                     .child(div().font_weight(FontWeight::BOLD).text_color(t.err).child("Destructive."))
                     .child(c.danger.clone().unwrap_or_default())
-                    .child(div().text_color(t.dim).child("↩ again to confirm.")),
+                    .child(div().text_color(t.dim).child(os("↩ again to confirm.", "Enter again to confirm."))),
             )
             .child(
                 div()
@@ -1182,7 +1183,7 @@ fn row(m: &MainWindow, t: &Theme, r: &Row, n: usize, on: bool, cx: &mut Context<
                     .font_weight(FontWeight::BOLD)
                     .cursor_pointer()
                     .on_click(cx.listener(move |m, _, w, cx| execute(m, &cmd, w, cx)))
-                    .child("Confirm ↩"),
+                    .child(os("Confirm ↩", "Confirm")),
             )
             .child(
                 div()

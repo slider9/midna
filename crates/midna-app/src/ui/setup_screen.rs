@@ -552,7 +552,7 @@ fn model(m: &MainWindow, t: &Theme, window: &Window) -> Model {
             .into();
             md.body_size = 18.;
             md.body_top = 20.;
-            md.primary = "Begin ↩".into();
+            md.primary = os("Begin ↩", "Begin").into();
             md.buttons_top = 34.;
         }
         Stage::At(s) => {
@@ -588,7 +588,7 @@ fn model(m: &MainWindow, t: &Theme, window: &Window) -> Model {
             md.body = "Anything you put off waits in Settings. Agents can do the rest when you ask.".into();
             md.body_size = 16.;
             md.body_top = 24.;
-            md.primary = "Open midna ↩".into();
+            md.primary = os("Open midna ↩", "Open midna").into();
             md.buttons_top = 32.;
         }
     }
@@ -1079,7 +1079,7 @@ fn preview(md: &Model, d: &ThemeDef) -> Div {
             _ => el.border(md.u(1.5)).border_color(dim),
         }
     };
-    let rows = [("api", "working"), ("migrate", "needs"), ("tests", "done"), ("build", "failed"), ("zsh", "idle")];
+    let rows = [("api", "working"), ("migrate", "needs"), ("tests", "done"), ("build", "failed"), (os("zsh", "pwsh"), "idle")];
     let mut side = div()
         .w(md.u(150.))
         .flex_none()
@@ -1088,7 +1088,10 @@ fn preview(md: &Model, d: &ThemeDef) -> Div {
         .bg(panel)
         .border_r_1()
         .border_color(line)
-        .child(div().flex().gap(md.u(6.)).px(md.u(10.)).py(md.u(12.)).children([0xFF5F57, 0xFEBC2E, 0x28C840].map(|x| div().size(md.u(9.)).rounded_full().bg(rgb(hex(x), 1.)))))
+        // macOS's window buttons; Windows' are on the right of a window's title row, so just the room
+        .child(div().flex().gap(md.u(6.)).px(md.u(10.)).py(md.u(12.)).when(cfg!(target_os = "macos"), |d| {
+            d.children([0xFF5F57, 0xFEBC2E, 0x28C840].map(|x| div().size(md.u(9.)).rounded_full().bg(rgb(hex(x), 1.))))
+        }).when(!cfg!(target_os = "macos"), |d| d.h(md.u(33.))))
         .child(div().mx(md.u(8.)).mb(md.u(6.)).px(md.u(8.)).py(md.u(5.)).border_1().border_color(c("need")).rounded(md.u(6.)).text_color(c("need")).font_weight(FontWeight::SEMIBOLD).text_size(md.u(11.)).child("● 2 need you"))
         .child(div().px(md.u(10.)).pt(md.u(6.)).pb(md.u(2.)).text_size(md.u(9.5)).font_weight(FontWeight::BOLD).text_color(dim).child("ZONAI"));
     for (i, (name, state)) in rows.into_iter().enumerate() {

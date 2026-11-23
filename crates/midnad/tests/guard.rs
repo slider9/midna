@@ -40,7 +40,7 @@ fn a_busy_mac_holds_heavy_work_back() {
     let mut a = d.agent(Some(&sid));
     let r = request(&mut a, "Bash(source ./env.sh && cargo test --workspace)");
     assert_eq!((r["decision"].as_str(), r["source"].as_str()), (Some("deny"), Some("guard")), "{r}");
-    assert!(r["reason"].as_str().unwrap().contains("the Mac is busy"), "{r}");
+    assert!(r["reason"].as_str().unwrap().contains(&format!("the {} is busy", midna_proto::wording::MAC)), "{r}");
     assert!(r["reason"].as_str().unwrap().contains("`midna system wait` as a background command"), "{r}");
     assert!(r["reason"].as_str().unwrap().contains("`midna system run-anyway`"), "{r}");
     let r = launch(&mut a, 1);

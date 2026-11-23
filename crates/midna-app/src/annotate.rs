@@ -1226,7 +1226,7 @@ fn load(src: Source) -> anyhow::Result<Shot> {
             let _ = std::fs::remove_file(&src);
             match out {
                 Ok(o) if o.status.success() => {}
-                _ => anyhow::bail!("{name} is not an image macOS can read"),
+                _ => anyhow::bail!("{name} is not an image {} can read", midna_proto::wording::os("macOS", "midna on Windows")),
             }
             (ImageFormat::Png, path.clone(), std::fs::read(&path)?)
         }

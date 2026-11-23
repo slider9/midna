@@ -418,12 +418,12 @@ pub fn popover(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> impl 
         .border_color(t.line)
         .text_size(px(11.5))
         .text_color(t.dim)
-        .child(key("↩", "open"))
+        .child(key(midna_proto::wording::ENTER, "open"))
         .child(key(&crate::actions::glyph_keys("⌥↩"), "find in terminal"))
-        .child(key("⇧↩", "pin"))
+        .child(key(midna_proto::wording::SHIFT_ENTER, "pin"))
         .when(m.selected.as_ref().is_some_and(|s| m.links.undo.iter().any(|(u, _)| u == s)), |d| d.child(key(&crate::actions::glyph_keys("⌘Z"), "undo remove")))
         .child(div().flex_1())
-        .child(key("⇥", "kind"));
+        .child(key(midna_proto::wording::TAB, "kind"));
 
     deferred(
         anchored().anchor(Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(
@@ -541,7 +541,7 @@ fn row(m: &MainWindow, t: &Theme, l: &Link, i: usize, selected: bool, agent: &st
                 )
                 .child(
                     small_button(t, format!("link-pin-{}", l.id))
-                        .tooltip(super::header::tip_fixed(if l.pinned { "Unpin" } else { "Pin" }, "⇧↩"))
+                        .tooltip(super::header::tip_fixed(if l.pinned { "Unpin" } else { "Pin" }, midna_proto::wording::SHIFT_ENTER))
                         .on_click(cx.listener(move |m, _, _, cx| {
                             cx.stop_propagation();
                             pin(m, &pin_l, cx);
