@@ -86,6 +86,7 @@ pub fn run(args: &[String]) -> i32 {
         closing: AtomicBool::new(false),
         closed: (Mutex::new(false), Condvar::new()),
         draining: AtomicBool::new(false),
+        watched: AtomicBool::new(false),
     });
     k.log.line(&format!("up, build {}, ConPTY {}", midna_proto::VERSION, shell::conpty().dll.as_ref().map_or("Windows' own".into(), |d| d.display().to_string())));
     k.serve_forever()
@@ -116,6 +117,9 @@ struct Keeper {
     closing: AtomicBool,
     closed: (Mutex<bool>, Condvar),
     draining: AtomicBool,
+    /// The shell exited and its watcher has closed the console and told the client then
+    /// connected, if any.
+    watched: AtomicBool,
 }
 
 struct Conn {
@@ -247,8 +251,10 @@ impl Keeper {
             self.tell_exit(&mut conn);
             // A shell that exited while no client was attached (a midnad that was killed): once
             // the next one has attached and been told the code, the keeper's work is done, as
-            // when it tells a client that's already attached.
-            let told = conn.as_ref().is_some_and(|c| c.attached && c.exited_sent);
+            // when it tells a client that's already attached. Only once the shell's watcher has
+            // closed the console after the last paint (`watched`): until then it tells the
+            // client itself.
+            let told = conn.as_ref().is_some_and(|c| c.attached && c.exited_sent) && self.watched.load(Ordering::SeqCst);
             drop(conn);
             if told {
                 self.maybe_exit();
@@ -361,6 +367,7 @@ impl Keeper {
         std::thread::sleep(LAST_PAINT);
         self.close_console(false);
         self.tell_exit(&mut self.conn.lock().unwrap_or_else(|e| e.into_inner()));
+        self.watched.store(true, Ordering::SeqCst);
         self.maybe_exit();
     }
 

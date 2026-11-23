@@ -921,6 +921,11 @@ fn a_killed_midnads_keepers_the_next_cant_attach_to_are_ended_and_its_terminals_
     });
     let records = midna_pty::names::records(&d.home);
     assert_eq!(records.len(), 1, "{records:?}");
+    // The next midnad hangs up a keeper whose session isn't in the state it loads.
+    wait_for(10, "state.json with the session", || {
+        let state: Value = serde_json::from_slice(&std::fs::read(d.home.join("state.json")).ok()?).ok()?;
+        state["sessions"].as_array()?.iter().any(|s| s["id"] == id.as_str()).then_some(())
+    });
     let (keeper, shell) = (records[0].1.pid as i32, records[0].1.shell_pid as i32);
     let table = midnad::procs::snapshot();
     let theirs: Vec<i32> = [keeper, shell].into_iter().chain(hidden).collect();

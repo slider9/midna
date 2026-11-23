@@ -105,9 +105,10 @@ pub fn reattach(d: &Arc<Daemon>, found: Vec<Found>) -> Outcome {
     let mut out = Outcome::default();
     let live: Vec<String> = found.iter().map(|f| f.sid.clone()).collect();
     for f in found {
-        let open = d.core().state.session(&f.sid).is_some_and(|s| !s.status.state.is_terminal());
-        if !open {
-            eprintln!("midnad: hanging up keeper {} of session {}, which is closed, and its shell {}", f.record.pid, f.sid, f.record.shell_pid);
+        let status = d.core().state.session(&f.sid).map(|s| s.status.state);
+        if status.is_none_or(|s| s.is_terminal()) {
+            let why = if status.is_some() { "which is closed" } else { "which isn't in the state" };
+            eprintln!("midnad: hanging up keeper {} of session {}, {why}, and its shell {}", f.record.pid, f.sid, f.record.shell_pid);
             if let Some(s) = d.core().state.session_mut(&f.sid) {
                 s.pid = None;
             }
