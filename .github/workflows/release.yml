@@ -189,9 +189,11 @@ jobs:
         env:
           MIDNA_UPDATE_PUBKEY: ${{ vars.MIDNA_UPDATE_PUBKEY }}
         run: |
-          # The key in the secret has to match the one compiled into the app.
-          [ "$("$MIDNA_RELEASE_TOOL" pubkey "$MIDNA_UPDATE_KEY")" = "$MIDNA_UPDATE_PUBKEY" ] ||
-            { echo "::error::MIDNA_UPDATE_KEY doesn't match MIDNA_UPDATE_PUBKEY"; exit 1; }
+          # The key in the secret has to be one of those compiled into the app (MIDNA_UPDATE_PUBKEY
+          # is a list, separated by commas or whitespace; docs/RELEASING.md, "Several keys").
+          pub="$("$MIDNA_RELEASE_TOOL" pubkey "$MIDNA_UPDATE_KEY")"
+          tr ', \t' '\n\n\n' <<<"$MIDNA_UPDATE_PUBKEY" | grep -qxF "$pub" ||
+            { echo "::error::MIDNA_UPDATE_KEY's public key ($pub) isn't one of MIDNA_UPDATE_PUBKEY's"; exit 1; }
           packaging/make-update.sh --app dist/release/Midna.app \
             --url-base "https://github.com/${GITHUB_REPOSITORY}/releases/download/$GITHUB_REF_NAME" \
             --channel feed --notes "$(cat release/notes.md)" --arch aarch64 --out release

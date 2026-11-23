@@ -1,0 +1,250 @@
+name: Release (Windows)
+
+# Pushing a windows-v tag (windows-v0.1.0-beta.58.w.1) builds Midna for Windows, zips it, signs
+# its update feed entry and publishes a GitHub release. A bare v tag runs release.yml (macOS)
+# instead; this one never does.
+#
+# The version is the upstream version this branch merged (what Cargo.toml says) plus a Windows
+# counter: 0.1.0-beta.58.w.1, .w.2, … on a beta base, 0.2.0-w.1 on a stable one. The rule and
+# why it sorts right are in docs/RELEASING.md ("Windows releases").
+#
+# The Windows app's updater reads releases/download/channels/windows-{channel}.json:
+# windows-stable.json names the newest Windows build of a stable base, windows-beta.json the
+# newest of any. stable.json and beta.json are macOS's, and this workflow leaves them alone.
+#
+# Run by hand (workflow_dispatch) on a branch, it makes a draft release of the version you give
+# and never touches the channels: that's how to try the workflow without a public release.
+# Run by hand on a windows-v tag, it publishes that tag unless you leave "draft" on.
+#
+# Two jobs, so a failed publish doesn't cost a rebuild ("Re-run failed jobs"):
+#   build    compile, zip, sign the feed entry (Windows)
+#   publish  the GitHub release and the channel feeds
+on:
+  push:
+    tags: ["windows-v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build when run on a branch (e.g. 0.1.0-beta.58.w.1); a tag run takes the tag's"
+        required: false
+      draft:
+        description: "Publish as a draft release and leave the channels alone"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+# Releases update the shared channel feeds one at a time (with release.yml's too).
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    # Only the fork's owner releases (docs/RELEASING.md, "Windows releases").
+    if: github.actor == 'slider9'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      draft: ${{ steps.version.outputs.draft }}
+      beta: ${{ steps.version.outputs.beta }}
+
+    steps:
+      # Ghostty's source and cargo's build paths run past Windows' 260-character limit.
+      - name: Long paths
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@v4
+
+      # The tag (or the version input) is <files' version>.w.N on a beta base, <files' version>-w.N
+      # on a stable one. The files keep the upstream version, so a merge from upstream never
+      # conflicts on it; the counter lives only in the tag.
+      - name: Version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRAFT: ${{ inputs.draft }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"
+            [[ "$tag" == windows-v* ]] || { echo "::error::$tag isn't a windows-v tag"; exit 1; }
+            version="${tag#windows-v}"
+            draft=false
+            [ "$GITHUB_EVENT_NAME" != workflow_dispatch ] || draft="$INPUT_DRAFT"
+          else
+            version="${INPUT_VERSION#v}"
+            [ -n "$version" ] || { echo "::error::Run on a branch, it needs a version (or push a windows-v tag)"; exit 1; }
+            [ "$INPUT_DRAFT" = true ] || { echo "::error::Run on a branch, it only makes drafts; push a windows-v tag to publish"; exit 1; }
+            tag="windows-v$version"
+            draft=true
+          fi
+          if [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+)\.w\.([0-9]+)$ ]]; then
+            beta=true
+          elif [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-w\.([0-9]+)$ ]]; then
+            beta=false
+          else
+            echo "::error::$version isn't a Windows version: <base>.w.N on a beta base (0.1.0-beta.58.w.1) or <base>-w.N on a stable one (0.2.0-w.1)"
+            exit 1
+          fi
+          base="${BASH_REMATCH[1]}"
+          ./scripts/set-version.sh --check "$base"
+          { echo "tag=$tag"; echo "version=$version"; echo "base=$base"; echo "draft=$draft"; echo "beta=$beta"; } >> "$GITHUB_OUTPUT"
+          echo "$tag: Windows build $version of $base (draft $draft, beta $beta)"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target/package"
+          cache-directories: packaging/release-tool/target
+
+      # Zig, Ghostty's source and Microsoft's newer ConPTY, all pinned by their scripts.
+      - name: Toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: .toolchain
+          key: toolchain-${{ runner.os }}-${{ hashFiles('scripts/setup-toolchain.sh', 'scripts/setup-conpty.sh') }}
+
+      - name: Set up toolchain
+        run: |
+          ./scripts/setup-toolchain.sh
+          ./scripts/setup-conpty.sh
+
+      # The update keys are compiled in; without them the app would never accept an update, so
+      # refuse to build rather than ship that.
+      - name: Build
+        env:
+          MIDNA_UPDATE_PUBKEY: ${{ vars.MIDNA_UPDATE_PUBKEY }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          [ -n "$MIDNA_UPDATE_PUBKEY" ] || { echo "::error::Set the MIDNA_UPDATE_PUBKEY repository variable"; exit 1; }
+          packaging/build-windows.sh --version "$VERSION" --out dist/release
+          got="$(dist/release/Midna/midnad.exe --version | awk '{print $2}' | tr -d '\r')"
+          [ "$got" = "$VERSION" ] || { echo "::error::midnad.exe says $got, expected $VERSION"; exit 1; }
+
+      - name: Build release tool
+        run: |
+          cargo build --release -q --manifest-path packaging/release-tool/Cargo.toml --target-dir packaging/release-tool/target
+          echo "MIDNA_RELEASE_TOOL=$PWD/packaging/release-tool/target/release/midna-release.exe" >> "$GITHUB_ENV"
+
+      - name: Release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BASE: ${{ steps.version.outputs.base }}
+        run: |
+          mkdir -p release
+          cat > release/notes.md <<EOF
+          Midna for Windows $VERSION: upstream $BASE with the Windows port, from $GITHUB_SHA.
+
+          Unzip it, move the \`Midna\` folder to \`%LOCALAPPDATA%\\Programs\\Midna\` and run \`midna-app.exe\`. An installed copy updates itself from here.
+          EOF
+          cat release/notes.md
+
+      # The zip and its signed feed entry (docs/RELEASING.md). The entry points at this release's
+      # copy of the zip.
+      - name: Update archive and feed entry
+        env:
+          MIDNA_UPDATE_PUBKEY: ${{ vars.MIDNA_UPDATE_PUBKEY }}
+          UPDATE_KEY: ${{ secrets.MIDNA_UPDATE_KEY }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          key="$(cygpath -u "$RUNNER_TEMP")/update-ed25519.key"
+          (umask 077; echo "$UPDATE_KEY" > "$key")
+          trap 'rm -f "$key"' EXIT
+          # The secret's public half has to be one of the keys compiled into the app
+          # (MIDNA_UPDATE_PUBKEY is a list, separated by commas or whitespace).
+          pub="$("$MIDNA_RELEASE_TOOL" pubkey "$key" | tr -d '\r')"
+          tr ', \t' '\n\n\n' <<<"$MIDNA_UPDATE_PUBKEY" | grep -qxF "$pub" ||
+            { echo "::error::MIDNA_UPDATE_KEY's public key ($pub) isn't one of MIDNA_UPDATE_PUBKEY's"; exit 1; }
+          packaging/make-update.sh --windows dist/release/Midna --key "$key" \
+            --url-base "https://github.com/${GITHUB_REPOSITORY}/releases/download/$TAG" \
+            --channel feed --notes "$(cat release/notes.md)" --out release
+          # Checked against the whole list too, as the app checks it. MSYS_NO_PATHCONV: Git Bash
+          # would rewrite a base64 key that starts with / as a path.
+          MSYS_NO_PATHCONV=1 "$MIDNA_RELEASE_TOOL" verify release/windows-feed.json "$MIDNA_UPDATE_PUBKEY" release/Midna-*-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: release/
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.build.outputs.tag }}
+      VERSION: ${{ needs.build.outputs.version }}
+      DRAFT: ${{ needs.build.outputs.draft }}
+      BETA: ${{ needs.build.outputs.beta }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-windows
+          path: release
+
+      # The feed is published with the zip, so a draft carries everything a release would. A
+      # re-run finds the release already made and replaces its files.
+      - name: Publish release
+        run: |
+          files=("release/Midna-$VERSION-windows-x86_64.zip" release/windows-feed.json)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --clobber
+            gh release edit "$TAG" --notes-file release/notes.md
+          else
+            if [ "$DRAFT" = true ]; then
+              flags=(--draft --target "$GITHUB_SHA")
+              [ "$BETA" != true ] || flags+=(--prerelease)
+            elif [ "$BETA" = true ]; then
+              flags=(--prerelease --latest=false)
+            else
+              flags=(--latest)
+            fi
+            gh release create "$TAG" "${files[@]}" \
+              --title "Midna $VERSION for Windows" --notes-file release/notes.md "${flags[@]}"
+          fi
+          gh release view "$TAG" --json url,isDraft,isPrerelease
+
+      # What the Windows updater reads: releases/download/channels/windows-{stable,beta}.json.
+      # windows-stable.json follows builds of a stable base; windows-beta.json names the newest
+      # build, beta or not, and a stable build older than the current beta leaves it alone. A
+      # draft touches neither.
+      - name: Channel feeds
+        if: needs.build.outputs.draft != 'true'
+        run: |
+          if ! gh release view channels >/dev/null 2>&1; then
+            gh release create channels --prerelease --latest=false --title "Update channels" \
+              --notes "Where midna's updater looks for new versions. Not a release to download."
+          fi
+          files=()
+          if [ "$BETA" != true ]; then
+            cp release/windows-feed.json windows-stable.json
+            files+=(windows-stable.json)
+          fi
+          current=$(gh release download channels --pattern windows-beta.json --output - 2>/dev/null \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])' || true)
+          if [ -z "$current" ] || [ "$(./scripts/newest-version.py "$current" "$VERSION")" = "$VERSION" ]; then
+            cp release/windows-feed.json windows-beta.json
+            files+=(windows-beta.json)
+          else
+            echo "windows-beta.json stays on $current, newer than $VERSION."
+          fi
+          [ ${#files[@]} -eq 0 ] || gh release upload channels "${files[@]}" --clobber

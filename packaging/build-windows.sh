@@ -20,7 +20,9 @@
 #                         installed Midna's files (midna_proto::paths::guard_write); its icon is
 #                         inverted and Windows lists it as "Midna Dev"
 #
-# Windows builds never update themselves (no update key), so none is embedded.
+# Env: MIDNA_UPDATE_PUBKEY, the update keys to compile in (base64 ed25519 public keys, separated by
+# commas or spaces; the release workflow sets the fork's). Without it, or with --dev-home, the
+# build never updates itself. Unlike build-app.sh, there's no default dev key.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -35,7 +37,7 @@ while [ $# -gt 0 ]; do
     --target-dir) TARGET_DIR="$2"; shift 2 ;;
     --dev-home) DEV_HOME="$2"; shift 2 ;;
     --conpty) CONPTY="$2"; shift 2 ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
     *) echo "build-windows.sh: unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -71,7 +73,12 @@ fi
 BIN="$TARGET_DIR/release"
 if [ "$BUILD" = 1 ]; then
   echo "==> cargo build --release (midna $VERSION, target $TARGET_DIR)"
-  unset MIDNA_UPDATE_PUBKEY
+  if [ -n "${MIDNA_UPDATE_PUBKEY:-}" ] && [ -z "$DEV_HOME" ]; then
+    export MIDNA_UPDATE_PUBKEY
+  else
+    unset MIDNA_UPDATE_PUBKEY
+    echo "build-windows.sh: no update key (MIDNA_UPDATE_PUBKEY): this build will never update itself" >&2
+  fi
   MIDNA_DEV_HOME="$DEV_HOME" MIDNA_BUILD_VERSION="$VERSION" CARGO_TARGET_DIR="$TARGET_DIR" CARGO_BUILD_BUILD_DIR="$TARGET_DIR" \
     cargo build --release -p midna-app -p midnad -p midna-cli -p midna-pty --bin midna-app --bin midnad --bin midna --bin midna-pty
 fi

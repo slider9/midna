@@ -11,7 +11,8 @@ mkdir -p "$DIR" && chmod 700 "$DIR"
 if [ -f "$DIR/update-ed25519.key" ]; then
   echo "$DIR/update-ed25519.key already exists; public key:"; cat "$DIR/update-ed25519.pub"; exit 0
 fi
-cargo build --release -q --manifest-path "$ROOT/packaging/release-tool/Cargo.toml"
+# Its own target dir: env.sh's CARGO_TARGET_DIR would put the binary somewhere else.
+cargo build --release -q --manifest-path "$ROOT/packaging/release-tool/Cargo.toml" --target-dir "$ROOT/packaging/release-tool/target"
 "$ROOT/packaging/release-tool/target/release/midna-release" keygen "$DIR/update-ed25519.key" > "$DIR/update-ed25519.pub"
 echo "wrote $DIR/update-ed25519.key (secret) and $DIR/update-ed25519.pub:"
 cat "$DIR/update-ed25519.pub"
