@@ -19,6 +19,8 @@ static N: AtomicU32 = AtomicU32::new(0);
 /// The copies of midnad the daemon runs from (Windows starts programs by their `.exe`).
 const V1: &str = if cfg!(windows) { "v1.exe" } else { "v1" };
 const V2: &str = if cfg!(windows) { "v2.exe" } else { "v2" };
+#[cfg(windows)]
+const KEEPER: &str = "midna-pty.exe";
 
 /// This test process's own copy of the built midnad, run once before any test waits on it:
 /// macOS scans a new executable the first time it runs, which takes a second on a calm Mac
@@ -39,6 +41,9 @@ fn built() -> &'static Path {
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join(if cfg!(windows) { "midnad.exe" } else { "midnad" });
         std::fs::copy(env!("CARGO_BIN_EXE_midnad"), &bin).unwrap();
+        // Windows terminals run in the keeper beside midnad (scripts/test.sh builds it).
+        #[cfg(windows)]
+        std::fs::copy(Path::new(env!("CARGO_BIN_EXE_midnad")).with_file_name(KEEPER), dir.join(KEEPER)).expect("midna-pty.exe beside midnad.exe: cargo build -p midna-pty");
         assert!(Command::new(&bin).arg("--version").stdout(Stdio::null()).status().unwrap().success());
         bin
     })
@@ -70,6 +75,8 @@ impl Bin {
         for v in [V1, V2] {
             std::fs::hard_link(built(), home.join(v)).unwrap();
         }
+        #[cfg(windows)]
+        std::fs::hard_link(built().with_file_name(KEEPER), home.join(KEEPER)).unwrap();
         let log = std::fs::File::create(home.join("daemon.log")).unwrap();
         let child = Command::new(home.join(V1))
             .args(["--foreground", "--home"])
