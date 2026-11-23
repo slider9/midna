@@ -1232,7 +1232,9 @@ fn main_windows(cx: &mut App) -> Vec<(w32::Hwnd, f64)> {
 mod w32 {
     use super::{Corner, DOCK, MX, MY, SIZE, WIN_H, WIN_W};
     use gpui_kit::{App, Window};
+    use std::cell::Cell;
     use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+    use windows_sys::Win32::Graphics::Dwm::{DWMNCRP_DISABLED, DWMWA_NCRENDERING_POLICY, DwmSetWindowAttribute};
     use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_LBUTTON, VK_RBUTTON};
@@ -1279,6 +1281,13 @@ mod w32 {
             // A layered window shows only once it has an opacity: all of it, GPUI's own alpha
             // making the rest of the rectangle clear.
             SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
+            // No frame from Windows: its shadow (and edge) would outline the whole transparent
+            // rectangle around the badge.
+            let off = DWMNCRP_DISABLED;
+            let hr = DwmSetWindowAttribute(h, DWMWA_NCRENDERING_POLICY as u32, (&raw const off).cast(), size_of_val(&off) as u32);
+            if hr < 0 {
+                crate::lifecycle::log(&format!("badge: couldn't turn off its window's frame shadow ({hr:#x})"));
+            }
         }
     }
 
@@ -1344,8 +1353,21 @@ mod w32 {
         }
     }
 
-    /// The client area's top left on screen (GPUI draws from there).
+    thread_local! {
+        /// Where the window was last sent (`move_to`, its client origin), until it's there.
+        static GOING: Cell<Option<(HWND, (f64, f64))>> = const { Cell::new(None) };
+    }
+
+    /// The client area's top left on screen (GPUI draws from there), or where it's on its way
+    /// to: a drop in the same tick as the drag's last move goes where the badge was shown going.
     pub fn client_origin(h: HWND) -> (f64, f64) {
+        match GOING.get() {
+            Some((g, to)) if g == h => (to.0.round(), to.1.round()),
+            _ => live_origin(h),
+        }
+    }
+
+    fn live_origin(h: HWND) -> (f64, f64) {
         let mut p = POINT { x: 0, y: 0 };
         // SAFETY: as in `setup`; `p` is ours.
         unsafe { ClientToScreen(h, &mut p) };
@@ -1354,14 +1376,19 @@ mod w32 {
 
     /// Put the client area's top left at `to`.
     pub fn move_to(h: HWND, to: (f64, f64), cx: &mut App) {
+        GOING.set(Some((h, to)));
         later(cx, move || move_now(h, to));
     }
 
     fn move_now(h: HWND, to: (f64, f64)) {
+        // There now (unless it's been sent on since).
+        if GOING.get() == Some((h, to)) {
+            GOING.set(None);
+        }
         let mut wr = RECT::default();
         // SAFETY: as in `setup`.
         unsafe { GetWindowRect(h, &mut wr) };
-        let o = client_origin(h);
+        let o = live_origin(h);
         let (x, y) = (to.0.round() as i32 - (o.0 as i32 - wr.left), to.1.round() as i32 - (o.1 as i32 - wr.top));
         if (x, y) != (wr.left, wr.top) {
             // SAFETY: as in `setup`.
