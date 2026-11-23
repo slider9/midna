@@ -98,8 +98,9 @@ fn parse(text: &str, dir: &str, exists: &dyn Fn(&str) -> bool) -> Option<Vec<Str
         _ => return None,
     };
     let mut line = last.strip_prefix('@').unwrap_or(last);
-    if line.len() >= NPM_PREFIX.len() && line[..NPM_PREFIX.len()].eq_ignore_ascii_case(NPM_PREFIX) {
-        line = &line[NPM_PREFIX.len()..];
+    // `get`: the line needn't be ASCII (a path with é, or U+FFFD from an OEM code page).
+    if let Some(rest) = line.get(..NPM_PREFIX.len()).filter(|p| p.eq_ignore_ascii_case(NPM_PREFIX)).and(line.get(NPM_PREFIX.len()..)) {
+        line = rest;
     }
     let words = line.trim_end().strip_suffix("%*")?;
     let argv = split(words)?.iter().map(|w| expand(w, dir, prog.as_deref())).collect::<Option<Vec<_>>>()?;
@@ -236,6 +237,9 @@ mod tests {
         assert_eq!(parse("@\"C:\\Git\\bin\\bash.exe\" \"C:\\t\\a b.sh\" %*\r\n", DIR, &|_| false), words(&[r"C:\Git\bin\bash.exe", r"C:\t\a b.sh"]));
         assert_eq!(parse("@echo off\npython \"%~dp0fake.py\" -u %*\n", r"C:\t\", &|_| false), words(&["python", r"C:\t\fake.py", "-u"]));
         assert_eq!(parse("@\"100%%.exe\" %*", DIR, &|_| false), words(&["100%.exe"]));
+        // Not ASCII, with a character across the length of npm's prefix.
+        let exe = format!(r"C:\{}.exe", "é".repeat(30));
+        assert_eq!(parse(&format!("\"{exe}\" %*"), DIR, &|_| false), words(&[&exe]));
     }
 
     #[test]
