@@ -1,0 +1,20 @@
+== bundled
+  buf=0        pause=0     lines/s=11509    max_write_ms=232.2    blocked_in_pause_ms=-0.0    read_B/s=828527    first200ms_after=243423   stalls=[61, 64, 172, 232]
+  buf=0        pause=1000  lines/s=14862    max_write_ms=998.5    blocked_in_pause_ms=999.0   read_B/s=2040530   first200ms_after=401709   stalls=[999]
+  buf=65536    pause=0     lines/s=17497    max_write_ms=1.6      blocked_in_pause_ms=-0.0    read_B/s=2074297   first200ms_after=377400   stalls=[]
+  buf=65536    pause=1000  lines/s=15949    max_write_ms=984.4    blocked_in_pause_ms=984.0   read_B/s=2163857   first200ms_after=506382   stalls=[984]
+  buf=1048576  pause=0     lines/s=21320    max_write_ms=1.5      blocked_in_pause_ms=-0.0    read_B/s=2448835   first200ms_after=420024   stalls=[]
+  buf=1048576  pause=1000  lines/s=16093    max_write_ms=507.0    blocked_in_pause_ms=507.0   read_B/s=1972820   first200ms_after=1345209  stalls=[507]
+  buf=8388608  pause=0     lines/s=16478    max_write_ms=6.1      blocked_in_pause_ms=-0.0    read_B/s=1857847   first200ms_after=369852   stalls=[]
+  buf=8388608  pause=1000  lines/s=15446    max_write_ms=4.6      blocked_in_pause_ms=-0.0    read_B/s=1607922   first200ms_after=2759460  stalls=[]
+  hangup: {'hangup_reply': {'ok': True, 'took_ms': 0.0251}, 'hangup_returned_ms': 0.33490000000000003, 'shell_alive_after': True, 'keeper_alive_after': True}
+== system
+  buf=0        pause=0     lines/s=10028    max_write_ms=4.5      blocked_in_pause_ms=-0.0    read_B/s=1200143   first200ms_after=180153   stalls=[]
+  buf=0        pause=1000  lines/s=3246     max_write_ms=506.4    blocked_in_pause_ms=1034.0  read_B/s=733418    first200ms_after=4995     stalls=[506, 98, 207, 118, 52, 53]
+  buf=65536    pause=0     lines/s=8115     max_write_ms=7.2      blocked_in_pause_ms=-0.0    read_B/s=905409    first200ms_after=178932   stalls=[]
+  buf=65536    pause=1000  lines/s=6202     max_write_ms=930.8    blocked_in_pause_ms=931.0   read_B/s=760408    first200ms_after=211124   stalls=[931]
+  buf=1048576  pause=0     lines/s=3390     max_write_ms=110.8    blocked_in_pause_ms=55.0    read_B/s=759124    first200ms_after=333      stalls=[78, 70, 55, 80, 85, 99]
+  buf=1048576  pause=1000  lines/s=6417     max_write_ms=8.3      blocked_in_pause_ms=-0.0    read_B/s=717877    first200ms_after=936729   stalls=[]
+  buf=8388608  pause=0     lines/s=5346     max_write_ms=341.5    blocked_in_pause_ms=-0.0    read_B/s=762862    first200ms_after=70598    stalls=[91, 115, 100, 341, 90]
+  buf=8388608  pause=1000  lines/s=9043     max_write_ms=10.9     blocked_in_pause_ms=-0.0    read_B/s=1064373   first200ms_after=1327449  stalls=[]
+  hangup: {'hangup_reply': None, 'hangup_returned_ms': 15002.4262, 'shell_alive_after': True, 'keeper_alive_after': True}

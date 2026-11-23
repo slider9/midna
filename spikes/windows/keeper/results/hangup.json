@@ -1,0 +1,78 @@
+{
+  "bundled": {
+    "hangup": {
+      "client": {
+        "bytes": 24000962,
+        "client_pid": 48596,
+        "seen": true,
+        "shell_pid": 21912,
+        "shell_running_via_dup_handle": true
+      },
+      "conpty": "D:\\Projects\\midna\\.toolchain\\conpty\\conpty.dll",
+      "hangup_reply": {
+        "ok": true,
+        "took_ms": 0.0619
+      },
+      "hangup_returned_ms": 0.4751,
+      "keeper_alive_after": true,
+      "shell_alive_after": true
+    },
+    "hangup_drain": {
+      "client": {
+        "bytes": 26108741,
+        "client_pid": 74620,
+        "seen": true,
+        "shell_pid": 8468,
+        "shell_running_via_dup_handle": true
+      },
+      "conpty": "D:\\Projects\\midna\\.toolchain\\conpty\\conpty.dll",
+      "hangup_reply": {
+        "drained_bytes": 4491,
+        "ok": true,
+        "shell_end_ms": 4.8491,
+        "shell_ended": true,
+        "took_ms": 4.9451
+      },
+      "hangup_returned_ms": 5.4032,
+      "keeper_alive_after": true,
+      "shell_alive_after": false
+    }
+  },
+  "driver_in_job": false,
+  "system": {
+    "hangup": {
+      "client": {
+        "bytes": 9951213,
+        "client_pid": 66204,
+        "seen": true,
+        "shell_pid": 57372,
+        "shell_running_via_dup_handle": true
+      },
+      "conpty": "system",
+      "hangup_reply": null,
+      "hangup_returned_ms": 15014.7146,
+      "keeper_alive_after": true,
+      "shell_alive_after": true
+    },
+    "hangup_drain": {
+      "client": {
+        "bytes": 105957,
+        "client_pid": 54716,
+        "seen": true,
+        "shell_pid": 14488,
+        "shell_running_via_dup_handle": true
+      },
+      "conpty": "system",
+      "hangup_reply": {
+        "drained_bytes": 4107,
+        "ok": true,
+        "shell_end_ms": 2.1874,
+        "shell_ended": true,
+        "took_ms": 13.1946
+      },
+      "hangup_returned_ms": 16.2962,
+      "keeper_alive_after": true,
+      "shell_alive_after": false
+    }
+  }
+}

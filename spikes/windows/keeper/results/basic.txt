@@ -1,0 +1,35 @@
+== bundled
+ launch {'breakaway': True, 'launcher_in_job': False, 'keeper_in_job': False, 'shell_alive': True, 'launcher_exit': 0, 'keeper_children': [{'exe': 'OpenConsole.exe', 'pid': 73052}, {'exe': 'cmd.exe', 'pid': 57696}], 'error': None}
+ after {'keeper_alive': True, 'keeper_children': [{'exe': 'OpenConsole.exe', 'pid': 73052}, {'exe': 'cmd.exe', 'pid': 57696}], 'launcher_alive': False, 'shell_alive': True}
+  client_a {'bytes': 404, 'client_pid': 75308, 'seen': True, 'shell_pid': 57696, 'shell_running_via_dup_handle': True}
+  client_b_killed {'hold': {'client_pid': 20192, 'shell_pid': 57696, 'shell_running_via_dup_handle': True}, 'killed': True, 'shell_alive_after': True}
+  client_c {'bytes': 210, 'client_pid': 22408, 'seen': True, 'shell_pid': 57696, 'shell_running_via_dup_handle': True}
+  client_paint {'bytes': 4153, 'client_pid': 71848, 'seen': True, 'shell_pid': 57696, 'shell_running_via_dup_handle': True}
+  client_exit {'client_pid': 62788, 'exit_code': 7, 'shell_pid': 57696, 'shell_running_via_dup_handle': True, 'wait': True}
+  repaint_0ms_1x0 {'hr': [0, 0], 'took_ms': 0.0124} pre 0 post 0 text_diff 29 style_diff 27 [29, 65] [0, 0] nonblank fresh/truth 0 29
+  repaint_100ms_0x1 {'hr': [0, 0], 'took_ms': 100.5084} pre 0 post 0 text_diff 29 style_diff 27 [29, 65] [0, 0] nonblank fresh/truth 0 29
+  repaint_100ms_10x5 {'hr': [0, 0], 'took_ms': 100.8983} pre 0 post 0 text_diff 29 style_diff 27 [29, 65] [0, 0] nonblank fresh/truth 0 29
+  repaint_100ms_1x0 {'hr': [0, 0], 'took_ms': 100.4442} pre 0 post 0 text_diff 29 style_diff 27 [29, 65] [0, 0] nonblank fresh/truth 0 29
+  repaint_500ms_1x0 {'hr': [0, 0], 'took_ms': 500.4488} pre 0 post 0 text_diff 29 style_diff 27 [29, 65] [0, 0] nonblank fresh/truth 0 29
+ keeper_after_exit True True
+ keeper_killed {'hosts_alive_after': [{'alive': False, 'exe': 'OpenConsole.exe'}, {'alive': False, 'exe': 'cmd.exe'}], 'killed': True, 'shell_alive_after': False}
+ peek took 5.9 {'attach': 0.2298, 'detach': 0.5959, 'free': 0.0040999999999999995, 'read': 0.5796} err None buf [120, 30] top 0 text_diff 0 style_diff 27 [29, 65] [29, 65] nonblank 29 29
+ after peek True True
+driver_in_job False
+== system
+ launch {'breakaway': True, 'launcher_in_job': False, 'keeper_in_job': False, 'shell_alive': True, 'launcher_exit': 0, 'keeper_children': [{'exe': 'conhost.exe', 'pid': 69916}, {'exe': 'cmd.exe', 'pid': 69700}], 'error': None}
+ after {'keeper_alive': True, 'keeper_children': [{'exe': 'conhost.exe', 'pid': 69916}, {'exe': 'cmd.exe', 'pid': 69700}], 'launcher_alive': False, 'shell_alive': True}
+  client_a {'bytes': 334, 'client_pid': 65144, 'seen': True, 'shell_pid': 69700, 'shell_running_via_dup_handle': True}
+  client_b_killed {'hold': {'client_pid': 54120, 'shell_pid': 69700, 'shell_running_via_dup_handle': True}, 'killed': True, 'shell_alive_after': True}
+  client_c {'bytes': 115, 'client_pid': 40684, 'seen': True, 'shell_pid': 69700, 'shell_running_via_dup_handle': True}
+  client_paint {'bytes': 4770, 'client_pid': 57340, 'seen': True, 'shell_pid': 69700, 'shell_running_via_dup_handle': True}
+  client_exit {'client_pid': 24676, 'exit_code': 7, 'shell_pid': 69700, 'shell_running_via_dup_handle': True, 'wait': True}
+  repaint_0ms_1x0 {'hr': [0, 0], 'took_ms': 0.016} pre 0 post 2585 text_diff 0 style_diff 0 [29, 65] [29, 65] nonblank fresh/truth 28 28
+  repaint_100ms_0x1 {'hr': [0, 0], 'took_ms': 100.3569} pre 0 post 4993 text_diff 0 style_diff 0 [28, 65] [28, 65] nonblank fresh/truth 27 27
+  repaint_100ms_10x5 {'hr': [0, 0], 'took_ms': 100.5607} pre 0 post 4213 text_diff 0 style_diff 0 [24, 65] [24, 65] nonblank fresh/truth 23 23
+  repaint_100ms_1x0 {'hr': [0, 0], 'took_ms': 100.3898} pre 0 post 5170 text_diff 0 style_diff 0 [29, 65] [29, 65] nonblank fresh/truth 28 28
+  repaint_500ms_1x0 {'hr': [0, 0], 'took_ms': 500.6682} pre 0 post 5170 text_diff 0 style_diff 0 [29, 65] [29, 65] nonblank fresh/truth 28 28
+ keeper_after_exit True False
+ keeper_killed {'hosts_alive_after': [{'alive': False, 'exe': 'conhost.exe'}, {'alive': False, 'exe': 'cmd.exe'}], 'killed': True, 'shell_alive_after': False}
+ peek took 4.7 {'attach': 0.153, 'detach': 0.5088999999999999, 'free': 0.001, 'read': 0.4927} err None buf [120, 30] top 0 text_diff 0 style_diff 27 [29, 65] [29, 65] nonblank 29 29
+ after peek True True
