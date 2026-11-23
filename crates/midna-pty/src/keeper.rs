@@ -245,6 +245,14 @@ impl Keeper {
                 return;
             }
             self.tell_exit(&mut conn);
+            // A shell that exited while no client was attached (a midnad that was killed): once
+            // the next one has attached and been told the code, the keeper's work is done, as
+            // when it tells a client that's already attached.
+            let told = conn.as_ref().is_some_and(|c| c.attached && c.exited_sent);
+            drop(conn);
+            if told {
+                self.maybe_exit();
+            }
         }
     }
 

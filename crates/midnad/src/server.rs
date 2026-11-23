@@ -193,17 +193,21 @@ pub fn start_with(mut cfg: Config, resume: Option<crate::upgrade::Resume>) -> st
         crate::upgrade::set_aside_stale(&cfg.home);
     }
     let _ = secure_dir(&cfg.home);
+    // Windows: the keepers a killed or crashed midnad left keep their sessions running.
+    #[cfg(windows)]
+    let found = if resume.is_none() { crate::pty::recover::find(&cfg.home) } else { vec![] };
+    #[cfg(windows)]
+    kept.extend(crate::pty::recover::kept(&found));
     let d = Daemon::new_keeping(cfg, &kept)?;
     let listener = match resume.as_ref().and_then(crate::upgrade::inherited_listener) {
         Some(l) => l,
         None => bind(&d.cfg.socket, &d.cfg.home)?,
     };
-    // Windows: what a crashed midnad's keepers still run is ended before any terminal reopens
-    // (only once the socket is ours, so a running midnad's terminals are never touched).
+    // Attached to only once the socket is ours, so a running midnad's terminals are never touched.
     #[cfg(windows)]
-    if resume.is_none() {
-        crate::pty::end_leftover_keepers(&d.cfg.home);
-    }
+    let reattached = if resume.is_none() { crate::pty::recover::reattach(&d, found).reattached } else { vec![] };
+    #[cfg(unix)]
+    let reattached: Vec<String> = vec![];
     #[cfg(unix)]
     d.listener_fd.store(std::os::fd::AsRawFd::as_raw_fd(&listener), Ordering::SeqCst);
     crate::hooks::write_claude_settings(&d);
@@ -216,7 +220,7 @@ pub fn start_with(mut cfg: Config, resume: Option<crate::upgrade::Resume>) -> st
                 Actor::system(),
                 None,
                 None,
-                json!({ "pid": std::process::id(), "version": midna_proto::VERSION, "socket": d.cfg.socket }),
+                json!({ "pid": std::process::id(), "version": midna_proto::VERSION, "socket": d.cfg.socket, "sessions_reattached": reattached }),
             );
         }
     }

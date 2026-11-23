@@ -899,12 +899,13 @@ fn a_stopped_midnad_leaves_no_keeper_console_host_or_shell_on_windows() {
     assert!(midna_pty::names::records(&d.home).is_empty(), "keeper records left: {:?}", midna_pty::names::records(&d.home));
 }
 
-/// A midnad that's killed leaves its keepers running, with shells no terminal shows. Until a new
-/// midnad can re-attach to them, it ends them, with what they started, and the sessions they
-/// held can be restarted.
+/// A midnad that's killed leaves its keepers running. A next one the keepers won't serve (here
+/// `v1.exe`: a keeper serves only `midnad.exe`, from the home's `bin` or beside it) can't
+/// re-attach to them, so it ends them, with what they started, and the sessions they held can be
+/// restarted. Re-attaching is `tests/crash_windows.rs`.
 #[cfg(windows)]
 #[test]
-fn a_killed_midnads_keepers_are_ended_by_the_next_and_its_terminals_restart_on_windows() {
+fn a_killed_midnads_keepers_the_next_cant_attach_to_are_ended_and_its_terminals_restart_on_windows() {
     let mut d = Bin::start();
     let mut c = d.human();
     let id = call(&mut c, "session.open", json!({ "kind": "shell", "cwd": common::tmp(), "command": ["cmd.exe"] }))["id"].as_str().unwrap().to_string();
@@ -935,10 +936,9 @@ fn a_killed_midnads_keepers_are_ended_by_the_next_and_its_terminals_restart_on_w
 
     d.child = Bin::launch(&d.home, 0., &[]);
     let mut c = d.human();
-    let left = running(&theirs);
-    assert!(left.is_empty(), "still running after the next midnad started: {left:?}");
-    assert!(midna_pty::names::records(&d.home).is_empty());
-    assert!(d.log().contains("left by an earlier midnad"), "{}", d.log());
+    wait_for(10, "the keeper, its shell and the ping to end", || running(&theirs).is_empty().then_some(()));
+    wait_for(5, "its record to go", || midna_pty::names::records(&d.home).is_empty().then_some(()));
+    assert!(d.log().contains(&format!("can't re-attach session {id}")), "{}", d.log());
     let s = call(&mut c, "session.restart", json!({ "id": id }));
     assert_eq!(s["status"]["reason"], "restarted", "{s}");
     call(&mut c, "session.input", json!({ "id": id, "text": "echo back-again", "enter": true }));
