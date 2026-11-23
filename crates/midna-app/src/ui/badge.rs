@@ -52,8 +52,14 @@
 //! it. The home main window feeds it (`sync`, `push`); while it takes notifications, they
 //! aren't macOS banners.
 //!
-//! Off macOS the badge never opens (`init`): moving and clicking through a panel is AppKit
-//! here, so most of this is unused there.
+//! On Windows (`w32`) it's the same window made a topmost tool window (no taskbar button) that
+//! is never activated (`WS_EX_NOACTIVATE`, and `MA_NOACTIVATE` when it's clicked), so it never
+//! takes focus from a game full screen; it stays in while a Direct3D app is full screen. It
+//! drags by hand and drops straight into the corner (no sling), docks in the front main window
+//! the same way, and has no screen-reader label. Windows can't say when the screen's shared, so
+//! `notify.badge.sharing` `hide` and `count` keep it out of every capture and share, and `show`
+//! lets them see it (the sling's parts are unused there). Elsewhere the badge never opens
+//! (`init`), so most of this is unused there.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_variables))]
 use crate::backend::Backend;
 use crate::icons::Icon;
@@ -267,6 +273,13 @@ fn screen_watched() -> bool {
         (!sym.is_null()).then(|| unsafe { std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn() -> bool>(sym) })
     });
     f.is_some_and(|f| unsafe { f() })
+}
+
+/// Windows has no call that says the screen is shared (`W32State::captured` keeps the badge
+/// out of captures instead); `MIDNA_DEBUG_SHARING=1` fakes one.
+#[cfg(not(target_os = "macos"))]
+fn screen_watched() -> bool {
+    crate::dev::var("MIDNA_DEBUG_SHARING").is_ok_and(|v| v == "1")
 }
 
 /// A midna is the app in front: this one, or another build of it (Midna and Midna Dev both
@@ -550,12 +563,13 @@ impl Switch {
     }
 }
 
-/// A press on the badge (Cocoa screen coordinates).
+/// A press on the badge (Cocoa screen coordinates; on Windows, physical pixels with y down).
 #[derive(Clone)]
 struct Press {
     /// Which part: None the pill, or a Mac's tab (its peer).
     part: Option<String>,
-    /// The pointer and the window's origin when it went down.
+    /// The pointer and the window's origin when it went down (on Windows, where in the window
+    /// it went down, in points).
     mouse: (f64, f64),
     origin: (f64, f64),
     /// It moved past `DRAG_SLOP`: a drag, not a click.
@@ -722,7 +736,22 @@ pub struct Badge {
     /// The tooltip's keys line (`mac_tab::keys`), as `keys.next_needs_you` and
     /// `keys.next_needs_you_anywhere` are bound.
     keys: String,
+    /// The Windows window's own state (`w32`).
+    #[cfg(windows)]
+    w32: W32State,
     _ticker: Task<()>,
+}
+
+/// What the Windows tick last set on the window, and saw.
+#[cfg(windows)]
+#[derive(Default)]
+struct W32State {
+    /// Clicks go through it (`WS_EX_TRANSPARENT`).
+    through: bool,
+    /// Screen captures see it (`SetWindowDisplayAffinity`), once set.
+    captured: Option<bool>,
+    /// An app is full screen through Direct3D (a game): the badge stays in.
+    game: bool,
 }
 
 struct BadgeWindow(Option<WindowHandle<Badge>>);
@@ -737,11 +766,11 @@ pub fn is_badge(window: AnyWindowHandle, cx: &App) -> bool {
     handle(cx).is_some_and(|h| h.window_id() == window.window_id())
 }
 
-/// Open the badge's window (hidden until there's something to show). Off macOS there's no
-/// badge yet (it's an AppKit panel moved by hand): with no window, `takes` is false and the
-/// in-app cards (`ui/toast.rs`) show notifications, as with `notify.badge` `off`.
+/// Open the badge's window (hidden until there's something to show). Off macOS and Windows
+/// there's no badge: with no window, `takes` is false and the in-app cards (`ui/toast.rs`) show
+/// notifications, as with `notify.badge` `off`.
 pub fn init(backend: Arc<dyn Backend>, cx: &mut App) {
-    if handle(cx).is_some() || !cfg!(target_os = "macos") {
+    if handle(cx).is_some() || !cfg!(any(target_os = "macos", windows)) {
         return;
     }
     let display = cx.primary_display();
@@ -769,6 +798,13 @@ pub fn init(backend: Arc<dyn Backend>, cx: &mut App) {
             // Hiding midna (⌘H, an app switcher like Charmstone) leaves the badge out.
             ns.setCanHide(false);
             place(&ns, Corner::TopRight);
+        }
+        #[cfg(windows)]
+        if let Some(h) = w32::hwnd(window) {
+            w32::setup(h);
+            if let Some(to) = w32::origin_at(h, window.scale_factor() as f64, Corner::TopRight, (PAD as f64, PAD as f64)) {
+                w32::move_to(h, to, cx);
+            }
         }
         cx.new(|cx| Badge::new(backend, window, cx))
     });
@@ -1174,6 +1210,304 @@ fn nearest(ns: &objc2_app_kit::NSWindow, corner: Corner, ahead: (f64, f64)) -> C
     }
 }
 
+/// The main windows on screen, most recently focused first, with their scales (the badge docks
+/// only in these).
+#[cfg(windows)]
+fn main_windows(cx: &mut App) -> Vec<(w32::Hwnd, f64)> {
+    crate::windows::main_handles(cx)
+        .into_iter()
+        .filter_map(|m| m.update(cx, |_, w, _| Some((w32::hwnd(w)?, w.scale_factor() as f64))).ok().flatten())
+        .collect()
+}
+
+/// The badge's window on Windows: GPUI's `PopUp` (a topmost tool window: no taskbar button,
+/// not in Alt-Tab) made never to activate, so a click on it, or it showing or moving, never
+/// takes focus from the app in front (a game full screen). Clicks go through it outside the
+/// zones (`WS_EX_TRANSPARENT` on a layered window). Points are physical pixels, y down.
+///
+/// What sends the window messages GPUI answers (a move, a resize, showing or hiding it) runs
+/// once the app isn't borrowed (`later`): GPUI's handlers update the app, and from inside an
+/// update a resize would never reach its layout, nor a new scale.
+#[cfg(windows)]
+mod w32 {
+    use super::{Corner, DOCK, MX, MY, SIZE, WIN_H, WIN_W};
+    use gpui_kit::{App, Window};
+    use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+    use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_LBUTTON, VK_RBUTTON};
+    use windows_sys::Win32::UI::Shell::{DefSubclassProc, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState, SetWindowSubclass};
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+    pub type Hwnd = HWND;
+
+    /// Run `f` on the main thread once nothing in GPUI is borrowed: the messages it sends reach
+    /// GPUI's handlers, which update the app (inside an update, or `cx.defer`, they can't).
+    fn later(cx: &App, f: impl FnOnce() + 'static) {
+        cx.foreground_executor().spawn(async move { f() }).detach();
+    }
+
+    /// GPUI's window for `window`.
+    pub fn hwnd(window: &Window) -> Option<HWND> {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let handle = HasWindowHandle::window_handle(window).ok()?;
+        let RawWindowHandle::Win32(h) = handle.as_raw() else { return None };
+        Some(h.hwnd.get() as HWND)
+    }
+
+    /// GPUI answers every `WM_MOUSEACTIVATE` with "activate" (so a click handler sees its
+    /// window active): the badge's says "don't", and the press still arrives.
+    unsafe extern "system" fn no_activate(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
+        if msg == WM_MOUSEACTIVATE {
+            return MA_NOACTIVATE as LRESULT;
+        }
+        // SAFETY: the next window procedure in the chain, for the message it was sent.
+        unsafe { DefSubclassProc(h, msg, wp, lp) }
+    }
+
+    /// Make GPUI's window the badge's: never activated, and clicked through until the pointer
+    /// is on something.
+    pub fn setup(h: HWND) {
+        // SAFETY: GPUI's HWND on its own (this) thread, alive while the window is; only its
+        // styles and a subclass for one message change.
+        unsafe {
+            if SetWindowSubclass(h, Some(no_activate), 1, 0) == 0 {
+                crate::lifecycle::log("badge: couldn't keep its window from activating on a click");
+            }
+            let ex = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32;
+            SetWindowLongPtrW(h, GWL_EXSTYLE, (ex | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT) as isize);
+            // A layered window shows only once it has an opacity: all of it, GPUI's own alpha
+            // making the rest of the rectangle clear.
+            SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
+        }
+    }
+
+    /// Size the window to the badge's (`WIN_W` x `WIN_H` points at scale `s`). GPUI sizes a
+    /// window made hidden only when it's activated, and its own resize would activate it.
+    pub fn fit(h: HWND, scale: f64, cx: &mut App) {
+        later(cx, move || fit_now(h, scale));
+    }
+
+    fn fit_now(h: HWND, scale: f64) {
+        // SAFETY: as in `setup`.
+        unsafe {
+            let (mut wr, mut cr) = (RECT::default(), RECT::default());
+            GetWindowRect(h, &mut wr);
+            GetClientRect(h, &mut cr);
+            let (cw, ch) = ((WIN_W as f64 * scale).round() as i32, (WIN_H as f64 * scale).round() as i32);
+            if (cr.right, cr.bottom) == (cw, ch) {
+                // It's that size, but GPUI missed being told (it was sized as it was made):
+                // tell it again.
+                SendMessageW(h, WM_SIZE, SIZE_RESTORED as WPARAM, ((ch as u32) << 16 | (cw as u32 & 0xffff)) as LPARAM);
+                return;
+            }
+            let (fw, fh) = ((wr.right - wr.left) - cr.right, (wr.bottom - wr.top) - cr.bottom);
+            SetWindowPos(h, std::ptr::null_mut(), 0, 0, cw + fw, ch + fh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+
+    /// Show it above everything (topmost) without activating it.
+    pub fn show(h: HWND, cx: &mut App) {
+        // SAFETY: as in `setup`.
+        later(cx, move || unsafe {
+            ShowWindow(h, SW_SHOWNOACTIVATE);
+            SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        });
+    }
+
+    pub fn hide(h: HWND, cx: &mut App) {
+        // SAFETY: as in `setup`.
+        later(cx, move || unsafe {
+            ShowWindow(h, SW_HIDE);
+        });
+    }
+
+    /// Clicks go through the window (to whatever's under it), or come to it.
+    pub fn click_through(h: HWND, on: bool) {
+        // SAFETY: as in `setup`.
+        unsafe {
+            let ex = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32;
+            let to = if on { ex | WS_EX_TRANSPARENT } else { ex & !WS_EX_TRANSPARENT };
+            if to != ex {
+                SetWindowLongPtrW(h, GWL_EXSTYLE, to as isize);
+            }
+        }
+    }
+
+    /// Screen captures and shares see the window, or never do (`WDA_EXCLUDEFROMCAPTURE`,
+    /// Windows 10 2004 and later; earlier ones show it).
+    pub fn let_capture(h: HWND, on: bool) {
+        // SAFETY: as in `setup`.
+        let ok = unsafe { SetWindowDisplayAffinity(h, if on { WDA_NONE } else { WDA_EXCLUDEFROMCAPTURE }) } != 0;
+        if !ok {
+            crate::lifecycle::log(&format!("badge: couldn't {} screen captures", if on { "show in" } else { "keep out of" }));
+        }
+    }
+
+    /// The client area's top left on screen (GPUI draws from there).
+    pub fn client_origin(h: HWND) -> (f64, f64) {
+        let mut p = POINT { x: 0, y: 0 };
+        // SAFETY: as in `setup`; `p` is ours.
+        unsafe { ClientToScreen(h, &mut p) };
+        (p.x as f64, p.y as f64)
+    }
+
+    /// Put the client area's top left at `to`.
+    pub fn move_to(h: HWND, to: (f64, f64), cx: &mut App) {
+        later(cx, move || move_now(h, to));
+    }
+
+    fn move_now(h: HWND, to: (f64, f64)) {
+        let mut wr = RECT::default();
+        // SAFETY: as in `setup`.
+        unsafe { GetWindowRect(h, &mut wr) };
+        let o = client_origin(h);
+        let (x, y) = (to.0.round() as i32 - (o.0 as i32 - wr.left), to.1.round() as i32 - (o.1 as i32 - wr.top));
+        if (x, y) != (wr.left, wr.top) {
+            // SAFETY: as in `setup`.
+            unsafe { SetWindowPos(h, std::ptr::null_mut(), x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) };
+        }
+    }
+
+    pub fn cursor() -> (f64, f64) {
+        let mut p = POINT { x: 0, y: 0 };
+        // SAFETY: `p` is ours.
+        unsafe { GetCursorPos(&mut p) };
+        (p.x as f64, p.y as f64)
+    }
+
+    /// The primary button is down, as this thread's mouse messages say: a press on the badge
+    /// captures the mouse (GPUI), so its release comes here wherever it is. (The button's live
+    /// state, `GetAsyncKeyState`, reads up while another app is in front.) With the buttons
+    /// swapped, either one counts.
+    pub fn primary_down() -> bool {
+        // SAFETY: plain queries.
+        let down = |vk: u16| (unsafe { GetKeyState(vk as i32) } as u16 & 0x8000) != 0;
+        down(VK_LBUTTON) || (unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0 && down(VK_RBUTTON))
+    }
+
+    /// The work area (clear of the taskbar) of the screen at `p`, or the nearest one: left,
+    /// top, width, height.
+    fn work_area(p: (f64, f64)) -> Option<(f64, f64, f64, f64)> {
+        let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        // SAFETY: `mi` is ours, its size set.
+        let ok = unsafe { GetMonitorInfoW(MonitorFromPoint(POINT { x: p.0 as i32, y: p.1 as i32 }, MONITOR_DEFAULTTONEAREST), &mut mi) } != 0;
+        let r = mi.rcWork;
+        ok.then(|| (r.left as f64, r.top as f64, (r.right - r.left) as f64, (r.bottom - r.top) as f64))
+    }
+
+    /// The badge's center on screen, where the window is now.
+    fn badge_center(h: HWND, s: f64) -> (f64, f64) {
+        let o = client_origin(h);
+        (o.0 + (MX + SIZE / 2.) as f64 * s, o.1 + (MY + SIZE / 2.) as f64 * s)
+    }
+
+    /// Where the window goes (its client origin) for the badge `inset` points from `corner` of
+    /// its screen's work area. An inset too big for the screen keeps the badge on it.
+    pub fn origin_at(h: HWND, s: f64, corner: Corner, inset: (f64, f64)) -> Option<(f64, f64)> {
+        let (x, y, w, ht) = work_area(badge_center(h, s))?;
+        let size = SIZE as f64 * s;
+        let ix = (inset.0 * s).clamp(0., (w - size).max(0.));
+        let iy = (inset.1 * s).clamp(0., (ht - size).max(0.));
+        let bx = if corner.right() { x + w - ix - size } else { x + ix };
+        let by = if corner.top() { y + iy } else { y + ht - iy - size };
+        Some((bx - MX as f64 * s, by - MY as f64 * s))
+    }
+
+    /// The badge's distance (points) from `corner`'s edges of its screen's work area, where it
+    /// is now (a free drop), kept on the screen.
+    pub fn inset_from(h: HWND, s: f64, corner: Corner) -> Option<(f64, f64)> {
+        let c = badge_center(h, s);
+        let (x, y, w, ht) = work_area(c)?;
+        let size = SIZE as f64 * s;
+        let (bx, by) = (c.0 - size / 2., c.1 - size / 2.);
+        let ix = if corner.right() { x + w - size - bx } else { bx - x };
+        let iy = if corner.top() { by - y } else { y + ht - size - by };
+        let keep = |v: f64, room: f64| (v.clamp(0., (room - size).max(0.)) / s).round();
+        Some((keep(ix, w), keep(iy, ht)))
+    }
+
+    /// The corner of its screen the badge is nearest, where the window is now.
+    pub fn nearest(h: HWND, s: f64, corner: Corner) -> Corner {
+        let c = badge_center(h, s);
+        let Some((x, y, w, ht)) = work_area(c) else { return corner };
+        match (c.1 < y + ht / 2., c.0 > x + w / 2.) {
+            (true, true) => Corner::TopRight,
+            (true, false) => Corner::TopLeft,
+            (false, true) => Corner::BottomRight,
+            (false, false) => Corner::BottomLeft,
+        }
+    }
+
+    /// Where the window goes (its client origin, at the badge's scale `s`) for the badge docked
+    /// in midna's front main window (`DOCK` from its top right, at that window's scale).
+    pub fn dock_origin(mains: &[(HWND, f64)], s: f64) -> Option<(f64, f64)> {
+        // SAFETY: GPUI's HWNDs for windows that are open (`main_windows` just asked them).
+        let &(m, ms) = mains.iter().find(|(m, _)| unsafe { IsWindowVisible(*m) != 0 && IsIconic(*m) == 0 })?;
+        let mut cr = RECT::default();
+        // SAFETY: as above.
+        unsafe { GetClientRect(m, &mut cr) };
+        let o = client_origin(m);
+        let size = SIZE as f64 * s;
+        let (bx, by) = (o.0 + cr.right as f64 - DOCK.0 * ms - size, o.1 + DOCK.1 * ms);
+        Some((bx - MX as f64 * s, by - MY as f64 * s))
+    }
+
+    /// One of midna's main windows is in front (`Some(true)`), or another app or another of its
+    /// windows is (`Some(false)`); `None` when the badge is (it never should be).
+    pub fn here(badge: HWND, mains: &[(HWND, f64)]) -> Option<bool> {
+        // SAFETY: a plain query; it may be null.
+        let fg = unsafe { GetForegroundWindow() };
+        if fg == badge {
+            return None;
+        }
+        Some(!fg.is_null() && mains.iter().any(|(m, _)| *m == fg))
+    }
+
+    /// A midna is the app in front: one of this one's windows (not the badge), or another
+    /// build's (Midna and Midna Dev both running; either one's badge stays out of the way while
+    /// you're in a midna).
+    pub fn midna_in_front(badge: HWND) -> bool {
+        let mut pid = 0u32;
+        // SAFETY: plain queries; a null window gives pid 0.
+        let fg = unsafe { GetForegroundWindow() };
+        unsafe { GetWindowThreadProcessId(fg, &mut pid) };
+        if pid == 0 {
+            return false;
+        }
+        if pid == std::process::id() {
+            return fg != badge;
+        }
+        exe_name(pid).is_some_and(|n| n.eq_ignore_ascii_case("midna-app.exe"))
+    }
+
+    /// The file name of process `pid`'s program.
+    fn exe_name(pid: u32) -> Option<String> {
+        // SAFETY: a handle we close; the buffer and its length are ours.
+        unsafe {
+            let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if p.is_null() {
+                return None;
+            }
+            let mut buf = [0u16; 1024];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(p, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) != 0;
+            CloseHandle(p);
+            let path = ok.then(|| String::from_utf16_lossy(&buf[..len as usize]))?;
+            Some(midna_proto::paths::base_name(&path).to_string())
+        }
+    }
+
+    /// An app is full screen through Direct3D (most games): a topmost window over it can't be
+    /// seen, and can knock it out of its full-screen mode.
+    pub fn full_screen_d3d() -> bool {
+        let mut state = 0;
+        // SAFETY: `state` is ours.
+        let ok = unsafe { SHQueryUserNotificationState(&mut state) } >= 0;
+        ok && state == QUNS_RUNNING_D3D_FULL_SCREEN
+    }
+}
+
 impl Badge {
     fn new(backend: Arc<dyn Backend>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let ticker = cx.spawn_in(window, async move |this, cx| {
@@ -1305,6 +1639,8 @@ impl Badge {
             hover_part: None,
             middles: Vec::new(),
             spoken: String::new(),
+            #[cfg(windows)]
+            w32: W32State { through: true, ..Default::default() },
             _ticker: ticker,
         }
     }
@@ -1668,7 +2004,16 @@ impl Badge {
             let mouse = (m.x, m.y);
             self.pressing = Some(Press { part, mouse, origin: (f.origin.x, f.origin.y), moved: false, last: (mouse, Instant::now()), vel: (0., 0.) });
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
+        if let Some(h) = w32::hwnd(window) {
+            self.slide = None;
+            let s = window.scale_factor() as f64;
+            let (m, o) = (w32::cursor(), w32::client_origin(h));
+            // Where in the window it's held (points), for the drag (`tick`).
+            let held = ((m.0 - o.0) / s, (m.1 - o.1) / s);
+            self.pressing = Some(Press { part, mouse: m, origin: held, moved: false, last: (m, Instant::now()), vel: (0., 0.) });
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
         let _ = (part, window);
         cx.notify();
     }
@@ -2586,15 +2931,182 @@ impl Badge {
             .detach();
     }
 
-    /// Off macOS the badge never opens (`init`), so it never moves or ticks.
-    #[cfg(not(target_os = "macos"))]
+    /// Off macOS and Windows the badge never opens (`init`), so it never moves or ticks.
+    #[cfg(not(any(target_os = "macos", windows)))]
     fn snap(&mut self, corner: Corner, _vel: (f64, f64), _window: &mut Window, cx: &mut Context<Self>) {
         self.corner = corner;
         cx.notify();
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     fn tick(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    /// Windows: put the badge at `corner`, straight there (no spring: the window moves only on
+    /// the tick, and a sling's dozens of moves a second would be a game's to share).
+    #[cfg(windows)]
+    fn snap(&mut self, corner: Corner, _vel: (f64, f64), window: &mut Window, cx: &mut Context<Self>) {
+        self.corner = corner;
+        cx.notify();
+        // Docked in midna's window: it goes there when midna's left.
+        if self.within {
+            return;
+        }
+        let Some(h) = w32::hwnd(window) else { return };
+        if let Some(to) = w32::origin_at(h, window.scale_factor() as f64, corner, self.inset) {
+            w32::move_to(h, to, cx);
+        }
+    }
+
+    /// Windows: macOS's tick on an always-on-top tool window that never activates (`w32`).
+    /// Screen coordinates are physical pixels, y down; the window's own are points.
+    #[cfg(windows)]
+    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(h) = w32::hwnd(window) else { return };
+        let s = window.scale_factor() as f64;
+        let now = Instant::now();
+        // The window's size, as GPUI has it (made hidden, it isn't yet; a move to a screen of
+        // another scale can change it).
+        let vs = window.viewport_size();
+        if (f32::from(vs.width) - WIN_W).abs() > 0.5 || (f32::from(vs.height) - WIN_H).abs() > 0.5 {
+            w32::fit(h, s, cx);
+        }
+        let mut changed = false;
+
+        // The badge follows the pointer while it's pressed (and moved past the slop).
+        // Docked in midna's window, it stays put: a press is a click.
+        let within = self.within;
+        if let Some(p) = self.pressing.as_mut() {
+            let m = w32::cursor();
+            let (dx, dy) = ((m.0 - p.mouse.0) / s, (m.1 - p.mouse.1) / s);
+            let was = p.moved;
+            p.moved |= !within && (dx.abs() > DRAG_SLOP || dy.abs() > DRAG_SLOP);
+            // A drag starting: an open list's rows lift away (tick closes it after).
+            if p.moved && !was && self.list && self.list_closing.is_none() {
+                self.list_closing = Some(now);
+                changed = true;
+            }
+            if p.moved {
+                // `origin` is where in the window it was held (points): it stays under the
+                // pointer, even onto a screen of another scale.
+                w32::move_to(h, (m.0 - p.origin.0 * s, m.1 - p.origin.1 * s), cx);
+            }
+        }
+
+        // Midna came to the front or went: onto its window's top right, or back to the corner.
+        let mains = main_windows(cx);
+        // `MIDNA_DEBUG_BADGE_DOCK` (dev screenshots): docked in the window, though it's not in front.
+        let in_main = if crate::dev::var("MIDNA_DEBUG_BADGE_DOCK").is_ok() { Some(true) } else { w32::here(h, &mains) };
+        if let Some(within) = in_main
+            && within != self.within
+            && self.pressing.is_none()
+        {
+            self.within = within;
+            // Leaving midna with the list open: it lifts away.
+            if !within && self.list && self.list_closing.is_none() {
+                self.list_closing = Some(now);
+            }
+            let to = if within { w32::dock_origin(&mains, s) } else { w32::origin_at(h, s, self.corner, self.inset) };
+            if let Some(to) = to {
+                w32::move_to(h, to, cx);
+            }
+            changed = true;
+        }
+        // Docked: it follows its window.
+        if self.within
+            && self.pressing.is_none()
+            && let Some(to) = w32::dock_origin(&mains, s)
+        {
+            let at = w32::client_origin(h);
+            if (at.0 - to.0).abs() > 0.5 || (at.1 - to.1).abs() > 0.5 {
+                w32::move_to(h, to, cx);
+            }
+        }
+
+        changed |= self.age(now, cx);
+        // A game (or anything) full screen through Direct3D: the badge stays in until it's done.
+        if self.watched_at.is_none_or(|t| now.duration_since(t) >= WATCH_EVERY) {
+            let game = w32::full_screen_d3d();
+            if game != self.w32.game {
+                self.w32.game = game;
+                crate::lifecycle::log(&format!("badge: a Direct3D app {} full screen", if game { "went" } else { "left" }));
+                changed = true;
+            }
+        }
+        changed |= self.hush(now);
+        // Windows can't say when the screen's shared: unless it may show in one
+        // (`notify.badge.sharing` `show`), captures and shares never see it at all.
+        // `MIDNA_DEBUG_BADGE` (dev screenshots): they do.
+        let captured = self.sharing == Sharing::Show || crate::dev::var("MIDNA_DEBUG_BADGE").is_ok();
+        if self.w32.captured != Some(captured) {
+            self.w32.captured = Some(captured);
+            w32::let_capture(h, captured);
+        }
+
+        // In another midna build, that one's shows instead (an open stack or menu closes); a
+        // press finishes first.
+        let busy = self.pressing.is_some();
+        // `MIDNA_DEBUG_BADGE` (dev screenshots): shown whatever's in front.
+        let enabled = match self.mode {
+            _ if crate::dev::var("MIDNA_DEBUG_BADGE").is_ok() => true,
+            Mode::Off => false,
+            Mode::Always => true,
+            Mode::Background => busy || self.within || !w32::midna_in_front(h),
+        } && !(self.shared && self.sharing == Sharing::Hide)
+            && !(self.w32.game && !busy);
+        if let Some(want) = self.showing(enabled, &mut changed) {
+            if want {
+                w32::show(h, cx);
+            } else {
+                w32::hide(h, cx);
+            }
+        }
+
+        if self.shown && self.debug_mac(now, cx) {
+            changed = true;
+        }
+        // The pointer's on something that keeps the open list up.
+        let mut keep = false;
+        let mut through = true;
+        if self.shown {
+            // Where the pointer is, in the window's coordinates.
+            let (m, o) = (w32::cursor(), w32::client_origin(h));
+            let p = point(px(((m.0 - o.0) / s) as f32), px(((m.1 - o.1) / s) as f32));
+            let (hover, keeps) = self.point_at(p, now, &mut changed, cx);
+            keep = keeps;
+            through = hover.is_none() && self.pressing.is_none();
+
+            // A press on the badge ended: a drag goes to the nearest corner, a click opens the stack.
+            if self.pressing.is_some()
+                && !w32::primary_down()
+                && let Some(p) = self.pressing.take()
+            {
+                // A click or a drag ends the wait to open the list by resting there.
+                self.hover_since = None;
+                if p.moved {
+                    let corner = w32::nearest(h, s, self.corner);
+                    if self.free {
+                        // It stays where it lands (nudged back on if it's past the edge): saved
+                        // as the nearest corner and its distances from it.
+                        let inset = w32::inset_from(h, s, corner).unwrap_or(self.inset);
+                        self.save(corner, Some(inset), cx);
+                        self.inset = inset;
+                    } else {
+                        self.save(corner, None, cx);
+                    }
+                    self.snap(corner, (0., 0.), window, cx);
+                } else {
+                    self.clicked(p, now, cx);
+                }
+                changed = true;
+            }
+        }
+        // Clicks go through the window everywhere but the badge, the capsule and the stack.
+        if through != self.w32.through {
+            self.w32.through = through;
+            w32::click_through(h, through);
+        }
+        self.finish(now, keep, changed, cx);
+    }
 
     /// Sling the badge to `corner`, carrying `vel` (the throw, points a second) into a spring.
     #[cfg(target_os = "macos")]
@@ -2695,11 +3207,6 @@ impl Badge {
                 }
             }
         }
-        // Docked, with something waiting: a softer sweep now and then (not under the pointer).
-        if self.within && self.count > 0 && !self.list && self.hover != Some("badge") && self.shimmer.is_none_or(|(_, _, at)| now.duration_since(at) >= REMIND) {
-            self.shine(REMIND_ALPHA);
-            changed = true;
-        }
 
         // The sling: a damped spring to the corner, stepped in small slices.
         if let Some(sl) = self.slide.as_mut() {
@@ -2719,6 +3226,110 @@ impl Badge {
             if settled {
                 self.slide = None;
             }
+        }
+
+        changed |= self.age(now, cx);
+        changed |= self.hush(now);
+
+        // In another midna build, that one's shows instead (an open stack or menu closes); a
+        // press or a sling finishes first.
+        let busy = self.pressing.is_some() || self.slide.is_some();
+        // `MIDNA_DEBUG_BADGE` (dev screenshots): shown whatever's in front.
+        let enabled = match self.mode {
+            _ if crate::dev::var("MIDNA_DEBUG_BADGE").is_ok() => true,
+            Mode::Off => false,
+            Mode::Always => true,
+            Mode::Background => busy || self.within || !midna_in_front(&ns),
+        } && !(self.shared && self.sharing == Sharing::Hide);
+        if let Some(want) = self.showing(enabled, &mut changed) {
+            if want {
+                ns.orderFrontRegardless();
+            } else {
+                ns.orderOut(None);
+            }
+        }
+
+        if self.shown && self.debug_mac(now, cx) {
+            changed = true;
+        }
+        // The pointer's on something that keeps the open list up.
+        let mut keep = false;
+        if self.shown {
+            // Where the pointer is, in the window's coordinates.
+            let mouse = objc2_app_kit::NSEvent::mouseLocation();
+            let f = ns.frame();
+            let p = point(px((mouse.x - f.origin.x) as f32), px((f.origin.y + f.size.height - mouse.y) as f32));
+            let (hover, keeps) = self.point_at(p, now, &mut changed, cx);
+            keep = keeps;
+            ns.setIgnoresMouseEvents(hover.is_none() && self.pressing.is_none());
+
+            // A press on the badge ended: a drag slings to the nearest corner, a click opens the stack.
+            if self.pressing.is_some()
+                && objc2_app_kit::NSEvent::pressedMouseButtons() & 1 == 0
+                && let Some(p) = self.pressing.take()
+            {
+                // A click or a drag ends the wait to open the list by resting there.
+                self.hover_since = None;
+                if p.moved {
+                    // A pause before letting go is a drop, not a throw.
+                    let vel = if now.duration_since(p.last.1) > Duration::from_millis(80) { (0., 0.) } else { p.vel };
+                    if self.free {
+                        // It stays where it lands (nudged back on if it's past the edge): saved
+                        // as the nearest corner and its distances from it.
+                        let corner = nearest(&ns, self.corner, (0., 0.));
+                        let inset = inset_from(&ns, corner).unwrap_or(self.inset);
+                        self.save(corner, Some(inset), cx);
+                        self.inset = inset;
+                        self.snap(corner, (0., 0.), window, cx);
+                    } else {
+                        // The corner it's thrown toward: where it'd coast to in a fifth of a second.
+                        let corner = nearest(&ns, self.corner, (vel.0 * 0.2, vel.1 * 0.2));
+                        self.save(corner, None, cx);
+                        self.snap(corner, vel, window, cx);
+                    }
+                } else {
+                    self.clicked(p, now, cx);
+                }
+                changed = true;
+            }
+        }
+        // Only a click on the badge is kept from activating midna: left on, the flag turns away
+        // anything else bringing it forward (an app switcher's flashes in and back out).
+        let prevent = self.shown && (self.hover.is_some() || self.pressing.is_some()) && self.reprevent.is_none();
+        if prevent != self.preventing {
+            self.preventing = prevent;
+            prevent_activation(&ns, prevent);
+        }
+        // Something other than a click on the badge brought midna forward (an app switcher like
+        // Charmstone, ⌘-Tab) and AppKit made the badge, midna's frontmost window, its key window:
+        // midna's active but none of its windows came up. Its last-used main window on screen
+        // takes over. Minimizing the only main window on screen lands here too (the badge is
+        // all that's left to be key), so a minimized window is never brought back.
+        let badge_key = crate::sounds::app_active()
+            && objc2::MainThreadMarker::new()
+                .and_then(|mtm| objc2_app_kit::NSApplication::sharedApplication(mtm).keyWindow())
+                .is_some_and(|k| std::ptr::eq(&*k, &*ns));
+        let stray = badge_key && self.hover.is_none() && self.pressing.is_none();
+        if stray && !self.handed_off {
+            crate::lifecycle::log("midna came forward with the badge as its key window: focusing the main window");
+            crate::windows::focus_shown(cx);
+        }
+        self.handed_off = stray;
+        self.finish(now, keep, changed, cx);
+    }
+}
+
+// ------------------------------------------------------------------ the tick, either platform
+
+impl Badge {
+    /// Age what's out: the reminder sweep while docked, another Mac's capsule, the capsules
+    /// beside the badge and the rows held for a while. True when something changed.
+    fn age(&mut self, now: Instant, cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
+        // Docked, with something waiting: a softer sweep now and then (not under the pointer).
+        if self.within && self.count > 0 && !self.list && self.hover != Some("badge") && self.shimmer.is_none_or(|(_, _, at)| now.duration_since(at) >= REMIND) {
+            self.shine(REMIND_ALPHA);
+            changed = true;
         }
 
         // Another Mac's capsule, due a moment after its tab popped on.
@@ -2799,7 +3410,12 @@ impl Badge {
         if self.list && self.held.iter().any(|w| w.timer.is_some()) {
             changed = true;
         }
+        changed
+    }
 
+    /// Look for a screen share now and then; one starting takes what's out off at once.
+    fn hush(&mut self, now: Instant) -> bool {
+        let mut changed = false;
         if self.watched_at.is_none_or(|t| now.duration_since(t) >= WATCH_EVERY) {
             self.watched_at = Some(now);
             let shared = self.sharing != Sharing::Show && screen_watched();
@@ -2814,21 +3430,16 @@ impl Badge {
             self.close_list();
             changed = true;
         }
+        changed
+    }
 
-        // In another midna build, that one's shows instead (an open stack or menu closes); a
-        // press or a sling finishes first.
-        let busy = self.pressing.is_some() || self.slide.is_some();
-        // `MIDNA_DEBUG_BADGE` (dev screenshots): shown whatever's in front.
-        let enabled = match self.mode {
-            _ if crate::dev::var("MIDNA_DEBUG_BADGE").is_ok() => true,
-            Mode::Off => false,
-            Mode::Always => true,
-            Mode::Background => busy || self.within || !midna_in_front(&ns),
-        } && !(self.shared && self.sharing == Sharing::Hide);
+    /// Whether the badge should be out (`enabled`: nothing keeps it in): the window's shown or
+    /// hidden as this says (`Some`) when it changes.
+    fn showing(&mut self, enabled: bool, changed: &mut bool) -> Option<bool> {
         if !enabled && (self.list || self.menu) {
             self.close_list();
             self.menu = false;
-            changed = true;
+            *changed = true;
         }
         let want = enabled && (self.idle || matches!(self.mode, Mode::Always) || self.count > 0 || !self.lines.is_empty() || self.list || self.menu || !self.tabs().is_empty());
         if want != self.shown {
@@ -2841,125 +3452,77 @@ impl Badge {
                 crate::sounds::app_active(),
                 self.shared,
             ));
-            if want {
-                ns.orderFrontRegardless();
-            } else {
-                ns.orderOut(None);
+            if !want {
                 self.hover = None;
                 self.pressing = None;
             }
-            changed = true;
+            *changed = true;
+            return Some(want);
         }
+        None
+    }
 
-        if self.shown && self.debug_mac(now, cx) {
-            changed = true;
-        }
-        // The pointer's on something that keeps the open list up.
-        let mut keep = false;
-        if self.shown {
-            // Where the pointer is, in the window's coordinates.
-            let mouse = objc2_app_kit::NSEvent::mouseLocation();
-            let f = ns.frame();
-            let p = point(px((mouse.x - f.origin.x) as f32), px((f.origin.y + f.size.height - mouse.y) as f32));
-            // Dev (`MIDNA_DEBUG_BADGE=tip`): rest on the pill for good, its tooltip up.
-            let tip = self.debug.as_deref() == Some("tip");
-            let hover = if tip { Some("badge") } else { self.zones.hit(p) };
-            keep = matches!(hover, Some("badge" | "line")) || (hover == Some("panel") && self.zones.keeps(p));
-            // Which part of it: moving from the pill to a Mac's tab starts the rest over.
-            let part = if tip { None } else { self.zones.part(p).flatten() };
-            if hover != self.hover || (hover == Some("badge") && part != self.hover_part) {
-                if hover == Some("badge") && !tip {
-                    self.hover_since = Some(now);
-                } else if self.hover == Some("badge") {
-                    self.hover_since = None;
-                }
-                self.hover = hover;
-                self.hover_part = part;
-                changed = true;
-            }
-            // Resting on a part of the badge opens its Mac's list.
-            if self.hover_since.is_some_and(|t| now.duration_since(t) >= HOVER_OPEN) && self.pressing.is_none() {
+    /// The pointer is at `p` (window coordinates): what it's on, and whether that keeps the
+    /// open list up. Resting on a part of the badge opens its Mac's list.
+    fn point_at(&mut self, p: Point<Pixels>, now: Instant, changed: &mut bool, cx: &mut Context<Self>) -> (Option<&'static str>, bool) {
+        // Dev (`MIDNA_DEBUG_BADGE=tip`): rest on the pill for good, its tooltip up.
+        let tip = self.debug.as_deref() == Some("tip");
+        let hover = if tip { Some("badge") } else { self.zones.hit(p) };
+        let keep = matches!(hover, Some("badge" | "line")) || (hover == Some("panel") && self.zones.keeps(p));
+        // Which part of it: moving from the pill to a Mac's tab starts the rest over.
+        let part = if tip { None } else { self.zones.part(p).flatten() };
+        if hover != self.hover || (hover == Some("badge") && part != self.hover_part) {
+            if hover == Some("badge") && !tip {
+                self.hover_since = Some(now);
+            } else if self.hover == Some("badge") {
                 self.hover_since = None;
-                let part = self.hover_part.clone();
-                if !self.list && !self.menu && self.can_open(&part) {
-                    self.open_from_badge(part, cx);
-                    self.hover_opened = Some(now);
-                    changed = true;
-                }
             }
-            ns.setIgnoresMouseEvents(hover.is_none() && self.pressing.is_none());
+            self.hover = hover;
+            self.hover_part = part;
+            *changed = true;
+        }
+        // Resting on a part of the badge opens its Mac's list.
+        if self.hover_since.is_some_and(|t| now.duration_since(t) >= HOVER_OPEN) && self.pressing.is_none() {
+            self.hover_since = None;
+            let part = self.hover_part.clone();
+            if !self.list && !self.menu && self.can_open(&part) {
+                self.open_from_badge(part, cx);
+                self.hover_opened = Some(now);
+                *changed = true;
+            }
+        }
+        (hover, keep)
+    }
 
-            // A press on the badge ended: a drag slings to the nearest corner, a click opens the stack.
-            if self.pressing.is_some()
-                && objc2_app_kit::NSEvent::pressedMouseButtons() & 1 == 0
-                && let Some(p) = self.pressing.take()
-            {
-                // A click or a drag ends the wait to open the list by resting there.
-                self.hover_since = None;
-                if p.moved {
-                    // A pause before letting go is a drop, not a throw.
-                    let vel = if now.duration_since(p.last.1) > Duration::from_millis(80) { (0., 0.) } else { p.vel };
-                    if self.free {
-                        // It stays where it lands (nudged back on if it's past the edge): saved
-                        // as the nearest corner and its distances from it.
-                        let corner = nearest(&ns, self.corner, (0., 0.));
-                        let inset = inset_from(&ns, corner).unwrap_or(self.inset);
-                        self.save(corner, Some(inset), cx);
-                        self.inset = inset;
-                        self.snap(corner, (0., 0.), window, cx);
-                    } else {
-                        // The corner it's thrown toward: where it'd coast to in a fifth of a second.
-                        let corner = nearest(&ns, self.corner, (vel.0 * 0.2, vel.1 * 0.2));
-                        self.save(corner, None, cx);
-                        self.snap(corner, vel, window, cx);
-                    }
-                } else if self.menu {
-                    self.menu = false;
-                } else {
-                    let open = (self.list && self.list_closing.is_none()).then_some(&self.list_mac);
-                    match mac_tab::click(open, &p.part) {
-                        // Clicked as resting there opened it: it stays open.
-                        mac_tab::Click::Close if self.hover_opened.take().is_some_and(|t| now.duration_since(t) < HOVER_GRACE) => {}
-                        // Its rows lift away first (tick closes it after).
-                        mac_tab::Click::Close => self.list_closing = Some(now),
-                        mac_tab::Click::Switch => {
-                            self.hover_opened = None;
-                            if self.can_open(&p.part) {
-                                self.switch_to(p.part, cx);
-                            }
-                        }
-                        mac_tab::Click::Open => {
-                            if self.can_open(&p.part) {
-                                self.open_from_badge(p.part, cx);
-                            }
-                        }
-                    }
+    /// A press on the badge ended without a drag: a click on it (or one of its Mac tabs).
+    fn clicked(&mut self, p: Press, now: Instant, cx: &mut Context<Self>) {
+        if self.menu {
+            self.menu = false;
+            return;
+        }
+        let open = (self.list && self.list_closing.is_none()).then_some(&self.list_mac);
+        match mac_tab::click(open, &p.part) {
+            // Clicked as resting there opened it: it stays open.
+            mac_tab::Click::Close if self.hover_opened.take().is_some_and(|t| now.duration_since(t) < HOVER_GRACE) => {}
+            // Its rows lift away first (tick closes it after).
+            mac_tab::Click::Close => self.list_closing = Some(now),
+            mac_tab::Click::Switch => {
+                self.hover_opened = None;
+                if self.can_open(&p.part) {
+                    self.switch_to(p.part, cx);
                 }
-                changed = true;
+            }
+            mac_tab::Click::Open => {
+                if self.can_open(&p.part) {
+                    self.open_from_badge(p.part, cx);
+                }
             }
         }
-        // Only a click on the badge is kept from activating midna: left on, the flag turns away
-        // anything else bringing it forward (an app switcher's flashes in and back out).
-        let prevent = self.shown && (self.hover.is_some() || self.pressing.is_some()) && self.reprevent.is_none();
-        if prevent != self.preventing {
-            self.preventing = prevent;
-            prevent_activation(&ns, prevent);
-        }
-        // Something other than a click on the badge brought midna forward (an app switcher like
-        // Charmstone, ⌘-Tab) and AppKit made the badge, midna's frontmost window, its key window:
-        // midna's active but none of its windows came up. Its last-used main window on screen
-        // takes over. Minimizing the only main window on screen lands here too (the badge is
-        // all that's left to be key), so a minimized window is never brought back.
-        let badge_key = crate::sounds::app_active()
-            && objc2::MainThreadMarker::new()
-                .and_then(|mtm| objc2_app_kit::NSApplication::sharedApplication(mtm).keyWindow())
-                .is_some_and(|k| std::ptr::eq(&*k, &*ns));
-        let stray = badge_key && self.hover.is_none() && self.pressing.is_none();
-        if stray && !self.handed_off {
-            crate::lifecycle::log("midna came forward with the badge as its key window: focusing the main window");
-            crate::windows::focus_shown(cx);
-        }
-        self.handed_off = stray;
+    }
+
+    /// The list's × and arrow, its closing by itself, and finished animations; redraw if
+    /// anything changed.
+    fn finish(&mut self, now: Instant, keep: bool, mut changed: bool, cx: &mut Context<Self>) {
         // The list: × and arrow linger, then shrink; finished animations end.
         if self.hot.is_some() && self.hot_left.is_none() && !matches!(self.hover, Some("panel" | "line")) {
             // The pointer left the window's list without a hover-out reaching us.

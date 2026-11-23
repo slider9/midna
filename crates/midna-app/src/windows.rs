@@ -303,6 +303,15 @@ pub fn ns_windows(cx: &mut App) -> Vec<crate::ui::twilight::NativeWindow> {
     r.ordered().into_iter().filter(|(m, _)| !r.is_hidden(m.id)).filter_map(|(m, _)| m.ns).collect()
 }
 
+/// The main windows on screen, most recently focused first: Windows' `ns_windows` (the badge
+/// docks only in these).
+#[cfg(windows)]
+pub fn main_handles(cx: &mut App) -> Vec<AnyWindowHandle> {
+    let reg = shared(cx);
+    let r = reg.borrow();
+    r.ordered().into_iter().filter(|(m, _)| !r.is_hidden(m.id)).map(|(m, _)| m.handle).collect()
+}
+
 /// `id` was focused: it's its Mac's home window now.
 pub fn focused(id: EntityId, cx: &mut App) {
     let reg = shared(cx);
