@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/midna-proto", "crates/midnad", "crates/midna-cli", "crates/midna-app"]
+members = ["crates/midna-proto", "crates/midnad", "crates/midna-cli", "crates/midna-app", "crates/midna-pty"]
 
 [workspace.package]
 version = "0.1.0-beta.58"
