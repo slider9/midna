@@ -1712,7 +1712,7 @@ fn notify(a: &Args, out: OutFn) -> Res {
                 verb @ ("add" | "update" | "edit") => {
                     a.check(&["label", "description", "color", "stay", "set"])?;
                     let key = a.need(3, "a kind key (deploys)")?;
-                    // --stay 0 = stays until handled; --set field=value for the rest (sound=Glass, push=false, …)
+                    // --stay 0 = stays until handled; --set field=value for the rest (sound=Glass or chimes, push=false, …)
                     let mut settings = serde_json::Map::new();
                     for (f, v) in [("color", a.get("color")), ("stay", a.get("stay"))] {
                         if let Some(v) = v {
@@ -1720,7 +1720,7 @@ fn notify(a: &Args, out: OutFn) -> Res {
                         }
                     }
                     for s in a.all("set") {
-                        let (f, v) = s.split_once('=').ok_or_else(|| Fail::Usage(format!("--set `{s}`: expected field=value (stay=0, sound=Glass, push=false)")))?;
+                        let (f, v) = s.split_once('=').ok_or_else(|| Fail::Usage(format!("--set `{s}`: expected field=value (stay=0, sound={}, push=false)", midna_proto::wording::os("Glass", "chimes"))))?;
                         settings.insert(f.trim().into(), json!(v.trim()));
                     }
                     let p = json!({ "key": key, "label": a.get("label"), "description": a.get("description"), "settings": settings, "replace": verb != "add" });
@@ -1841,7 +1841,7 @@ fn notify(a: &Args, out: OutFn) -> Res {
                 Some(v) => Some(v.trim_end_matches('%').parse::<u8>().ok().filter(|v| *v <= 100).ok_or_else(|| Fail::Usage(format!("--volume `{v}`: expected 0-100")))?),
                 None => None,
             };
-            let v = call("notify.play", json!({ "session": session, "sound": a.need(2, "a kind (approved, failed, …) or a sound (Glass, Pop, …)")?, "volume": volume }))?;
+            let v = call("notify.play", json!({ "session": session, "sound": a.need(2, midna_proto::wording::os("a kind (approved, failed, …) or a sound (Glass, Pop, …)", "a kind (approved, failed, …) or a sound (chimes, tada, …)"))?, "volume": volume }))?;
             out(&v, &|v| match v["reason"].as_str() {
                 None => println!("played {}", s_(v, "sound")),
                 Some(r) => println!("not played: {r}"),

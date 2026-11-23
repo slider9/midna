@@ -402,15 +402,24 @@ fn build() -> Vec<MethodSpec> {
         m::<NotifyKindsRemoveParams, OkResult>("notify.kinds.remove").mutating().d(
             "Remove a notification kind the human added, and its settings. Built-in kinds can only be turned off \
              (`notify.<key>`)."),
-        m::<NotifyMediaParams, NotifyMediaResult>("notify.media").d(
+        m::<NotifyMediaParams, NotifyMediaResult>("notify.media").d(crate::wording::os(
             "The sounds and images notifications can use: the macOS sounds (Glass, Ping, …) and what the human imported, \
              each with the `name` a setting takes and which settings use it. A category's sound, volume and image are the \
              settings `notify.sound.<category>`, `notify.volume.<category>` (0-100, scaled by `notify.volume`) and \
-             `notify.image.<category>` (empty = `notify.image`, the image every notification uses)."),
-        m::<NotifyImportParams, NotifyMedia>("notify.import").mutating().d(
+             `notify.image.<category>` (empty = `notify.image`, the image every notification uses).",
+            "The sounds and images notifications can use: midna's Twilight sounds, Windows' own sounds (chimes, tada, …) \
+             and what the human imported, each with the `name` a setting takes and which settings use it. \
+             A category's sound, volume and image are the \
+             settings `notify.sound.<category>`, `notify.volume.<category>` (0-100, scaled by `notify.volume`) and \
+             `notify.image.<category>` (empty = `notify.image`, the image every notification uses).")),
+        m::<NotifyImportParams, NotifyMedia>("notify.import").mutating().d(crate::wording::os(
             "Copy a sound (aiff, wav, mp3, m4a, caf) or image (png, jpg, gif) into midna so notifications can use it, and \
              optionally set it right away (`use_for: [\"notify.sound.approval\"]`). Its `name` is what the settings take. \
-             Import what the human points you at (\"use ~/Downloads/ding.mp3 for approvals\"); don't pick sounds for them."),
+             Import what the human points you at (\"use ~/Downloads/ding.mp3 for approvals\"); don't pick sounds for them.",
+            "Copy a sound (wav: Windows plays only WAVs) or image (png, jpg, gif) into midna so notifications can use it, and \
+             optionally set it right away (`use_for: [\"notify.sound.approval\"]`). Its `name` is what the settings take. \
+             Import what the human points you at (\"use ~/Downloads/ding.wav for approvals\"); don't pick sounds for them.",
+        )),
         m::<NotifyRemoveParams, NotifyRemoveResult>("notify.remove").mutating().d(
             "Delete an imported sound or image. Settings that used it go back to their defaults."),
         m::<NotifyClearParams, NotifyClearResult>("notify.clear").mutating().d(
@@ -428,12 +437,18 @@ fn build() -> Vec<MethodSpec> {
         m::<NotifyTestParams, NotifySendResult>("notify.test").mutating().d(
             "Show a test notification with a category's sound, volume and image (default `approval`), even when that \
              category is off, so the human can hear and see their choice."),
-        m::<NotifyPlayParams, NotifyPlayResult>("notify.play").mutating().d(
+        m::<NotifyPlayParams, NotifyPlayResult>("notify.play").mutating().d(crate::wording::os(
             "Play a sound now, with no notification: a kind's sound at its volume (a notification category, or a \
              sound effect: approved, denied, queue_sent, image_added, closed, switched, command_bar, copied) or a \
              sound by name (Glass, Pop, an imported file). Use it when the human asks for one (\"play a sound when \
              the deploy is done\"), never as decoration. `notify.sounds` off silences it; an agent can play at most \
-             6 a minute."),
+             6 a minute.",
+            "Play a sound now, with no notification: a kind's sound at its volume (a notification category, or a \
+             sound effect: approved, denied, queue_sent, image_added, closed, switched, command_bar, copied) or a \
+             sound by name (chimes, tada, an imported file). Use it when the human asks for one (\"play a sound when \
+             the deploy is done\"), never as decoration. `notify.sounds` off silences it; an agent can play at most \
+             6 a minute.",
+        )),
         m::<IdParams, Vec<ProcessInfo>>("session.processes").d(
             "Every OS process under a terminal (its process tree: pid, ppid, pgid, depth, command), with the agent's \
              background task id when a process belongs to one. Subagents run inside the agent process and appear in \
@@ -967,4 +982,22 @@ fn build() -> Vec<MethodSpec> {
             "Click a custom header button: run its script (listed in ui.header.buttons) with MIDNA_CLICK=1 and return the \
              button's new segments. Human only (the midna app calls it)."),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    /// The sound methods name only sounds and files this platform plays. The rest of the
+    /// catalog still describes macOS on Windows; that's a pass of its own.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn sound_methods_name_this_platforms_sounds() {
+        for name in ["notify.media", "notify.import", "notify.play"] {
+            let m = super::method(name).unwrap();
+            let text = format!("{} {} {}", m.description, (m.params)(), (m.result)());
+            assert_eq!(crate::wording::mac_words(&text), None, "{name}: {text}");
+            for mac in ["Glass", "Ping", "Pop", "aiff", "mp3"] {
+                assert!(!text.contains(mac), "{name} names {mac}: {text}");
+            }
+        }
+    }
 }
