@@ -65,6 +65,11 @@ pub fn stable_cli(home: &Path) -> PathBuf {
 /// Returns whether it's current now.
 #[cfg(windows)]
 pub fn refresh_stable_cli(home: &Path) -> bool {
+    // midnad refreshes from several threads (polls, launches, hooks RPCs): one at a time. The
+    // temp and aside names also carry a per-call number, for `--install-self` running alongside.
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     let (src, stable) = (current_cli(home), stable_cli(home));
     let Some(want) = std::fs::metadata(&src).ok().filter(|m| m.is_file()) else { return false };
     let root = bin_root(home);
@@ -77,7 +82,8 @@ pub fn refresh_stable_cli(home: &Path) -> bool {
     if std::fs::metadata(&stable).is_ok_and(|m| m.len() == want.len() && m.modified().ok() == want.modified().ok()) {
         return true;
     }
-    let tmp = root.join(format!(".midna.{}.tmp", std::process::id()));
+    let id = format!("{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let tmp = root.join(format!(".midna.{id}.tmp"));
     if std::fs::copy(&src, &tmp).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return false;
@@ -86,11 +92,19 @@ pub fn refresh_stable_cli(home: &Path) -> bool {
     if std::fs::rename(&tmp, &stable).is_ok() {
         return true;
     }
-    let aside = root.join(format!(".midna.{}.old", std::process::id()));
-    let ok = std::fs::rename(&stable, &aside).is_ok() && std::fs::rename(&tmp, &stable).is_ok();
+    let aside = root.join(format!(".midna.{id}.old"));
+    if std::fs::rename(&stable, &aside).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    if std::fs::rename(&tmp, &stable).is_ok() {
+        let _ = std::fs::remove_file(&aside);
+        return true;
+    }
+    // Never leave it missing: the old copy goes back.
+    let _ = std::fs::rename(&aside, &stable);
     let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&aside);
-    ok
+    false
 }
 
 /// Install the running executable. Returns the versioned directory.
@@ -206,6 +220,15 @@ mod tests {
         assert_eq!(left().len(), 1, "{:?}", left());
         assert!(super::refresh_stable_cli(&home));
         assert!(left().is_empty(), "{:?}", left());
+
+        // midnad's threads refreshing at once leave one whole, current copy.
+        let big: Vec<u8> = (0..4_000_000u32).map(|i| i as u8).collect();
+        point("v3", &big);
+        let all: Vec<bool> = std::thread::scope(|s| (0..8).map(|_| s.spawn(|| super::refresh_stable_cli(&home))).collect::<Vec<_>>().into_iter().map(|t| t.join().unwrap()).collect());
+        assert!(all.iter().all(|&ok| ok), "{all:?}");
+        assert!(std::fs::read(&stable).unwrap() == big);
+        let tmps: Vec<_> = std::fs::read_dir(&bin).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).collect();
+        assert!(tmps.is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
 
