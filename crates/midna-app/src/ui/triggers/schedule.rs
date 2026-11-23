@@ -10,6 +10,7 @@ use midna_proto::cron::{self, Schedule};
 use midna_proto::{AgentCron, TimeWindow, TriggerFilter, time};
 
 mod pick;
+use midna_proto::wording::os;
 use pick::{Open, Pick};
 
 // ------------------------------------------------------------------ crons
@@ -894,7 +895,11 @@ impl TriggersView {
                     }
                     cx.notify();
                 })))
-                .child(dim(if wake { "Wakes the Mac for each run, even outside keep-awake hours" } else { "Runs only while the Mac is awake" })),
+                .child(dim(if wake {
+                    os("Wakes the Mac for each run, even outside keep-awake hours", "Not on Windows yet: would wake the PC for each run")
+                } else {
+                    os("Runs only while the Mac is awake", "Runs only while the PC is awake")
+                })),
         );
         if e.trigger_id.is_none() {
             let terms = self.agent_terminals(cx);

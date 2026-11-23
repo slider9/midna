@@ -12,6 +12,7 @@ use crate::theme::Theme;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use midna_proto::nearby::ShareKind;
+use midna_proto::wording::os;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -883,7 +884,7 @@ fn card(m: &MainWindow, t: &Theme, n: &NeedsYou, cx: &mut Context<MainWindow>) -
     });
 
     let long = too_long(n).then(|| {
-        div().flex().items_center().gap(px(8.)).text_size(px(12.)).text_color(t.dim).child(Icon::PopOut.el(12., t.dim)).child("This one's longer than fits here: answer it in its terminal (⌘O).")
+        div().flex().items_center().gap(px(8.)).text_size(px(12.)).text_color(t.dim).child(Icon::PopOut.el(12., t.dim)).child(os("This one's longer than fits here: answer it in its terminal (⌘O).", "This one's longer than fits here: answer it in its terminal (Ctrl+O)."))
     });
 
     let clicked = m.stack.clicked.as_deref() == Some(n.id.as_str());

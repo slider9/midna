@@ -99,8 +99,8 @@ pub fn body(f: &Facts) -> String {
     let mut rows = vec![
         ("midna", format!("{} ({})", f.app, f.channel)),
         ("midnad", daemon),
-        ("macOS", f.macos.clone()),
-        ("Mac", f.hardware.clone()),
+        (midna_proto::wording::os("macOS", "Windows"), f.macos.clone()),
+        (midna_proto::wording::MAC, f.hardware.clone()),
         ("Arch", f.arch.clone()),
         ("Installed in", f.install.clone()),
         ("Accessibility", yes(f.accessibility).into()),
@@ -163,7 +163,7 @@ mod tests {
         let b = body(&facts());
         assert!(b.contains("| midna | 0.3.0 (beta) |"));
         assert!(b.contains("| midnad | 0.3.0 |"));
-        assert!(b.contains("| macOS | 15.1 (24B83) |"));
+        assert!(b.contains(&format!("| {} | 15.1 (24B83) |", midna_proto::wording::os("macOS", "Windows"))));
         assert!(b.contains("| Accessibility | granted |"));
         assert!(b.contains("| Agents | Claude 2.1.3 (opus) |"));
         assert!(b.starts_with("### What happened"));

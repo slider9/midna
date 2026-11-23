@@ -111,7 +111,7 @@ pub fn check_entry(e: &FeedEntry, current: &str, pubkey: &str) -> Result<bool, S
         return Ok(false);
     }
     if !arch_ok(&e.arch) {
-        return Err(format!("midna {} is built for {}, this Mac is {}", e.version, e.arch, std::env::consts::ARCH));
+        return Err(format!("midna {} is built for {}, this {} is {}", e.version, e.arch, midna_proto::wording::MAC, std::env::consts::ARCH));
     }
     if crate::install::macos_version() < version_tuple(&e.minimum_macos) {
         return Err(format!("midna {} needs macOS {}", e.version, e.minimum_macos));

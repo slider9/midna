@@ -17,6 +17,7 @@ use crate::theme::Theme;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use midna_proto::{ActorKind, QueueState, QueuedMessage, SendWhen};
+use midna_proto::wording::os;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -586,9 +587,9 @@ impl Render for QueueView {
             .text_size(px(11.5))
             .text_color(t.dim)
             .child(key("↑↓ ↩", "edit"))
-            .child(key("⌥↑↓", "reorder"))
+            .child(key(os("⌥↑↓", "Alt+↑↓"), "reorder"))
             .child(key("⇧↩", "send now"))
-            .child(key("⌥⌫", "remove"))
+            .child(key(os("⌥⌫", "Alt+Backspace"), "remove"))
             .child(div().flex_1())
             .child(key(&crate::actions::label(cx, "keys.queue"), ""));
 
@@ -702,7 +703,7 @@ impl QueueView {
                             v.call("queue.send_now", json!({ "id": q2 }), cx);
                         })))
                         .child(btn(format!("queue-edit-{}", q.id), Icon::Pencil, "Edit", "↩").on_click(cx.listener(move |v, _, window, cx| v.edit(&q1, window, cx))))
-                        .child(btn(format!("queue-rm-{}", q.id), Icon::Cross, "Remove", "⌥⌫").on_click(cx.listener(move |v, _, _, cx| v.remove(&q3, cx)))),
+                        .child(btn(format!("queue-rm-{}", q.id), Icon::Cross, "Remove", os("⌥⌫", "Alt+Backspace")).on_click(cx.listener(move |v, _, _, cx| v.remove(&q3, cx)))),
                 )
             })
     }

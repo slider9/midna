@@ -22,6 +22,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use midna_proto::link_actions;
 use midna_proto::{AppLinkActions, AppLinkMenu, LinkItemStyle, LinkMenuItem};
+use midna_proto::wording::os;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -425,7 +426,7 @@ pub(super) fn entries(kind: &Kind, ide: Option<&str>, agent: bool, body: Option<
         Kind::File { line } => {
             let mut v = vec![
                 item(Act::OpenIde, &open_in, "↩"),
-                item(Act::Reveal, "Reveal in Finder", ""),
+                item(Act::Reveal, os("Reveal in Finder", "Reveal in File Explorer"), ""),
                 Entry::Sep,
                 item(Act::CopyPath, "Copy path", "⌘C"),
                 item(Act::CopyRelative, "Copy relative path", ""),
@@ -441,7 +442,7 @@ pub(super) fn entries(kind: &Kind, ide: Option<&str>, agent: bool, body: Option<
         Kind::Folder => vec![
             item(Act::NewTerminal, "New terminal here", "↩"),
             item(Act::OpenIde, &open_in, ""),
-            item(Act::Reveal, "Reveal in Finder", ""),
+            item(Act::Reveal, os("Reveal in Finder", "Reveal in File Explorer"), ""),
             Entry::Sep,
             item(Act::CopyPath, "Copy path", "⌘C"),
             item(Act::CopyRelative, "Copy relative path", ""),
@@ -1179,6 +1180,8 @@ mod tests {
     use midna_proto::AppLinkActions;
     use serde_json::json;
 
+    const REVEAL: &str = super::os("Reveal in Finder", "Reveal in File Explorer");
+
     fn vite() -> midna_proto::ServedBy {
         midna_proto::ServedBy { session: "s2".into(), name: "dev".into(), command: "vite".into(), pid: 4242, port: 5173 }
     }
@@ -1227,10 +1230,10 @@ mod tests {
         let k = Kind::File { line: Some(42) };
         assert_eq!(
             labels(&k, Some("Zed"), true),
-            ["Open in Zed ↩", "Reveal in Finder", "--", "Copy path ⌘C", "Copy relative path", "Copy path:line", "--", "Mention in prompt"]
+            ["Open in Zed ↩", REVEAL, "--", "Copy path ⌘C", "Copy relative path", "Copy path:line", "--", "Mention in prompt"]
         );
         // No line, not an agent, no editor found.
-        assert_eq!(labels(&Kind::File { line: None }, None, false), ["Open in editor ↩", "Reveal in Finder", "--", "Copy path ⌘C", "Copy relative path"]);
+        assert_eq!(labels(&Kind::File { line: None }, None, false), ["Open in editor ↩", REVEAL, "--", "Copy path ⌘C", "Copy relative path"]);
     }
 
     #[test]
@@ -1252,7 +1255,7 @@ mod tests {
     fn folder_and_session_items() {
         assert_eq!(
             labels(&Kind::Folder, Some("Cursor"), true),
-            ["New terminal here ↩", "Open in Cursor", "Reveal in Finder", "--", "Copy path ⌘C", "Copy relative path"]
+            ["New terminal here ↩", "Open in Cursor", REVEAL, "--", "Copy path ⌘C", "Copy relative path"]
         );
         assert_eq!(labels(&Kind::Session, None, false), ["Go to terminal ↩", "--", "Copy id ⌘C"]);
     }

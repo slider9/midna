@@ -97,7 +97,8 @@ impl SettingsWindow {
         self.focus.focus(window, cx);
         self.recorder = Some(capture(window, cx, |s, ks, _| {
             let text = keystroke_text(ks);
-            if text == "alt-cmd-k" {
+            // The key that started the recording (actions: ⌥⌘K, Ctrl+Alt+K off macOS)
+            if text == midna_proto::wording::os("alt-cmd-k", "ctrl-alt-k") {
                 s.recorder = None;
             } else {
                 s.recorded = vec![text];

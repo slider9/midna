@@ -175,7 +175,7 @@ fn card(m: &MainWindow, s: &Session, t: &Theme, cx: &mut Context<MainWindow>) ->
         let (name, count) = name_and_count(b);
         div().flex().justify_between().child(name.to_string()).child(div().text_color(t.dim).child(count.to_string()))
     }));
-    let now = m.load.as_ref().filter(|l| l.cpu_percent > 0).map(|l| format!("The Mac's CPU is at {}% now.", l.cpu_percent));
+    let now = m.load.as_ref().filter(|l| l.cpu_percent > 0).map(|l| format!("The {}'s CPU is at {}% now.", midna_proto::wording::MAC, l.cpu_percent));
     let (sid1, sid2, sid3) = (s.id.clone(), s.id.clone(), s.id.clone());
     let actions = if confirming {
         div()

@@ -26,6 +26,7 @@ use crate::ui::onboarding::{self as ob, STEPS, Step};
 use midna_proto::themes::ThemeDef;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use midna_proto::wording::os;
 use std::cell::Cell;
 use std::time::Duration;
 
@@ -321,15 +322,18 @@ fn copy(s: Step) -> Copy {
     match s {
         Step::Daemon => Copy {
             name: "Background daemon",
-            kicker: "JUMP 01 / 05 · macOS",
+            kicker: os("JUMP 01 / 05 · macOS", "JUMP 01 / 05 · Windows"),
             title: "Keep shells alive when midna quits",
-            body: "Install midnad and your terminals survive quitting midna and updating it. macOS then asks you to allow it under Login Items.",
+            body: os(
+                "Install midnad and your terminals survive quitting midna and updating it. macOS then asks you to allow it under Login Items.",
+                "Install midnad and your terminals survive quitting midna. It starts when you sign in; switch it on and off in Settings ▸ Apps ▸ Startup.",
+            ),
             human: true,
             ask: None,
         },
         Step::Notifications => Copy {
             name: "Notifications",
-            kicker: "JUMP 02 / 05 · macOS",
+            kicker: os("JUMP 02 / 05 · macOS", "JUMP 02 / 05 · Windows"),
             title: "Get a ping when a terminal needs you",
             body: "Approvals, questions and failures. Clicking one jumps straight to that terminal.",
             human: true,
@@ -339,7 +343,10 @@ fn copy(s: Step) -> Copy {
             name: "First project",
             kicker: "JUMP 03 / 05",
             title: "Add your first project",
-            body: "A project is a folder. It gets ⌘1, a shell, and git status in the header. Dropping a folder anywhere works too.",
+            body: os(
+                "A project is a folder. It gets ⌘1, a shell, and git status in the header. Dropping a folder anywhere works too.",
+                "A project is a folder. It gets Ctrl+1, a shell, and git status in the header. Dropping a folder anywhere works too.",
+            ),
             human: false,
             ask: Some("add ~/Development/my-app as a project"),
         },
@@ -538,7 +545,11 @@ fn model(m: &MainWindow, t: &Theme, window: &Window) -> Model {
             md.title = vec!["Your terminals,".into(), "wherever you go.".into()];
             md.title_size = 50.;
             md.title_lh = 1.04;
-            md.body = "Five quick jumps and midna can carry your shells and agents across quits, updates and webhooks. Every jump can wait.".into();
+            md.body = os(
+                "Five quick jumps and midna can carry your shells and agents across quits, updates and webhooks. Every jump can wait.",
+                "Five quick jumps and midna can carry your shells and agents across quits and webhooks. Every jump can wait.",
+            )
+            .into();
             md.body_size = 18.;
             md.body_top = 20.;
             md.primary = "Begin ↩".into();
@@ -736,7 +747,7 @@ impl Model {
             can_later: false,
         later_label: "Later",
             rail: vec![],
-            command_key: "⌘K".into(),
+            command_key: os("⌘K", "Ctrl+Shift+K").into(),
         }
     }
 
@@ -866,7 +877,7 @@ fn card_body(md: &Model, mut cx: Option<&mut Context<MainWindow>>) -> Div {
         col = col.child(div().mt(md.u(26.)).flex().items_center().gap(md.u(10.)).font_family(PLEX).text_size(md.u(14.)).text_color(color).child(diamond(md, 8., Icon::Tile, color)).child(text.clone()));
     }
     if md.human {
-        col = col.child(div().mt(md.u(26.)).flex().items_center().gap(md.u(10.)).font_family(PLEX).text_size(md.u(14.)).text_color(dim).child(diamond(md, 8., Icon::Tile, ember)).child("Only you can do this one: macOS asks a person, not an agent."));
+        col = col.child(div().mt(md.u(26.)).flex().items_center().gap(md.u(10.)).font_family(PLEX).text_size(md.u(14.)).text_color(dim).child(diamond(md, 8., Icon::Tile, ember)).child(os("Only you can do this one: macOS asks a person, not an agent.", "Only you can do this one: it's for a person to allow, not an agent.")));
     }
     if let Some(ask) = &md.ask {
         col = col.child(div().mt(md.u(26.)).font_family(MONO).text_size(md.u(14.)).text_color(dim).child(ask.clone()));
@@ -1044,7 +1055,11 @@ fn mode_control(md: &Model, ui: &ThemeUi, mut cx: Option<&mut Context<MainWindow
         .child(if p.sys { Icon::ChainBroken.el(16. * md.s, dim) } else { Icon::Chain.el(16. * md.s, fg) });
     row = row.child(clickable(chain, "setup-theme-link", Action::ThemeMatch(!p.sys), cx.as_deref_mut()));
     row = row.child(clickable(card(false), "setup-theme-slot-light", Action::ThemeSlot(false), cx.as_deref_mut()));
-    let hint = if p.sys { "Unlinked: midna switches when macOS does. Tap the chain to use one." } else { "Linked: one theme, day and night. Tap the chain to follow macOS." };
+    let hint = if p.sys {
+        os("Unlinked: midna switches when macOS does. Tap the chain to use one.", "Unlinked: midna switches when Windows does. Tap the chain to use one.")
+    } else {
+        os("Linked: one theme, day and night. Tap the chain to follow macOS.", "Linked: one theme, day and night. Tap the chain to follow Windows.")
+    };
     div().flex().flex_col().child(row).child(div().mt(md.u(8.)).font_family(PLEX).text_size(md.u(13.)).text_color(dim).child(hint))
 }
 
@@ -1139,7 +1154,7 @@ fn preview(md: &Model, d: &ThemeDef) -> Div {
         .text_color(dim)
         .child(div().flex().child(seg("●", c("ok"), false)).child(" midnad · 7 terminals"))
         .child(div().flex_1())
-        .child("⌘K commands");
+        .child(os("⌘K commands", "Ctrl+Shift+K commands"));
     div()
         .w_full()
         .h(md.u(420.))
@@ -1287,7 +1302,7 @@ fn guide_daemon(md: &Model) -> Div {
         .w(md.u(400.))
         .flex()
         .flex_col()
-        .child(gbox(md, false).px(md.u(18.)).py(md.u(16.)).child(row("midna", "QUIT · UPDATING", ember)))
+        .child(gbox(md, false).px(md.u(18.)).py(md.u(16.)).child(row("midna", os("QUIT · UPDATING", "QUIT"), ember)))
         .child(div().ml(md.u(36.)).h(md.u(36.)).border_l_2().border_dashed().border_color(rgb(md.pal.line, 1.)))
         .child(
             gbox(md, true)
@@ -1366,7 +1381,7 @@ fn guide_project(md: &Model) -> Div {
         .child(folder)
         .child(div().font_family(CHAKRA).font_weight(FontWeight::BOLD).text_size(md.u(20.)).text_color(fg).child("Drop a folder"))
         .child(gmono(md, "~/Development/my-app", 13., dim))
-        .child(tracked(md, "⌘1 · SHELL · GIT STATUS", MONO, 11., FontWeight::SEMIBOLD, 0.12, glow))
+        .child(tracked(md, os("⌘1 · SHELL · GIT STATUS", "CTRL+1 · SHELL · GIT STATUS"), MONO, 11., FontWeight::SEMIBOLD, 0.12, glow))
 }
 
 /// Webhooks: a pull request starts an agent.

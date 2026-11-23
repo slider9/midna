@@ -18,6 +18,7 @@ use crate::ui::tooltip::sentences;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use midna_proto::settings::{SETTINGS, SettingKind};
+use midna_proto::wording::os;
 use serde_json::{Value, json};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -175,7 +176,7 @@ impl Sec {
 
     fn about(self) -> &'static str {
         match self {
-            Sec::General => "Updates, the ⌘K Ask box, and where projects open.",
+            Sec::General => os("Updates, the ⌘K Ask box, and where projects open.", "Updates, the Ctrl+Shift+K Ask box, and where projects open."),
             Sec::Appearance => "Theme, density and what the bars show.",
             Sec::Terminal => "How terminals behave under your hands.",
             Sec::Shortcuts => "Click a shortcut's keys, then press new ones. Right-click for more.",
@@ -185,7 +186,7 @@ impl Sec {
             Sec::Sounds => "What each notification and action sounds like.",
             Sec::Nearby => "Other Midnas on this network: who can find this Mac, and the devices it's paired with.",
             Sec::Webhooks => "How GitHub and Bitbucket events reach midna to start triggers.",
-            Sec::System => "macOS permissions, the daemon, and starting over.",
+            Sec::System => os("macOS permissions, the daemon, and starting over.", "Permissions, the daemon, and starting over."),
         }
     }
 
@@ -221,7 +222,7 @@ impl Sec {
 /// kind); see `special_rows`. A test checks every catalog setting has a place.
 const LAYOUT: &[(Sec, &str, &[&str])] = &[
     (Sec::General, "Updates", &["@update", "updates.channel"]),
-    (Sec::General, "⌘K Ask an agent", &["ui.ask.agent", "ui.ask.scope"]),
+    (Sec::General, os("⌘K Ask an agent", "Ctrl+Shift+K Ask an agent"), &["ui.ask.agent", "ui.ask.scope"]),
     (Sec::General, "Projects and windows", &["projects.roots", "projects.empty_opens", "projects.new_terminal_in", "projects.switch_to_main", "summary.keep_days", "ide.app", "ide.rules", "windows.close_with_terminals", "finder.quick_action"]),
     (Sec::Appearance, "Theme", &["theme", "theme.dark", "theme.light", "theme.colors", "density", "ui.haptics"]),
     (Sec::Appearance, "Bars", &["ui.header.script", "ui.header.buttons", "ui.row.script", "ui.status.script", "ui.status.items", "ui.status.looks", "ui.status.background_ring", "git.refresh_secs"]),
@@ -238,7 +239,7 @@ const LAYOUT: &[(Sec, &str, &[&str])] = &[
     (Sec::Agents, "Lifecycle", &["agents.restart_on_update", "agents.restart_idle_secs", "agents.adopt_typed", "agents.shell_on_exit", "agents.resume_after_sleep", "agents.resume_after_network", "agents.resume_after_limit", "agents.resume_after_sleep_prompt"]),
     (
         Sec::Agents,
-        "Keep the Mac awake",
+        os("Keep the Mac awake", "Keep the PC awake"),
         &["@keep_awake", "keep_awake.enabled", "keep_awake.mode", "keep_awake.start", "keep_awake.days", "keep_awake.min_battery", "keep_awake.linger_mins", "keep_awake.wake"],
     ),
     (
@@ -278,7 +279,7 @@ const LAYOUT: &[(Sec, &str, &[&str])] = &[
     (Sec::Nearby, "My other Macs' windows here", &["@nearby_looks"]),
     (Sec::Webhooks, "Delivery", &["webhooks.path", "webhooks.port", "webhooks.relay_url"]),
     (Sec::Webhooks, "Triggers", &["triggers.agent_mode"]),
-    (Sec::System, "macOS", &["@accessibility", "@notifications", "@login"]),
+    (Sec::System, os("macOS", "Windows"), &["@accessibility", "@notifications", "@login"]),
     (Sec::System, "midna", &["@version", "@daemon"]),
     (Sec::System, "Reset", &["@reset_settings", "@reset_midna"]),
 ];
@@ -1125,8 +1126,8 @@ fn presets(key: &str) -> Option<&'static [(i64, &'static str)]> {
 pub(crate) fn label_for(key: &str) -> String {
     match key {
         "theme" => "Theme",
-        "theme.dark" => "When macOS is dark",
-        "theme.light" => "When macOS is light",
+        "theme.dark" => os("When macOS is dark", "When Windows is dark"),
+        "theme.light" => os("When macOS is light", "When Windows is light"),
         "theme.colors" => "Color overrides",
         "density" => "Sidebar density",
         "ui.header.script" => "Terminal header line",
@@ -1134,8 +1135,8 @@ pub(crate) fn label_for(key: &str) -> String {
         "ui.status.script" => "Status bar line",
         "ui.status.items" => "Status bar items",
         "updates.channel" => "Channel",
-        "ui.ask.agent" => "⌘K “Ask an agent” uses",
-        "ui.ask.scope" => "⌘K “Ask an agent” starts in",
+        "ui.ask.agent" => os("⌘K “Ask an agent” uses", "Ctrl+Shift+K “Ask an agent” uses"),
+        "ui.ask.scope" => os("⌘K “Ask an agent” starts in", "Ctrl+Shift+K “Ask an agent” starts in"),
         "webhooks.path" => "Delivery path",
         "webhooks.port" => "Local port",
         "webhooks.relay_url" => "Relay URL",
@@ -1152,7 +1153,7 @@ pub(crate) fn label_for(key: &str) -> String {
         "nearby.visibility" => "Who can find this Mac",
         "nearby.name" => "Name other Midnas see",
         "nearby.downloads" => "Save received files in",
-        "keep_awake.enabled" => "Keep the Mac awake for agents",
+        "keep_awake.enabled" => os("Keep the Mac awake for agents", "Keep the PC awake for agents"),
         "keep_awake.mode" => "When",
         "keep_awake.start" => "From",
         "keep_awake.end" => "Until",
@@ -1160,10 +1161,10 @@ pub(crate) fn label_for(key: &str) -> String {
         "keep_awake.hours" => "Days with their own hours",
         "keep_awake.min_battery" => "Stop on battery below",
         "keep_awake.linger_mins" => "Keep holding after the work",
-        "keep_awake.wake" => "Wake the Mac for scheduled work",
+        "keep_awake.wake" => os("Wake the Mac for scheduled work", "Wake the PC for scheduled work"),
         "system.busy_load" => "Wait to update at load per core (%)",
         "system.busy_cpu" => "Busy at CPU use (%)",
-        "guard.background_agents" => "Slow agents' work down while the Mac is busy",
+        "guard.background_agents" => os("Slow agents' work down while the Mac is busy", "Slow agents' work down while the PC is busy"),
         "guard.busy_gate" => "Make agents wait to start heavy work while busy",
         "guard.max_subagents" => "Most subagents an agent runs at once",
         "guard.build_slots" => "Most builds and tests at once",
@@ -1171,9 +1172,9 @@ pub(crate) fn label_for(key: &str) -> String {
         "guard.hold_agents_at" => "Hold new agents at load per core (%)",
         "system.busy_memory" => "Short of memory at pressure",
         "guard.panic_hold" => "After a kernel panic, hold agents until I've looked",
-        "guard.memory_alert" => "Tell me when the Mac is short of memory",
-        "guard.overload_alert" => "Offer to pause terminals hogging the Mac",
-        "guard.overload_secs" => "After the Mac is busy for (seconds)",
+        "guard.memory_alert" => os("Tell me when the Mac is short of memory", "Tell me when the PC is short of memory"),
+        "guard.overload_alert" => os("Offer to pause terminals hogging the Mac", "Offer to pause terminals hogging the PC"),
+        "guard.overload_secs" => os("After the Mac is busy for (seconds)", "After the PC is busy for (seconds)"),
         "guard.loop_max_hours" => "Stop agents' poll loops after (hours)",
         "worktrees.auto_clean_hours" => "Remove idle git worktrees after (hours)",
         "cleanup.enabled" => "Clean up after a closed terminal",
@@ -1195,7 +1196,7 @@ pub(crate) fn label_for(key: &str) -> String {
         "summary.keep_days" => "Summary keeps closed terminals (days)",
         "ide.app" => "Open in IDE",
         "ide.rules" => "IDE per folder or file",
-        "finder.quick_action" => "Finder “Open in Midna”",
+        "finder.quick_action" => os("Finder “Open in Midna”", "File Explorer “Open in Midna”"),
         "ui.haptics" => "Haptics",
         "ui.header.buttons" => "Terminal header buttons",
         "sidebar.footer.stats" => "Footer stats",
@@ -1224,10 +1225,10 @@ pub(crate) fn label_for(key: &str) -> String {
         "terminal.auto_name_updates" => "As the work changes",
         "terminal.link_preview" => "Link previews",
         "terminal.prompt_bar" => "Prompt bar",
-        "terminal.cmd_enter_sends" => "⌘↩ to send",
+        "terminal.cmd_enter_sends" => os("⌘↩ to send", "Ctrl+Enter to send"),
         "terminal.preview_path_click" => "Clicking a preview's path",
         "terminal.pr_status" => "PR and Actions run status",
-        "terminal.image_paste" => "⌘V of an image",
+        "terminal.image_paste" => os("⌘V of an image", "Ctrl+V of an image"),
         "terminal.link_patterns" => "Link patterns",
         "notify.enabled" => "Show notifications",
         "notify.turn_done_min_secs" => "“Agent finished” after",
@@ -1289,12 +1290,12 @@ pub(crate) fn option_label(key: &str, v: &str) -> String {
         ("terminal.auto_name_updates", "follow") => "Keep renaming".into(),
         ("terminal.auto_name_updates", "first") => "Name once".into(),
         ("terminal.link_preview", "hover") => "On hover".into(),
-        ("terminal.link_preview", "cmd") => "On ⌘-hover".into(),
+        ("terminal.link_preview", "cmd") => os("On ⌘-hover", "On Ctrl-hover").into(),
         ("terminal.prompt_bar", "scrolled") => "When scrolled back".into(),
         ("terminal.prompt_bar", "always") => "Always".into(),
         ("cleanup.sessions", "agents") => "Agent terminals".into(),
         ("cleanup.sessions", "all") => "All terminals".into(),
-        ("terminal.preview_path_click", "reveal") => "Reveal in Finder".into(),
+        ("terminal.preview_path_click", "reveal") => os("Reveal in Finder", "Reveal in File Explorer").into(),
         ("terminal.preview_path_click", "ide") => "Open in IDE".into(),
         ("terminal.preview_path_click", "copy") => "Copy path".into(),
         ("terminal.image_paste", "sheet") => "Open the image sheet".into(),
@@ -1430,7 +1431,7 @@ impl SettingsWindow {
             "theme.light" => Some(false),
             _ => None,
         };
-        let first = (key == "theme").then(|| ("system".to_string(), "Follow macOS".to_string()));
+        let first = (key == "theme").then(|| ("system".to_string(), os("Follow macOS", "Follow Windows").to_string()));
         let k = key.clone();
         self.theme_chips(t, format!("theme-{key}"), &current, first, only, Rc::new(move |s, id, cx| s.set(&k, json!(id), cx)), cx)
     }
@@ -1518,7 +1519,7 @@ impl SettingsWindow {
                 + " Until reinstalled, midna adds its hooks to the agents it starts.", Some(("Reinstall", false))),
             Some("not_installed") => (t.fg, "Per terminal".into(), t.fg, per_terminal.into(), Some(("Install", false))),
             Some("error") => (t.err, format!("Can't read {}", midna_proto::paths::base_name(path)), t.err, detail.unwrap_or_else(|| path.into()), Some(("Reinstall", false))),
-            Some("unavailable") => (t.dim, format!("{name} not set up"), t.dim, format!("No {name} config on this Mac."), None),
+            Some("unavailable") => (t.dim, format!("{name} not set up"), t.dim, format!("No {name} config on this {}.", midna_proto::wording::MAC), None),
             _ => (t.dim, "Checking…".into(), t.dim, String::new(), None),
         };
         RowSpec {
@@ -1764,10 +1765,10 @@ impl SettingsWindow {
             "@notifications" => {
                 use crate::notify::Permission as NP;
                 let (ok, state, why) = match crate::notify::permission() {
-                    NP::Allowed => (Some(true), "Allowed", "midna shows approvals, failures and finished turns as macOS notifications."),
-                    NP::Denied => (Some(false), "Off in System Settings", "Turn midna's notifications on to get approvals, failures and finished turns."),
-                    NP::NotAsked => (None, "Not requested yet", "macOS asks the first time midna has something to tell you."),
-                    NP::Unknown => (None, "Checking…", "Approvals, failures and finished turns show as macOS notifications."),
+                    NP::Allowed => (Some(true), "Allowed", os("midna shows approvals, failures and finished turns as macOS notifications.", "midna shows approvals, failures and finished turns as Windows notifications.")),
+                    NP::Denied => (Some(false), os("Off in System Settings", "Off in Settings"), os("Turn midna's notifications on to get approvals, failures and finished turns.", "Turn midna's notifications on in Settings ▸ System ▸ Notifications to get approvals, failures and finished turns.")),
+                    NP::NotAsked => (None, "Not requested yet", os("macOS asks the first time midna has something to tell you.", "Windows shows them unless midna's notifications are turned off.")),
+                    NP::Unknown => (None, "Checking…", os("Approvals, failures and finished turns show as macOS notifications.", "Approvals, failures and finished turns show as Windows notifications.")),
                     NP::Dev => (None, "Dev build", "Not running from Midna.app, so they show as Script Editor's."),
                 };
                 vec![self.permission(t, "Notifications", ok, state, why, PANE_NOTIF)]
@@ -1784,7 +1785,7 @@ impl SettingsWindow {
                         (Some(e), _) => (t.err, Some(format!("Doesn't match the app, and updating it failed: {e}"))),
                         (None, Some(l)) => (
                             t.need,
-                            Some(format!("Updates by itself once the Mac is less busy (load {:.1} on {} cores).", l.load1, l.cpus)),
+                            Some(format!("Updates by itself once the {} is less busy (load {:.1} on {} cores).", midna_proto::wording::MAC, l.load1, l.cpus)),
                         ),
                         (None, None) => (t.err, Some("Doesn't match the app. Update it in place: your terminals keep running.".into())),
                     },
@@ -2243,10 +2244,10 @@ fn lifecycle_rows(t: &Theme) -> LifeRows {
         Some(LoginItem::RequiresApproval) => row(
             "Login item",
             t.need,
-            "Needs your OK in Login Items".into(),
+            os("Needs your OK in Login Items", "Needs your OK in Startup apps").into(),
             t.need,
             Some(("Fix".into(), Act::Life(Cmd::OpenLoginItems), true)),
-            "Switch midna on under System Settings ▸ General ▸ Login Items ▸ Allow in the Background.".into(),
+            os("Switch midna on under System Settings ▸ General ▸ Login Items ▸ Allow in the Background.", "Switch Midna on under Settings ▸ Apps ▸ Startup.").into(),
             "midna permissions open login-items",
             Who::Human,
             true,
@@ -2323,7 +2324,7 @@ impl Render for SettingsWindow {
             let q = query.trim().to_string();
             let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
             let (title, sub) = match scope {
-                _ if total == 0 => ("No results".to_string(), "No setting matches. Press ↩ to ask an agent instead.".to_string()),
+                _ if total == 0 => ("No results".to_string(), os("No setting matches. Press ↩ to ask an agent instead.", "No setting matches. Press Enter to ask an agent instead.").to_string()),
                 None => (format!("Results for “{q}”"), format!("{} in {}.", count(total, "setting", "settings"), count(counts.len(), "section", "sections"))),
                 Some(s) => {
                     let n = counts.iter().find(|(c, _)| *c == s).map_or(0, |(_, n)| *n);
@@ -2344,7 +2345,7 @@ impl Render for SettingsWindow {
                 }
                 View::Section(sec) => {
                     let sub = if sec == Sec::Shortcuts && !self.recorded.is_empty() {
-                        format!("Shortcuts on {}. Press other keys to search again; ⌥⌘K stops.", crate::actions::pretty(&self.recorded.join(" ")))
+                        format!("Shortcuts on {}. Press other keys to search again; {} stops.", crate::actions::pretty(&self.recorded.join(" ")), os("⌥⌘K", "Ctrl+Alt+K"))
                     } else {
                         sec.about().to_string()
                     };
@@ -2865,7 +2866,7 @@ impl SettingsWindow {
                                 "Not what you meant? An agent can find or change it for you."
                             })),
                     )
-                    .child(crate::ui::header::key_chip(t, "↩".into()).text_size(px(12.)).text_color(t.dim)),
+                    .child(crate::ui::header::key_chip(t, os("↩", "Enter").into()).text_size(px(12.)).text_color(t.dim)),
             );
         }
         list
@@ -3415,7 +3416,7 @@ impl SettingsWindow {
             }
         }
         let ax = accessibility_trusted();
-        push("  ", "status", "{".into(), t.fg, "// read-only · from midnad and macOS, not settings".into(), t.fg);
+        push("  ", "status", "{".into(), t.fg, os("// read-only · from midnad and macOS, not settings", "// read-only · from midnad and Windows, not settings").into(), t.fg);
         push("    ", "version", format!("\"{}\",", self.info.get("version").and_then(Value::as_str).unwrap_or("?")), t.ok, String::new(), t.dim);
         push(
             "    ",

@@ -3,16 +3,18 @@
 //! line from here, and the whole catalog description on hover. Keep each to one sentence that
 //! fits a line or two beside its control (a test checks the length).
 
+use midna_proto::wording::os;
+
 /// A setting's line under its name, or None to fall back to the catalog's first sentence.
 pub(super) fn blurb(key: &str) -> Option<&'static str> {
     Some(match key {
         // General
         "updates.channel" => "Beta gets new releases before Stable does.",
-        "ui.ask.agent" => "The agent ⌘K's Ask starts; tab switches it there.",
+        "ui.ask.agent" => os("The agent ⌘K's Ask starts; tab switches it there.", "The agent Ctrl+Shift+K's Ask starts; tab switches it there."),
         "ui.ask.scope" => "Start it in the current project or in your home folder.",
-        "projects.roots" => "Their subfolders show up in ⌘K, ready to open.",
-        "projects.empty_opens" => "A project with no terminals opens a shell or its agent (click or ⌘K).",
-        "projects.new_terminal_in" => "Main opens ⌘T where main or master is already checked out.",
+        "projects.roots" => os("Their subfolders show up in ⌘K, ready to open.", "Their subfolders show up in Ctrl+Shift+K, ready to open."),
+        "projects.empty_opens" => os("A project with no terminals opens a shell or its agent (click or ⌘K).", "An empty project opens a shell or its agent (click or Ctrl+Shift+K)."),
+        "projects.new_terminal_in" => os("Main opens ⌘T where main or master is already checked out.", "Main opens Ctrl+Shift+T where main or master is already checked out."),
         "projects.switch_to_main" => "Only a clean main checkout no other terminal is in; worktrees never switch.",
         "ide.app" => "Used when no per-folder rule matches.",
         "ide.rules" => "Pick an IDE from a terminal's header to add a rule.",
@@ -21,11 +23,11 @@ pub(super) fn blurb(key: &str) -> Option<&'static str> {
         "nearby.visibility" => "Everyone lasts 10 minutes, then it's paired devices only again.",
         "nearby.name" => "Empty uses this Mac's computer name.",
         "nearby.downloads" => "Where files you accept are saved; empty is ~/Downloads/Midna.",
-        "finder.quick_action" => "Right-click a folder in Finder to open it in midna.",
+        "finder.quick_action" => os("Right-click a folder in Finder to open it in midna.", "Not on Windows yet: would add “Open in Midna” to File Explorer."),
         // Appearance
         "theme" => "Colors for the app and its terminals.",
-        "theme.dark" => "Used while macOS is in dark mode.",
-        "theme.light" => "Used while macOS is in light mode.",
+        "theme.dark" => os("Used while macOS is in dark mode.", "Used while Windows is in dark mode."),
+        "theme.light" => os("Used while macOS is in light mode.", "Used while Windows is in light mode."),
         "theme.colors" => "Change single colors from the CLI: midna explain theme.colors.",
         "density" => "Spacing of sidebar rows and headers.",
         "ui.haptics" => "A light tap on a Force Touch trackpad when you click.",
@@ -55,7 +57,7 @@ pub(super) fn blurb(key: &str) -> Option<&'static str> {
         "terminal.preview_path_click" => "Clicking the path at the top of a preview.",
         "terminal.image_paste" => "Add notes in the image sheet first, or paste the image's path.",
         "terminal.option_as_meta" => "Option-b moves back a word; off, Option types characters like é.",
-        "terminal.cmd_enter_sends" => "In Claude Code and Codex, ↩ starts a new line and ⌘↩ sends.",
+        "terminal.cmd_enter_sends" => os("In Claude Code and Codex, ↩ starts a new line and ⌘↩ sends.", "In Claude Code and Codex, Enter starts a new line and Ctrl+Enter sends."),
         "terminal.prompt_bar" => "Which of your prompts you're reading, on the terminal's top row.",
         // Agents
         "agents.mcp" => "Agents midna starts can drive midna as tools.",
@@ -66,7 +68,7 @@ pub(super) fn blurb(key: &str) -> Option<&'static str> {
         "agents.restart_idle_secs" => "How long an agent must be quiet before it restarts.",
         "agents.adopt_typed" => "A claude or codex typed in a shell gets midna's status and restarts.",
         "agents.shell_on_exit" => "The terminal turns into your shell, in the same folder.",
-        "agents.resume_after_sleep" => "Retry agents whose turn died while the Mac slept.",
+        "agents.resume_after_sleep" => os("Retry agents whose turn died while the Mac slept.", "Retry agents whose turn died while the PC slept."),
         "agents.resume_after_network" => "Retry agents whose turn died when the network dropped.",
         "agents.resume_after_limit" => "Retry agents whose turn hit Claude's usage limit, once it resets.",
         "agents.resume_after_sleep_prompt" => "What midna types into an agent to resume it.",
@@ -76,20 +78,20 @@ pub(super) fn blurb(key: &str) -> Option<&'static str> {
         "keep_awake.days" => "The days the hours apply.",
         "keep_awake.min_battery" => "On battery, stop below this charge.",
         "keep_awake.linger_mins" => "Stay awake a little after the last work.",
-        "keep_awake.wake" => "Wakes the Mac 2 minutes before scheduled work.",
-        "system.busy_load" => "Load per core that counts as busy; a busy Mac delays daemon updates.",
+        "keep_awake.wake" => os("Wakes the Mac 2 minutes before scheduled work.", "Not on Windows yet: would wake the PC before scheduled work."),
+        "system.busy_load" => os("Load per core that counts as busy; a busy Mac delays daemon updates.", "Load per core that counts as busy; a busy PC delays daemon updates."),
         "system.busy_cpu" => "CPU use across all cores that counts as busy.",
-        "guard.background_agents" => "When terminals keep the Mac busy, their builds run at low priority.",
-        "guard.busy_gate" => "When terminals keep the Mac busy, no new subagents, builds or installs.",
+        "guard.background_agents" => os("When terminals keep the Mac busy, their builds run at low priority.", "When terminals keep the PC busy, their builds run at low priority."),
+        "guard.busy_gate" => os("When terminals keep the Mac busy, no new subagents, builds or installs.", "When terminals keep the PC busy, no new subagents, builds or installs."),
         "guard.max_subagents" => "More wait their turn; 0 = no limit.",
         "guard.build_slots" => "Across every terminal, the rest wait in line; 0 = no limit",
         "guard.model_slots" => "mflux, MLX, ollama and model downloads; the rest wait in line; 0 = no limit",
-        "system.busy_memory" => "macOS's memory pressure (yellow or red) that holds new heavy work back.",
+        "system.busy_memory" => os("macOS's memory pressure (yellow or red) that holds new heavy work back.", "Windows' memory load (85% or 95% in use) that holds new heavy work back."),
         "guard.hold_agents_at" => "Agents others open wait their turn; yours start anyway; 0 = never",
         "guard.panic_hold" => "Triggers and other agents can't start agents until you dismiss the notice.",
         "guard.memory_alert" => "Agents still wait while memory is short; this only drops the notice.",
         "guard.overload_alert" => "Show whether terminals or other apps are using the CPU.",
-        "guard.overload_secs" => "How long the Mac must stay busy first.",
+        "guard.overload_secs" => os("How long the Mac must stay busy first.", "How long the PC must stay busy first."),
         "guard.loop_max_hours" => "Stop polling loops agents left running; 0 = never.",
         "worktrees.auto_clean_hours" => "Idle, clean worktrees with nothing in them; 0 = never.",
         "cleanup.enabled" => "A cheap model removes what a closed terminal left behind.",
@@ -147,7 +149,7 @@ pub(super) fn blurb(key: &str) -> Option<&'static str> {
         "notify.volume" => "Scales every sound; 0 = silent.",
         "notify.image" => "Shown beside the text; each kind can pick its own.",
         // Webhooks
-        "webhooks.path" => "How GitHub and Bitbucket webhooks reach this Mac.",
+        "webhooks.path" => os("How GitHub and Bitbucket webhooks reach this Mac.", "How GitHub and Bitbucket webhooks reach this PC."),
         "webhooks.port" => "The local port the webhook receiver listens on.",
         "webhooks.relay_url" => "Needed when the delivery path is Self-hosted.",
         "triggers.agent_mode" => "Supervised webhook agents still ask before running tools.",
@@ -158,8 +160,8 @@ pub(super) fn blurb(key: &str) -> Option<&'static str> {
 /// A shortcut row's name: its catalog description, shortened where that runs long.
 pub(super) fn shortcut_title(setting: &str) -> String {
     let short = match setting {
-        "keys.next_needs_you" => "Newest needs-you on this window's Mac",
-        "keys.next_needs_you_anywhere" => "Newest needs-you on any Mac",
+        "keys.next_needs_you" => os("Newest needs-you on this window's Mac", "Newest needs-you"),
+        "keys.next_needs_you_anywhere" => os("Newest needs-you on any Mac", "Newest needs-you on any device"),
         "keys.new_agent" => "New agent terminal in this project",
         "keys.new_terminal" => "New terminal in this project",
         "keys.new_agent_root" => "New agent terminal in your home folder",

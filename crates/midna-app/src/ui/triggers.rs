@@ -22,6 +22,7 @@ use crate::theme::Theme;
 use midna_proto::kinds;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use midna_proto::wording::os;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -513,7 +514,7 @@ pub struct WebhooksItem {
 
 const PATHS: [(&str, &str, &str, &str); 4] = [
     ("tailscale_funnel", "Tailscale Funnel", "free", "Through your tailnet on :8443. Misses deliveries while asleep; midnad reconciles from GitHub on wake."),
-    ("self_relay", "Self-hosted relay", "free", "midna-relay on a box you run. Queues while this Mac sleeps."),
+    ("self_relay", "Self-hosted relay", "free", os("midna-relay on a box you run. Queues while this Mac sleeps.", "midna-relay on a box you run. Queues while this PC sleeps.")),
     ("midna_relay", "midna relay", "paid", "Hosted by midna. Queues while asleep and keeps 7 days for replay."),
     ("off", "Off", "", "Stop receiving webhooks. Triggers stay, nothing fires."),
 ];
@@ -850,15 +851,15 @@ impl TriggersView {
     /// Send the pasted secret straight to midnad (Keychain) and forget it.
     fn save_secret(&mut self, id: String, cx: &mut Context<Self>) {
         if self.secret.text(cx).trim().is_empty() {
-            self.toast("Paste the secret first (⌘V).".into(), cx);
+            self.toast(os("Paste the secret first (⌘V).", "Paste the secret first (Ctrl+V).").into(), cx);
             return;
         }
         let secret = self.secret.text(cx);
         self.secret.clear(cx);
         self.replacing = None;
         self.call("trigger.set_secret", json!({"id": id, "secret": secret.trim()}), cx, |v, _, cx| {
-            let store = v.status.as_ref().map(|s| s.secret_store.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| "Keychain".into());
-            v.toast(format!("Secret saved to {}. It is never shown again.", if store == "keychain" { "Keychain" } else { &store }), cx);
+            let store = v.status.as_ref().map(|s| s.secret_store.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| os("Keychain", "Credential Manager").into());
+            v.toast(format!("Secret saved to {}. It is never shown again.", if store == "keychain" { os("Keychain", "Credential Manager") } else { &store }), cx);
             let _ = v.main.update(cx, |m, cx| m.request_refresh(refresh::NEEDS, cx));
             v.refetch(cx);
         });
@@ -960,7 +961,7 @@ impl Render for TriggersView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = crate::theme::of(window, cx).clone();
         let names = self.main.upgrade().map(|m| Names::from_main(m.read(cx))).unwrap_or_default();
-        let cmdk = self.main.upgrade().map(|m| m.read(cx).key_label("keys.command_bar")).unwrap_or_else(|| "⌘K".into());
+        let cmdk = self.main.upgrade().map(|m| m.read(cx).key_label("keys.command_bar")).unwrap_or_else(|| os("⌘K", "Ctrl+Shift+K").into());
         let crons = self.main.upgrade().map(|m| schedule::cron_rows(m.read(cx)).len()).unwrap_or(0);
         let streams = self.streams(cx);
         let empty = self.loaded && self.triggers.is_empty() && crons == 0 && streams.is_empty() && self.editor.is_none() && self.list_error.is_none();
@@ -1180,7 +1181,7 @@ impl TriggersView {
                     .flex_1()
                     .flex()
                     .gap(px(6.))
-                    .child(div().font_weight(FontWeight::BOLD).child("Webhooks can’t reach this Mac."))
+                    .child(div().font_weight(FontWeight::BOLD).child(os("Webhooks can’t reach this Mac.", "Webhooks can’t reach this PC.")))
                     .child(div().text_color(t.dim).truncate().child(s.detail)),
             )
             .when_some(fix, |d, fix| {
@@ -1281,7 +1282,10 @@ impl TriggersView {
                 .child(Icon::Triggers.el(28., t.accent))
                 .child(div().text_size(px(20.)).font_weight(FontWeight::BOLD).child("No triggers yet"))
                 .child(div().text_color(t.dim).child(
-                    "A trigger turns a GitHub or Bitbucket event into an agent terminal, a command, or a ping. Local triggers react to this Mac's terminals: an agent hook, a blocked prompt, an idle terminal. Describe one and an agent drafts it. You switch it on.",
+                    os(
+                "A trigger turns a GitHub or Bitbucket event into an agent terminal, a command, or a ping. Local triggers react to this Mac's terminals: an agent hook, a blocked prompt, an idle terminal. Describe one and an agent drafts it. You switch it on.",
+                "A trigger turns a GitHub or Bitbucket event into an agent terminal, a command, or a ping. Local triggers react to this PC's terminals: an agent hook, a blocked prompt, an idle terminal. Describe one and an agent drafts it. You switch it on.",
+            ),
                 ))
                 .child(list)
                 .when_some(arrival, |d, a| d.child(div().text_size(px(12.)).text_color(t.dim).child(a))),
@@ -1597,7 +1601,7 @@ impl TriggersView {
                             .flex_wrap()
                             .gap(px(4.))
                             .child(div().font_weight(FontWeight::BOLD).child("Paste the webhook secret to finish this draft."))
-                            .child(div().text_color(t.dim).child(format!("{drafted}. Agents can’t see or set secrets; it goes straight to Keychain."))),
+                            .child(div().text_color(t.dim).child(format!("{drafted}. Agents can’t see or set secrets; it goes straight to {}.", os("Keychain", "Credential Manager")))),
                     )
                     .child(
                         div()
@@ -1708,7 +1712,7 @@ impl TriggersView {
         } else {
             let store = match s.secret_store.as_deref() {
                 Some("file") => "file",
-                _ => "Keychain",
+                _ => os("Keychain", "Credential Manager"),
             };
             match &s.secret_set_at {
                 Some(at) => format!("Set {} · {store}", kit::day_label(at)),
