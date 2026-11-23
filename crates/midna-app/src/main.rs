@@ -19,7 +19,8 @@
 //! - `MIDNA_DEBUG_BADGE=list|card|menu|mac|switch:<ms>|tip` — once something's waiting, open this
 //!   Mac's list (with its first card) or the menu; the first other Mac's list (`mac`); or this
 //!   Mac's, then switch to the other Mac's and hold the slide `<ms>` in (`switch`); or rest on the
-//!   pill with its tooltip up (`tip`).
+//!   pill with its tooltip up (`tip`). Any value: on Windows, screenshots see the badge whatever
+//!   `notify.badge.sharing` says.
 //! - `MIDNA_DEV=1` — dev mode even inside a bundle: no install / login item / updates; a missing
 //!   midnad is spawned from next to this binary (`MIDNA_NO_SPAWN=1` to skip). See `lifecycle.rs`.
 //!
