@@ -45,6 +45,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -76,16 +77,56 @@ fn watchdog_budget() -> u64 {
     })
 }
 
-/// Set while a handover has written the state the next image loads: nothing saves over it (on
-/// Windows the old midnad runs on beside the new one until that one has resumed).
-static SAVES_HELD: AtomicBool = AtomicBool::new(false);
+/// Set while a handover has written the state and event log the next midnad loads (Windows: the
+/// old midnad runs on beside the new one until that one has resumed). While it holds, this midnad
+/// saves nothing, every RPC waits (`wait_while_held`) and every event waits (`emit`): a handover
+/// that goes through drops them with this process, one that fails lets them go (`release`).
+static HELD: AtomicBool = AtomicBool::new(false);
+/// The events emitted while held, in order. Its lock also orders `emit` against `release`.
+static HELD_EVENTS: Mutex<Vec<(String, Actor, Option<Id>, Option<Id>, Value)>> = Mutex::new(vec![]);
 
-pub fn hold_saves(on: bool) {
-    SAVES_HELD.store(on, Ordering::SeqCst);
+fn held_events() -> std::sync::MutexGuard<'static, Vec<(String, Actor, Option<Id>, Option<Id>, Value)>> {
+    HELD_EVENTS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub fn saves_held() -> bool {
-    SAVES_HELD.load(Ordering::SeqCst)
+pub fn hold() {
+    let _order = held_events();
+    HELD.store(true, Ordering::SeqCst);
+}
+
+pub fn held() -> bool {
+    HELD.load(Ordering::SeqCst)
+}
+
+/// A handover that failed: append the events it held back, then let everything go on.
+pub fn release(log: &crate::eventlog::EventLog) {
+    let mut evs = held_events();
+    for (kind, actor, project, session, data) in evs.drain(..) {
+        log.append(&kind, actor, project, session, data);
+    }
+    HELD.store(false, Ordering::SeqCst);
+}
+
+/// `Daemon::emit`: append the event, or, while a handover holds, keep it back (returned with seq
+/// 0, its place in the log not known yet): the next midnad hands out the seqs after the handoff's.
+pub fn emit(log: &crate::eventlog::EventLog, kind: &str, actor: Actor, project: Option<Id>, session: Option<Id>, data: Value) -> Event {
+    let mut evs = held_events();
+    if !held() {
+        drop(evs);
+        return log.append(kind, actor, project, session, data);
+    }
+    let e = Event { seq: 0, at: time::now_rfc3339(), kind: kind.into(), actor: actor.clone(), project_id: project.clone(), session_id: session.clone(), data: data.clone(), stream: None };
+    evs.push((kind.into(), actor, project, session, data));
+    e
+}
+
+/// Every RPC, first: wait while a handover holds. Once it has gone through this process exits,
+/// closing the connection, and the client retries on the next midnad; once it has failed the
+/// call goes on here.
+pub fn wait_while_held() {
+    while held() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(unix)]

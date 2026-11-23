@@ -45,7 +45,7 @@
 //!
 //! A new midnad that dies before step 5 leaves the plan behind: the next midnad to start runs
 //! it. One that exits at once is caught before the old one stops, and nothing changes.
-use super::{HANDOFF_VERSION, WATCHDOG_MAX, handoff_dir, hold_saves, lists, log, selftest_of, watchdog_budget};
+use super::{HANDOFF_VERSION, WATCHDOG_MAX, handoff_dir, hold, lists, log, selftest_of, watchdog_budget};
 use crate::daemon::{Config, Daemon};
 use crate::engine::{Engine, TermSnap};
 use crate::term::{self, EngineMsg};
@@ -341,8 +341,6 @@ fn hand_over(d: &Arc<Daemon>, bin: &Path, reason: &str) -> String {
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
-    hold_saves(false);
-    d.mark_dirty();
     if undo.socket_closed
         && let Err(e) = crate::server::reopen_socket()
     {
@@ -354,6 +352,9 @@ fn hand_over(d: &Arc<Daemon>, bin: &Path, reason: &str) -> String {
         }
     }
     term::resume_readers();
+    // The calls and events that waited go on, and state is saved again.
+    super::release(&d.log);
+    d.mark_dirty();
     e
 }
 
@@ -394,7 +395,8 @@ fn write_handoff(d: &Arc<Daemon>, dir: &Path, bin: &Path, reason: &str) -> Resul
         sessions.push(HandoffSession { id: sid, pid: rt.pid, keeper_pid, pipe, term: snap, primary_file, alt_file, in_turn, last_cost });
     }
     d.save_now();
-    hold_saves(true);
+    // From here the next midnad's: nothing saved, served or logged here (`upgrade::hold`).
+    hold();
     let h = Handoff {
         version: HANDOFF_VERSION,
         reason: reason.into(),
@@ -803,15 +805,28 @@ fn take_over(path: &Path) -> Result<Takeover, String> {
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let home = PathBuf::from(&handoff.home);
     let (mut attached, mut lost) = (HashMap::new(), vec![]);
+    // Every screen first: a handover that fails after attaching must let the keepers go.
     for s in &mut handoff.sessions {
         s.term.primary_vt = std::fs::read(dir.join(&s.primary_file)).map_err(|e| format!("{}: {e}", s.primary_file))?;
         if let Some(f) = &s.alt_file {
             s.term.alt_vt = Some(std::fs::read(dir.join(f)).map_err(|e| format!("{f}: {e}"))?);
         }
+    }
+    for s in &handoff.sessions {
         let owner = crate::pty::Owner { home: &home, sid: &s.id, tied: false };
         match crate::pty::attach_to(&owner, s.pid as u32) {
             Ok(sp) => {
                 attached.insert(s.id.clone(), sp);
+            }
+            // A keeper that has exited took its shell with it (it ends its job): that terminal
+            // is lost. One that runs on but won't take this midnad would be left running with
+            // nobody to show or end it, so the handover fails: the old midnad, still its client,
+            // takes every keeper back.
+            Err(e) if crate::sys::alive(s.keeper_pid as i32) => {
+                for (_, sp) in attached.drain() {
+                    sp.master.release_control();
+                }
+                return Err(format!("session {}: its keeper (pid {}) runs but couldn't be taken over: {e}", s.id, s.keeper_pid));
             }
             Err(e) => lost.push((s.id.clone(), e.to_string())),
         }

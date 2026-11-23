@@ -518,6 +518,45 @@ fn a_new_midnad_that_dies_taking_over_falls_back_to_the_old_one() {
     assert_eq!(up["sessions_kept"], json!(1), "{up}");
 }
 
+/// A keeper takes only a midnad from its home's `bin` (or beside it) as its client. A new
+/// midnad one refuses doesn't take over and leave it running unseen: the handover fails, and the
+/// old midnad keeps every terminal and keeper.
+#[cfg(windows)]
+#[test]
+fn a_keeper_that_refuses_the_new_midnad_fails_the_handover() {
+    let d = Bin::start();
+    let mut c = d.human();
+    let pid0 = d.pid();
+    let hup = d.path("hup");
+    let (loop_id, loop_pid) = open(&mut c, "monitor", &strs(&sh_c(&counter_cmd(&hup))));
+    wait_for(10, "counting", || (counts(&read(&mut c, &loop_id, 500)).len() > 3).then_some(()));
+    let keepers = midna_pty::names::records(&d.home);
+    assert_eq!(keepers.len(), 1, "{keepers:?}");
+    // Outside `bin`, with no keeper beside it: it passes its selftest, but the keeper won't have it.
+    let stray = d.home.join("elsewhere").join("midnad.exe");
+    std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    std::fs::hard_link(built(), &stray).unwrap();
+    call(&mut c, "daemon.upgrade", json!({ "binary_path": stray }));
+    let failed = wait_for(30, "daemon.upgrade_failed", || {
+        let mut c = Client::connect(d.socket()).ok()?;
+        c.set_caller(None);
+        let v = c.call_value("events.list", json!({ "since_seq": 0, "limit": 100, "filter": { "kinds": ["daemon.upgrade_failed"] } })).ok()?;
+        v.as_array()?.first().map(|e| e["data"].clone())
+    });
+    assert!(failed["error"].as_str().unwrap().contains("exited"), "{failed}");
+    assert!(d.log().contains("couldn't be taken over"), "{}", d.log());
+    let mut c = d.human();
+    assert_eq!(d.pid(), pid0);
+    assert!(alive(loop_pid));
+    assert_eq!(midna_pty::names::records(&d.home).iter().map(|(_, r)| r.pid).collect::<Vec<_>>(), keepers.iter().map(|(_, r)| r.pid).collect::<Vec<_>>());
+    let n0 = *counts(&read(&mut c, &loop_id, 3000)).last().unwrap();
+    counts_past(&mut c, &loop_id, 3000, n0 + 5, "counting after the refused handover");
+    // Its events kept their order: seqs rise one at a time.
+    let evs = call(&mut c, "events.list", json!({ "since_seq": 0, "limit": 1000 }));
+    let seqs: Vec<u64> = evs.as_array().unwrap().iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "{seqs:?}");
+}
+
 // Windows has no SIGTERM to restart on.
 #[cfg(unix)]
 #[test]
