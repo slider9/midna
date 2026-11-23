@@ -699,7 +699,7 @@ impl Render for RulesView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = crate::theme::of(window, cx).clone();
         let names = self.main.upgrade().map(|m| Names::from_main(m.read(cx))).unwrap_or_default();
-        let cmdk = self.main.upgrade().map(|m| m.read(cx).key_label("keys.command_bar")).unwrap_or_else(|| "⌘K".into());
+        let cmdk = self.main.upgrade().map(|m| m.read(cx).key_label("keys.command_bar")).unwrap_or_else(|| midna_proto::wording::os("⌘K", "Ctrl+Shift+K").into());
         let requests: Vec<RuleItem> = {
             let mut v: Vec<RuleItem> = self.rules.iter().filter(|r| r.removal_request.is_some()).cloned().collect();
             v.sort_by(|a, b| b.removal_request.as_ref().map(|x| x.at.clone()).cmp(&a.removal_request.as_ref().map(|x| x.at.clone())));

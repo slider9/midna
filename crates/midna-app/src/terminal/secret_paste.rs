@@ -20,6 +20,7 @@ use crate::ui::screen_kit::{KeyOutcome, LineInput, btn, btn_primary};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use midna_proto::secrets::{self, Found};
+use midna_proto::wording::os;
 use serde_json::json;
 
 pub struct Sheet {
@@ -371,11 +372,19 @@ impl TerminalView {
             None => "this terminal",
         };
         let body = if adding {
-            "Stored in your Keychain. Agents use it with `midna secret exec NAME -- <command>` and never see the value.".to_string()
+            os(
+                "Stored in your Keychain. Agents use it with `midna secret exec NAME -- <command>` and never see the value.",
+                "Stored in Credential Manager. Agents use it with `midna secret exec NAME -- <command>` and never see the value.",
+            )
+            .to_string()
         } else if self.is_agent() {
-            format!("Anything pasted here is sent to {who}'s model. Store it in your Keychain and paste a reference instead; the agent uses it with `midna secret exec`.")
+            format!("Anything pasted here is sent to {who}'s model. Store it in {} and paste a reference instead; the agent uses it with `midna secret exec`.", os("your Keychain", "Credential Manager"))
         } else {
-            "Store it in your Keychain and paste a reference. Agents use it with `midna secret exec NAME -- <command>`.".to_string()
+            os(
+                "Store it in your Keychain and paste a reference. Agents use it with `midna secret exec NAME -- <command>`.",
+                "Store it in Credential Manager and paste a reference. Agents use it with `midna secret exec NAME -- <command>`.",
+            )
+            .to_string()
         };
         let mono = self.font_family.clone();
         let check = |on: bool| {

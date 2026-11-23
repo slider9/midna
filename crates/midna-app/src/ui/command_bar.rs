@@ -293,7 +293,7 @@ fn rows(m: &MainWindow) -> Vec<Row> {
     // A typed folder path ("~/Development/kass") is offered first, as "Open … as a project".
     let path = commands::path_command(&m.palette.query, &home, &m.projects).map(|cmd| Row { cmd, hits: vec![], head: None });
     // Rows from the other Macs go under their Mac's heading; the rest are this window's Mac's.
-    let rest = m.backend.mac().map_or_else(|| "On this Mac".to_string(), |x| format!("On {}", x.name));
+    let rest = m.backend.mac().map_or_else(|| format!("On this {}", midna_proto::wording::MAC), |x| format!("On {}", x.name));
     let hits = commands::group_hits(commands::search(&cmds, &m.palette.query, LIMIT), &rest);
     path.into_iter().chain(hits.into_iter().map(|h| Row { cmd: h.cmd.clone(), hits: h.hits, head: h.head })).collect()
 }

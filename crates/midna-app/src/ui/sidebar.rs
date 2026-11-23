@@ -11,6 +11,7 @@ use crate::theme::Theme;
 use crate::ui::sidebar_anim::Frame;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use midna_proto::wording::os;
 
 /// Default width; dragging the right edge keeps it within `MIN_WIDTH`..=`MAX_WIDTH`.
 pub const WIDTH: f32 = 264.;
@@ -667,7 +668,7 @@ fn background_menu(t: &Theme, cx: &mut Context<MainWindow>) -> impl IntoElement 
                 t,
                 "background-hide",
                 "Hide from sidebar",
-                "show again from ⌘K",
+                os("show again from ⌘K", "show again from Ctrl+Shift+K"),
                 cx.listener(|m, _, _, cx| set_background_hidden(m, true, cx)),
             )),
         ),
@@ -682,7 +683,13 @@ pub fn set_background_hidden(m: &mut MainWindow, hidden: bool, cx: &mut Context<
     m.menu = Menu::None;
     crate::ui::statusbar::save_state(m);
     if hidden {
-        m.toast("Background terminals hidden from the sidebar. ⌘K \"Show background terminals\" brings them back.", cx);
+        m.toast(
+        os(
+            "Background terminals hidden from the sidebar. ⌘K \"Show background terminals\" brings them back.",
+            "Background terminals hidden from the sidebar. Ctrl+Shift+K \"Show background terminals\" brings them back.",
+        ),
+        cx,
+    );
     }
     cx.notify();
 }

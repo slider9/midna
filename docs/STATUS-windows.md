@@ -210,9 +210,15 @@ together at run time (`MAC` "PC", `FINDER` "File Explorer", `SYSTEM_SETTINGS`, `
 "Settings ▸ Apps ▸ Startup"). The setting descriptions (`settings.rs`), the Settings window's
 labels, rows and blurbs use it: ⌘K reads Ctrl+Shift+K, ⌘↩ Ctrl+Enter, ⌘V Ctrl+V, ⌘-click
 Ctrl+click, Mac PC, Finder File Explorer, macOS banners Windows notifications, and keep-awake,
-memory and background mode say what midnad does on Windows. Settings ▸ Nearby is hidden there,
-so its text still says Mac. Still in macOS wording: the setup screen and most of the remaining
-hints and menus.
+memory and background mode say what midnad does on Windows. The rest of the app uses it the same
+way: the setup screen (its Windows steps, Ctrl+1, Ctrl+Shift+K, Settings ▸ Apps ▸ Startup and
+Settings ▸ System ▸ Notifications), the link menus and previews (Reveal in File Explorer), the
+command bar, the sidebar, the queue and needs-you hints (Alt+↑↓, Alt+Backspace, Ctrl+O), triggers
+and pasted secrets (Credential Manager, not Keychain), the status bar and toasts. A key written as
+a phrase follows the mapping above: a `keys.*` shortcut (⌘K, ⌘T, ⌘E) reads Ctrl+Shift+X, a key in
+an overlay or text field (⌘V, ⌘O) Ctrl+X, ⌥ Alt and ↩ Enter. What stays in macOS wording: Nearby
+and everything about other Macs (hidden on Windows; B123 is the share commands and menu items that
+still show), log lines, and text on paths that only run on macOS (Touch ID, `sips`).
 
 ## What works (verified on Windows 10 19045)
 
@@ -249,10 +255,10 @@ hints and menus.
 
 In rough order of how much they matter:
 
-1. **macOS wording.** The shortcuts work and Settings says Windows' keys and names (see Shortcuts),
-   but the setup screen, menus and many hints still say ⌘ and ⌥. Settings rows for what Windows
-   doesn't have yet say so (File Explorer's “Open in Midna”, waking for scheduled work, noticing a
-   crash); the Accessibility row still shows, always granted.
+1. **macOS wording.** Done: Settings, the setup screen, menus, hints and toasts say Windows' keys
+   and names (see Shortcuts). Rows for what Windows doesn't have yet say so (File Explorer's “Open
+   in Midna”, waking for scheduled work, noticing a crash); the Accessibility row still shows,
+   always granted, and the sound pickers still offer macOS's sounds.
 2. **Integration tests: the product gaps they show.** The tests run on Windows through the helpers in `crates/midnad/tests/common/mod.rs` (and midna-cli's): `tmp()`, `sh()` and `posix_bin()` (Git for Windows' `usr\bin` tools, as 8.3 paths), `script()` (a `.sh` with a `.cmd` that runs it), and a copy of the test binary standing in for `nc -U`. Each test binary sets `MIDNA_SHELL` to Git's `sh`, so one-line commands get a POSIX shell as on macOS. What's Unix only is `cfg(unix)` with its reason: `shell_integration.rs`, in-place upgrade and restart (`upgrade.rs` checks the refusal instead), file modes, `/` as the root, and `adopt.rs`, whose fake agents are sh scripts (`adopt_windows.rs` covers Windows). The tests that still fail do so on the product:
    - **`.cmd` agents** used to get broken arguments: a `.cmd` ran as `cmd /d /s /c "…"`, and cmd drops every argument after a newline (Claude's system hint) and acts on `|`, `<`, `>` and `&` inside them (Codex's hint). Now a `.cmd` or `.bat` that is only a shim (npm's cmd-shim output, as in `claude.cmd` and `codex.cmd`, or one line ending in `%*` such as the tests' fake agents) is read and its program started directly, with the arguments quoted for it (`midna_proto::cmd_shim`). That covers terminals, typed `claude`/`codex` (`midna shim`) and the Codex notify command chained after midna's. npm's shim runs the `node.exe` beside it when there is one, else `node` from PATH. Any other batch file still runs through cmd, with the old limits. agent_args, global_hooks and agent_screen_prompts pass.
    - **Windows 10's own ConPTY**, used when the newer one isn't beside midnad (a cargo build without `.toolchain/conpty`), drops faint text (SGR 2), so Claude's dim placeholder reads as typed text and a queued restart waits forever (restart_queue). It also clears a new terminal's screen, so an exited agent's last screen isn't kept above its shell (shell_on_exit). That screen was also how midna told a "No" typed into Claude's folder-trust dialog from a "Yes"; it now also checks that the agent is still running (`trust::confirm`). It keeps an app's kitty keyboard push, and probably its mouse mode, to itself (prompt jumps in a full-screen view fail; the Enter tests expect legacy keys on it). Its first title is the program's path. The newer ConPTY fixes the rest (the title wasn't checked on it): restart_queue, shell_on_exit, the jumps and the kitty Enter tests pass on it. With real Claude in Midna Dev, a queued prompt and its follow-up were both typed and answered.
@@ -266,9 +272,7 @@ In rough order of how much they matter:
    - A new build can't take over a running daemon: `daemon.upgrade` is refused, the app says
      so, and the old daemon runs until it's stopped, which closes its terminals. Keeping them
      would need a separate pty-host process that owns the ConPTYs.
-   - The setup screen's login-entry wording still says System Settings ▸ Login Items (Settings ▸
-     System says Settings ▸ Apps ▸ Startup).
-5. **App stubs.** Badge, twilight, Kass composer, haptics and app link previews are missing. Commands that only exist on macOS (`sips`, `plutil`, `mdfind`, `xed`, `open -a`, `defaults`) do nothing, and menus and text still use macOS wording. Notifications show as toasts, but:
+5. **App stubs.** Badge, twilight, Kass composer, haptics and app link previews are missing. Commands that only exist on macOS (`sips`, `plutil`, `mdfind`, `xed`, `open -a`, `defaults`) do nothing. Notifications show as toasts, but:
    - Starting the app from a click after it quit (on the app's toast or midnad's) is registered by release builds, Midna and Midna Dev (`LocalServer32`), and hasn't been tried. Debug builds don't register it, so a click then does nothing, or starts Midna Dev, whose class they share. A dismissal while the app isn't running isn't reported.
    - A toast holds at most 5 buttons, so `notify send` with 6 loses the last one.
    - `PlaySoundW` has no volume, and plays one sound at a time. In the app, `volume` 0 silences and anything else is full; midnad's own sounds play at their volume. Only a WAV plays.

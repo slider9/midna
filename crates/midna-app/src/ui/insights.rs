@@ -12,6 +12,7 @@ use crate::theme::Theme;
 use crate::ui::charts::{self, ChartData, ChartState, Series, Unit};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use midna_proto::wording::os;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -593,7 +594,10 @@ impl InsightsView {
                     div()
                         .text_color(t.dim)
                         .text_center()
-                        .child("Charts fill in as agents work: turns, messages, spend, time spent working and waiting on you. Start an agent with ⌘T, or ask one from ⌘K."),
+                        .child(os(
+                            "Charts fill in as agents work: turns, messages, spend, time spent working and waiting on you. Start an agent with ⌘T, or ask one from ⌘K.",
+                            "Charts fill in as agents work: turns, messages, spend, time spent working and waiting on you. Start an agent with Ctrl+Shift+T, or ask one from Ctrl+Shift+K.",
+                        )),
                 )
                 .child(buttons)
                 .child(div().mt(px(4.)).font_family(t.mono_font.clone()).text_size(px(11.5)).text_color(t.dim).child(format!("midna insights --range {}", self.range.wire()))),

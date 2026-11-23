@@ -15,6 +15,7 @@
 //! Every command runs through an RPC (or pure GUI navigation), so the daemon's audit log
 //! records what the human ran (`midna events --kind audit`).
 use crate::model::*;
+use midna_proto::wording::os;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -649,7 +650,7 @@ pub fn build(s: &Snapshot) -> Vec<Command> {
     );
     out.push(
         Command::new("secret.add", CmdIcon::New, "Add a secret…", Run::AddSecret)
-            .sub("stored in your Keychain; agents use it as [secret:NAME] without seeing it")
+            .sub(os("stored in your Keychain; agents use it as [secret:NAME] without seeing it", "stored in Credential Manager; agents use it as [secret:NAME] without seeing it"))
             .kw("secret new store keychain token api key password credential env")
             .cli("<command> | midna secret save NAME"),
     );
@@ -685,13 +686,13 @@ pub fn build(s: &Snapshot) -> Vec<Command> {
     );
     out.push(
         Command::new("notify.clear", CmdIcon::Deny, "Clear notifications", Run::Rpc { method: "notify.clear".into(), params: json!({}) })
-            .sub("removes every midna notification from Notification Center")
+            .sub(os("removes every midna notification from Notification Center", "removes every midna notification from Action Center"))
             .kw("notifications banners dismiss remove clear all notification center")
             .cli("midna notify clear"),
     );
     out.push(
         Command::new("report.issue", CmdIcon::Screen, "Report an issue…", Run::ReportIssue)
-            .sub("opens a new GitHub issue with your midna, macOS and Mac details filled in")
+            .sub(os("opens a new GitHub issue with your midna, macOS and Mac details filled in", "opens a new GitHub issue with your midna, Windows and PC details filled in"))
             .kw("bug issue feedback github report problem crash broken file"),
     );
     out.push(
@@ -792,7 +793,7 @@ pub fn build(s: &Snapshot) -> Vec<Command> {
     let current = midna_proto::themes::choose(&theme, "", "", true);
     let themes = crate::theme::cached_themes();
     let name = |id: &str| themes.iter().find(|t| t.id == id).map(|t| t.name.clone()).unwrap_or_else(|| id.to_string());
-    let shown = if theme == "system" { "theme follows macOS".to_string() } else { format!("theme is {}", name(&current)) };
+    let shown = if theme == "system" { os("theme follows macOS", "theme follows Windows").to_string() } else { format!("theme is {}", name(&current)) };
     for t in &themes {
         if theme != "system" && t.id == current {
             continue;
@@ -807,8 +808,8 @@ pub fn build(s: &Snapshot) -> Vec<Command> {
     }
     if theme != "system" {
         out.push(
-            Command::new("theme:system", CmdIcon::Screen, "Theme: follow macOS", Run::Rpc { method: "settings.set".into(), params: json!({"key": "theme", "value": "system"}) })
-                .sub(format!("dark and light themes switch with macOS · {shown}"))
+            Command::new("theme:system", CmdIcon::Screen, os("Theme: follow macOS", "Theme: follow Windows"), Run::Rpc { method: "settings.set".into(), params: json!({"key": "theme", "value": "system"}) })
+                .sub(format!("dark and light themes switch with {} · {shown}", os("macOS", "Windows")))
                 .kw("theme appearance toggle color dark light mode system auto")
                 .cli("midna themes use system"),
         );
@@ -858,7 +859,7 @@ pub fn build(s: &Snapshot) -> Vec<Command> {
                 if s.background_hidden { "Show background terminals in the sidebar" } else { "Hide background terminals from the sidebar" },
                 Run::Screen { screen: "background".into() },
             )
-            .sub(if s.background_hidden { "the folded Background group above Today" } else { "they keep running; find them here in ⌘K" })
+            .sub(if s.background_hidden { "the folded Background group above Today" } else { os("they keep running; find them here in ⌘K", "they keep running; find them here in Ctrl+Shift+K") })
             .kw("background bg hide show sidebar group"),
         );
     }

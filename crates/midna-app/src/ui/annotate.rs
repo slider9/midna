@@ -6,6 +6,7 @@ use crate::icons::Icon;
 use crate::theme::{Theme, ThemeMode};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use midna_proto::wording::os;
 
 const STRIP_W: f32 = 128.;
 const THUMB_W: f32 = 104.;
@@ -195,7 +196,7 @@ fn empty(a: &AnnotateView, t: &Theme, cx: &mut Context<AnnotateView>) -> impl In
                 .child(button(t, "annot-paste", "Paste image", false).child(kbd(t, crate::actions::glyph_keys("⌘V"), false)).on_click(cx.listener(|v, _, w, cx| v.paste(w, cx))))
                 .child(button(t, "annot-choose", "Choose file…", false).on_click(cx.listener(|v, _, w, cx| v.pick_files(w, cx)))),
         )
-        .child(div().text_size(px(12.)).text_color(t.dim).child("PNG, JPEG, HEIC, TIFF, and other macOS image formats"))
+        .child(div().text_size(px(12.)).text_color(t.dim).child(os("PNG, JPEG, HEIC, TIFF, and other macOS image formats", "PNG, JPEG, GIF and WebP")))
 }
 
 // ------------------------------------------------------------------ left: the image strip
@@ -769,7 +770,7 @@ pub fn tray<V: 'static>(
                     .cursor_pointer()
                     .on_click(cx.listener(move |v, _, w, cx| edit(v, eid.clone(), w, cx)))
                     .child("Edit")
-                    .child(kbd(t, "⌘E", false)),
+                    .child(kbd(t, os("⌘E", "Ctrl+Shift+E"), false)),
             )
             .child(
                 div()
