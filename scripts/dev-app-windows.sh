@@ -179,18 +179,19 @@ for _ in $(seq 1 40); do
     break
   fi
 done
-# A handover started: say how it went (the old midnad logs either).
+# A handover or an immediate reopen (a daemon from before the keepers, nothing to wait for)
+# started: say how it went, from the old midnad's or the new one's log line.
 case "$line" in
   *'daemon.upgrade: '*'"when":"now"'*)
     for _ in $(seq 1 60); do
       sleep 0.5
-      d="$(tail -n +"$((dlines + 1))" "$HOME_U/midnad.log" 2>/dev/null | grep -E "resumed [0-9]+ session|failed, this midnad keeps running" | tail -1 || true)"
+      d="$(tail -n +"$((dlines + 1))" "$HOME_U/midnad.log" 2>/dev/null | grep -E "resumed [0-9]+ session|terminal\(s\) reopened|failed, this midnad keeps running" | tail -1 || true)"
       if [ -n "$d" ]; then
         echo "    ${d#midnad\[*\]: }"
         break
       fi
     done
-    [ -n "$d" ] || echo "    the daemon hasn't reported the handover after 30s (see $(cygpath -w "$HOME_U/midnad.log"))"
+    [ -n "$d" ] || echo "    the daemon hasn't reported the restart after 30s (see $(cygpath -w "$HOME_U/midnad.log"))"
     ;;
 esac
 # A fresh dev home starts on the default theme; give it Gruvbox so it can't pass for the real
