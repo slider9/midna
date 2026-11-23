@@ -419,11 +419,15 @@ impl Keeper {
         if self.finishing.swap(true, Ordering::SeqCst) {
             return;
         }
-        // What the shell started and left running goes too, and with it the console host.
-        if self.end_job.load(Ordering::SeqCst)
-            && let Some(s) = self.shell.get()
-        {
-            s.kill(1);
+        // What the shell started and left running goes too when asked, and with it the console
+        // host; otherwise it stays, as it would without a keeper: the job only ends what's in it
+        // when the keeper dies.
+        if let Some(s) = self.shell.get() {
+            if self.end_job.load(Ordering::SeqCst) {
+                s.kill(1);
+            } else {
+                s.release_job();
+            }
         }
         if !self.wait_closed(CLOSE_STALL) {
             if !self.client_reads() {

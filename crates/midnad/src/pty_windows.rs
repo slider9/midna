@@ -446,7 +446,7 @@ mod tests {
                 n.eq_ignore_ascii_case("ping") && crate::procs::command_line(*p).is_some_and(|l| l.contains(&format!("-n {count} ")))
             });
             if let Some((pid, _)) = child {
-                let h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid as u32) };
+                let h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid as u32) };
                 if !h.is_null() {
                     return unsafe { OwnedHandle::from_raw_handle(h) };
                 }
@@ -463,8 +463,13 @@ mod tests {
     /// A shell that starts a program in its job with a console of its own (hidden), which
     /// outlives the terminal's console: only the job ends it.
     fn pinging(count: &str) -> Vec<String> {
+        pinging_then(count, "ping -n 300 127.0.0.1")
+    }
+
+    /// [`pinging`], then `then`.
+    fn pinging_then(count: &str, then: &str) -> Vec<String> {
         // No quotes of its own: the argument reaches cmd quoted, and cmd can't take escaped ones.
-        let start = format!("powershell -NoProfile -Command Start-Process -WindowStyle Hidden ping -ArgumentList '-n','{count}','127.0.0.1' & ping -n 300 127.0.0.1");
+        let start = format!("powershell -NoProfile -Command Start-Process -WindowStyle Hidden ping -ArgumentList '-n','{count}','127.0.0.1' & {then}");
         vec!["cmd".into(), "/d".into(), "/c".into(), start]
     }
 
@@ -482,6 +487,34 @@ mod tests {
         assert!(!m.child_alive(), "the shell outlived its keeper");
         assert!(ends_within(&ping, 5000), "the shell's child outlived its keeper");
         reader.join().unwrap();
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    /// A keeper that exits on purpose (its shell exited, or a plain hang-up) leaves what the
+    /// shell started running, as a terminal without a keeper did: only a keeper that dies, or a
+    /// hang-up that ends the job, takes them.
+    #[test]
+    fn what_the_shell_started_outlives_a_keeper_that_exits_on_purpose() {
+        let h = home("purpose");
+        let sp = spawn(&Owner { home: &h, sid: "exits", tied: true }, &pinging_then("313", "exit 0"), ".", &[], 80, 24).expect("spawn");
+        let m = Arc::new(sp.master);
+        let reader = read_all(&m);
+        let ping = ping_of("313");
+        assert_eq!(m.wait_exit(), (Some(0), None));
+        assert!(m.wait_keeper(Duration::from_secs(10)), "the keeper stayed");
+        reader.join().unwrap();
+        assert!(!ends_within(&ping, 1000), "the shell's exit ended what it started");
+        unsafe { TerminateProcess(raw(&ping), 1) };
+
+        let sp = spawn(&Owner { home: &h, sid: "hangs-up", tied: true }, &pinging("314"), ".", &[], 80, 24).expect("spawn");
+        let m = Arc::new(sp.master);
+        let reader = read_all(&m);
+        let ping = ping_of("314");
+        m.hangup();
+        assert!(m.wait_keeper(Duration::from_secs(10)), "the keeper stayed");
+        reader.join().unwrap();
+        assert!(!ends_within(&ping, 1000), "a plain hang-up ended what the shell started");
+        unsafe { TerminateProcess(raw(&ping), 1) };
         let _ = std::fs::remove_dir_all(&h);
     }
 
