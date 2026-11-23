@@ -37,7 +37,7 @@ while [ $# -gt 0 ]; do
     --target-dir) TARGET_DIR="$2"; shift 2 ;;
     --dev-home) DEV_HOME="$2"; shift 2 ;;
     --conpty) CONPTY="$2"; shift 2 ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "build-windows.sh: unknown option $1" >&2; exit 2 ;;
   esac
 done
