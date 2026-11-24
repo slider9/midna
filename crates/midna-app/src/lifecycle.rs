@@ -665,6 +665,8 @@ impl Worker {
 ///   once this has exited, the app's folder.)
 /// - `--start-daemon` (Windows, what the login entry runs): start the installed midnad, with no
 ///   window, unless it's already answering.
+/// - `--install` (Windows, a packaged build): install it with no window and exit
+///   (`install::install_main`), for a package manager or a script.
 /// - `--quit` (Windows, any build): ask the app using this MIDNA_HOME to quit; exit 1 when none
 ///   is running.
 /// - `--apply-update <install folder> --wait <pid> [--no-launch]` (Windows, run from a staged
@@ -674,8 +676,8 @@ impl Worker {
 /// Returns the exit code when one of them ran.
 pub fn headless(args: &[String]) -> Option<i32> {
     let cmd = args.get(1)?.as_str();
-    let windows_only = matches!(cmd, "--start-daemon" | "--quit" | "--apply-update" | "--remove-install");
-    if !matches!(cmd, "--login-item-status" | "--uninstall" | "--start-daemon" | "--quit" | "--apply-update" | "--remove-install") || (windows_only && !cfg!(windows)) {
+    let windows_only = matches!(cmd, "--start-daemon" | "--install" | "--quit" | "--apply-update" | "--remove-install");
+    if !matches!(cmd, "--login-item-status" | "--uninstall" | "--start-daemon" | "--install" | "--quit" | "--apply-update" | "--remove-install") || (windows_only && !cfg!(windows)) {
         return None;
     }
     // Helpers with no console to print to.
@@ -701,6 +703,10 @@ pub fn headless(args: &[String]) -> Option<i32> {
     if cmd == "--login-item-status" {
         println!("{:?}", install::login_status(&bundle));
         return Some(0);
+    }
+    #[cfg(windows)]
+    if cmd == "--install" {
+        return Some(install::install_main(&bundle));
     }
     #[cfg(windows)]
     if cmd == "--start-daemon" {
