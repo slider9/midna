@@ -24,24 +24,34 @@ name: Build and test (Windows)
 # The toolchain is the one scripts/setup-toolchain.sh and scripts/setup-conpty.sh pin (Zig,
 # Ghostty's source, Microsoft's newer ConPTY), cached like release-windows.yml's; env.sh points
 # the build and the tests at it. macOS's workflows (build-macos.yml, release.yml) are separate.
+#
+# Doc-only changes don't build: nothing they touch is compiled or tested.
 on:
   pull_request:
     branches: [feat/windows-native]
+    paths-ignore: ['docs/**', '**/*.md']
   push:
     branches: [feat/windows-native]
+    paths-ignore: ['docs/**', '**/*.md']
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# A newer push to a PR cancels its older run. feat/windows-native's runs always finish: a push
+# run cancelled mid-build still saves what it had built (cache-on-failure), and that partial
+# cache then sticks, since rust-cache skips saving when it restored its exact key.
 concurrency:
   group: build-windows-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   # A CI build is built once; incremental artifacts would only fill the cache.
   CARGO_INCREMENTAL: 0
+  # No debug info: CI never reads it, and writing a PDB for every test binary is a large part of
+  # a Windows build and its cache. Panics still say their file and line.
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 defaults:
   run:
@@ -70,13 +80,16 @@ jobs:
           toolchain: 1.99.1
 
       # Dependencies' builds, libghostty-vt's Zig build among them (it lives in its OUT_DIR).
-      # A PR reads the cache feat/windows-native's last push saved. Saved when a test fails
+      # A PR reads the cache feat/windows-native's last push saved. Only that branch saves one:
+      # a PR's cache (about 1 GB, under refs/pull/<n>/merge) no other run can read, and enough
+      # of them would push the base branch's out of the repo's 10 GB. Saved when a test fails
       # too: a red run's build is as good, and the re-run after a fix shouldn't start cold.
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           shared-key: windows-test
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/feat/windows-native' }}
 
       # Zig, Ghostty's source and Microsoft's newer ConPTY, all pinned by their scripts. Saved
       # as soon as it's set up, so a failed build or test doesn't fetch it all again.
