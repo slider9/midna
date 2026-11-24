@@ -151,12 +151,13 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
           BASE: ${{ steps.version.outputs.base }}
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
           mkdir -p release
           cat > release/notes.md <<EOF
           Midna for Windows $VERSION: upstream $BASE with the Windows port, from $GITHUB_SHA.
 
-          Unzip it, move the \`Midna\` folder to \`%LOCALAPPDATA%\\Programs\\Midna\` and run \`midna-app.exe\`. An installed copy updates itself from here.
+          Unzip it and run \`midna-app.exe\`. It installs itself into \`%LOCALAPPDATA%\\Programs\\Midna\`, and an installed copy updates itself from here. Builds aren't code-signed yet, so Windows SmartScreen may warn the first time: More info, then Run anyway. The steps are in the [install guide](https://github.com/$GITHUB_REPOSITORY/blob/$TAG/docs/INSTALL-windows.md).
           EOF
           cat release/notes.md
 

@@ -63,7 +63,7 @@ ConPTY (`conpty.dll`, `OpenConsole.exe`), the fonts' and ConPTY's licenses and
 `midna-bundle.txt`. It won't build without the ConPTY (`--conpty FILE` names another copy). With
 that marker next to it, `midna-app.exe` runs as an installed Midna (`nonmac/install.rs`).
 
-There's no separate installer: the build installs itself. Its install folder is
+There's no separate installer: the build installs itself (a person follows `docs/INSTALL-windows.md`). Its install folder is
 `%LOCALAPPDATA%\Programs\<its name>` (`Midna`; Midna Dev's `Midna Dev`, a test build's `Midna
 Test`; those two take `MIDNA_INSTALL_DIR` instead when it's set, else the folder their Settings ▸
 Apps entry names when it holds a build, so a test install started later without the variable
@@ -331,10 +331,17 @@ In rough order of how much they matter:
    - **One handle leaks** per terminal open and close on Windows' own ConPTY (`resources.rs`: 146 → 346 over 200 cycles). On the newer ConPTY `resources.rs` passes (twice so far: in a full run and alone).
    - **Intermittent: typed input gets lost.** Bytes sent to a fresh Git Bash terminal sometimes go missing: the first (`stream_attach_frames_roundtrip` once read `cho streamed-…`), a `\0` typed in a command, or the final Enter (`stream_keys_scroll_and_selection` fails about two runs in three). `steps_for_a_refused_prompt_clear_it_from_the_input_box`, `shell_session_input_read_close`, `apps_register_their_own_link_patterns`, `another_terminals_id_is_a_link_to_it` and `a_gui_size_undone_at_once_never_reaches_the_app` fail now and then too, in a full run only. Since the merge with beta.58, so have `osc_title_is_tracked`, `pr_refs_link_to_the_terminals_github_repo`, `link_pattern_previews_run_only_as_link_at_gave_them` and `keys_an_app_isnt_reading_dont_stop_its_output` (its 200 KB flood outlasts the 30 s wait under the full run's load); each passes alone. Whether the merge made this worse isn't known: a pre-merge build to compare with would have to fetch Ghostty's source again. Until the client set its read timeout on the reader's socket handle as well (a clone is a handle of its own on Windows), a lost frame hung `stream_attach_frames_roundtrip` for good instead of failing it.
 3. **Shell integration, what's left.** A PowerShell alias for `claude` that names a full path skips the shims, and a profile that rebinds Enter to its own handler gets no output mark. Git Bash and cmd have no prompt marks: each prints its prompt in one write, which ConPTY would reorder. Marks depend on ConPTY painting within 15 ms, so on a very busy machine one may land early.
-4. **Installing and upgrading.** midnad starts at login and the app installs itself on launch
-   (see Installing), but:
-   - A build installs itself when run from elsewhere, and the updater works (see Installing), but `packaging/build-windows.sh`
-     embeds no update key yet, so a build from it reports updates off.
+4. **Installing and upgrading.** midnad starts at login, the app installs itself on launch and
+   updates itself (see Installing; the steps for a person are in `docs/INSTALL-windows.md`), but:
+   - **Builds aren't signed.** No Authenticode certificate (B140), so SmartScreen warns the first
+     time a downloaded build runs (the install drops the web mark, so the installed copy doesn't
+     warn again) and there's no signer check on an update; the signed feed pins the zip's sha256.
+   - **A local build has no update key.** `packaging/build-windows.sh` compiles in
+     `MIDNA_UPDATE_PUBKEY` only when it's set (the release workflow sets it), so a build without it
+     reports updates off. Releases come from `tb release cut windows-v<version>`
+     (`docs/RELEASING.md`, "Windows releases"), which cuts them from the fork, not upstream.
+   - **Settings' midna CLI row** still words the folder-not-on-PATH case for a shell (an
+     `export PATH=…` line, and it looks for a link, not the copy Windows makes).
    - **Upgrades.** Each terminal runs in a keeper (`midna-pty.exe`) that outlives midnad, so
      `daemon.upgrade` and `daemon.restart` hand every terminal to the new midnad
      (`upgrade_windows.rs`): the old one snapshots each screen into `handoff\handoff.json` (with
