@@ -466,6 +466,25 @@ pub fn detach(cmd: &mut Command) {
     cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 }
 
+/// Keep this process's standard handles to itself. Rust starts every child with handle
+/// inheritance on, so each inheritable handle goes along whatever its stdio is: a midnad a
+/// headless command starts (it outlives the command) would hold the pipe the caller reads the
+/// command's output from, and a script or package manager reading it would wait for good.
+#[cfg(windows)]
+pub fn keep_std_handles() {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    // SAFETY: plain calls on this process's own standard handles.
+    unsafe {
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let h = GetStdHandle(which);
+            if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
 #[cfg(not(windows))]
 pub fn detach(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -739,10 +758,7 @@ pub fn place() -> Option<i32> {
     let r = match step {
         Placement::Here => return None,
         Placement::StartInstalled => start_installed(&dest),
-        Placement::Newer(v) => Err(format!(
-            "{name} {v} is already installed in {}, which is newer than this {version}. To install this one instead, uninstall {name} first (Settings ▸ Apps ▸ {name} ▸ Uninstall), then run this again.",
-            dest.display()
-        )),
+        Placement::Newer(v) => Err(newer_installed(&v, &dest)),
         Placement::Install => foreign_files(&bundle)
             .and_then(|()| quit_running())
             .and_then(|()| crate::update_windows::swap_in(&bundle, &dest).map_err(|e| format!("Couldn't install {name} in {}: {e}", dest.display())))
@@ -762,6 +778,128 @@ pub fn place() -> Option<i32> {
             1
         }
     })
+}
+
+/// Why a build won't go over the newer version `v` installed in `dest`.
+#[cfg(windows)]
+fn newer_installed(v: &str, dest: &Path) -> String {
+    let (name, version) = (midna_proto::paths::app_name(), midna_proto::VERSION);
+    format!(
+        "{name} {v} is already installed in {}, which is newer than this {version}. To install this one instead, uninstall {name} first (Settings ▸ Apps ▸ {name} ▸ Uninstall), then run this again.",
+        dest.display()
+    )
+}
+
+/// What `--install` did with the build's files ([`copy_in`]).
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Copied {
+    /// It runs from its install folder: nothing to copy.
+    Here,
+    /// This version was installed already.
+    Already,
+    /// Copied into a folder with no build in it.
+    Installed,
+    /// Put in place of the older build there (its version, "" when it couldn't be read).
+    Updated(String),
+}
+
+/// `--install`'s copy: the build in `bundle` goes into `dest` by [`place`]'s rules, version
+/// `version`. One difference: an older build is replaced from this process ([`swap_in`] renames
+/// its running files aside), not by a helper after this exits, because nothing is started
+/// afterwards and this process doesn't run from `dest`. `quit` asks a running app to quit
+/// first; when it can't, nothing is copied.
+///
+/// [`swap_in`]: crate::update_windows::swap_in
+#[cfg(windows)]
+fn copy_in(bundle: &Path, dest: &Path, programs: &Path, version: &str, quit: impl FnOnce() -> Result<(), String>) -> Result<Copied, String> {
+    let installed = dest.join(BUNDLE_MARKER).is_file().then(|| installed_version(dest));
+    let name = midna_proto::paths::app_name();
+    let done = match placement(bundle, dest, programs, installed.as_deref(), version) {
+        Placement::Here => return Ok(Copied::Here),
+        Placement::StartInstalled => return Ok(Copied::Already),
+        Placement::Newer(v) => return Err(newer_installed(&v, dest)),
+        Placement::Install => Copied::Installed,
+        Placement::Update => Copied::Updated(installed.unwrap_or_default()),
+    };
+    foreign_files(bundle)?;
+    quit()?;
+    crate::update_windows::swap_in(bundle, dest).map_err(|e| format!("Couldn't install {name} in {}: {e}", dest.display()))?;
+    Ok(done)
+}
+
+/// `midna-app.exe --install`, run from a packaged build: install it with no window and exit, for
+/// a package manager or a script. It copies the build into its install folder ([`copy_in`]),
+/// then does what the app does at each launch from there (`lifecycle`): midnad into
+/// `MIDNA_HOME\bin`, the Start menu and Settings ▸ Apps entries, the login entry (which starts
+/// midnad if it isn't answering) and the CLI copy. It starts no app; one it asked to quit stays
+/// closed, and a running midnad keeps its build until the app next starts and upgrades it.
+/// Exit 0 when every step went, 1 when one failed (each is still tried).
+#[cfg(windows)]
+pub fn install_main(bundle: &Path) -> i32 {
+    let (name, version) = (midna_proto::paths::app_name(), midna_proto::VERSION);
+    let dest = install_dir();
+    let say = |line: String| {
+        crate::lifecycle::log_file(&format!("--install: {line}"));
+        println!("{line}");
+    };
+    let mut ok = true;
+    let mut fail = |line: String| {
+        crate::lifecycle::log_file(&format!("--install: {line}"));
+        eprintln!("midna-app --install: {line}");
+        ok = false;
+    };
+    let target = match copy_in(bundle, &dest, &programs_dir(), version, quit_running) {
+        Ok(Copied::Here) => {
+            say(format!("{name} {version} runs from {}", bundle.display()));
+            bundle.to_path_buf()
+        }
+        Ok(Copied::Already) => {
+            say(format!("{name} {version} is already installed in {}", dest.display()));
+            dest
+        }
+        Ok(Copied::Installed) => {
+            say(format!("installed {name} {version} in {}", dest.display()));
+            dest
+        }
+        Ok(Copied::Updated(old)) => {
+            say(format!("updated {name} in {} from {} to {version}", dest.display(), if old.is_empty() { "an unknown version" } else { &old }));
+            dest
+        }
+        Err(e) => {
+            fail(e);
+            return 1;
+        }
+    };
+    let home = midna_proto::paths::midna_home();
+    let _ = std::fs::create_dir_all(&home);
+    match install_daemon(&target, &home) {
+        Ok(d) => say(format!("midnad: {}", d.display())),
+        Err(e) => fail(format!("midnad: {e}")),
+    }
+    match add_to_start_menu(&target) {
+        Ok(()) => say(format!("Start menu: {}", start_menu_entry().unwrap_or_default().display())),
+        Err(e) => fail(format!("Start menu: {e}")),
+    }
+    match add_to_apps(&target) {
+        Ok(()) => say("Settings ▸ Apps: listed".into()),
+        Err(e) => fail(format!("Settings ▸ Apps: {e}")),
+    }
+    match register(&target) {
+        LoginItem::Enabled => say("login entry: on".into()),
+        LoginItem::RequiresApproval => say("login entry: switched off in Settings ▸ Apps ▸ Startup, so left off".into()),
+        LoginItem::Failed(e) => fail(format!("login entry: {e}")),
+        other => fail(format!("login entry: {other:?}")),
+    }
+    let shell_path = if cli_link_dir_pinned() { None } else { login_shell_path() };
+    match link_cli(&home, shell_path.as_deref(), false) {
+        CliLink::Linked { link } => say(format!("midna CLI: {}", link.display())),
+        CliLink::NotOnPath { dir } => say(format!("midna CLI: not copied, {} isn't on PATH", dir.display())),
+        CliLink::Conflict { link } => say(format!("midna CLI: not copied, {} isn't Midna's", link.display())),
+        CliLink::Failed(e) => fail(format!("midna CLI: {e}")),
+        CliLink::Dev => {}
+    }
+    if ok { 0 } else { 1 }
 }
 
 /// A build to install from must hold only the build ([`update_windows::not_the_build`]): its
@@ -1032,6 +1170,76 @@ mod tests {
         // A Dev or test build whose registered folder is elsewhere, run from Programs: it stays.
         assert_eq!(placement(&programs, &zip, &programs, Some("1.0.0"), "1.2.0"), Placement::Here);
         assert_eq!(placement(&programs, &zip, &programs, None, "1.2.0"), Placement::Here);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A build folder as the release zip unpacks it: the app, midnad and the marker.
+    #[cfg(windows)]
+    fn build(dir: &Path, version: &str, app: &[u8]) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("midna-app.exe"), app).unwrap();
+        std::fs::write(dir.join("midnad.exe"), format!("midnad {version}")).unwrap();
+        std::fs::write(dir.join(BUNDLE_MARKER), format!("Midna Test {version}. With this file next to it…")).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn install_copies_the_build_in_or_replaces_an_older_one_without_starting_it() {
+        let d = scratch("copy-in");
+        let (zip, dest, programs) = (d.join("Downloads").join("Midna"), d.join("Programs").join("Midna Test"), d.join("Local").join("Midna Test"));
+        let no_quit = || -> Result<(), String> { Ok(()) };
+        build(&zip, "1.2.0", b"app 1.2.0");
+        // Nothing installed: copied in, and nothing in the zip's folder changes.
+        assert_eq!(copy_in(&zip, &dest, &programs, "1.2.0", no_quit), Ok(Copied::Installed));
+        assert_eq!(std::fs::read(dest.join("midna-app.exe")).unwrap(), b"app 1.2.0");
+        assert_eq!(installed_version(&dest), "1.2.0");
+        assert!(!dest.join("midna-update-leftovers.txt").exists(), "nothing was there to set aside");
+        // Again: already there. Run from the install folder: nothing to copy.
+        assert_eq!(copy_in(&zip, &dest, &programs, "1.2.0", no_quit), Ok(Copied::Already));
+        assert_eq!(copy_in(&dest, &dest, &programs, "1.2.0", no_quit), Ok(Copied::Here));
+        // An older build, its app running: swapped in here and now, the running one set aside.
+        std::fs::remove_dir_all(&dest).unwrap();
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        build(&dest, "1.1.0", &std::fs::read(Path::new(&system).join(r"System32\PING.EXE")).unwrap());
+        let mut running = Command::new(dest.join("midna-app.exe")).args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        let mut asked = false;
+        let r = copy_in(&zip, &dest, &programs, "1.2.0", || {
+            asked = true;
+            Ok(())
+        });
+        let _ = running.kill();
+        let _ = running.wait();
+        assert_eq!(r, Ok(Copied::Updated("1.1.0".into())));
+        assert!(asked, "a running app is asked to quit first");
+        assert_eq!(std::fs::read(dest.join("midna-app.exe")).unwrap(), b"app 1.2.0");
+        assert_eq!(installed_version(&dest), "1.2.0");
+        let leftovers = std::fs::read_to_string(dest.join("midna-update-leftovers.txt")).unwrap();
+        assert!(leftovers.contains("midna-app.exe.old"), "{leftovers}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn install_refuses_a_newer_build_a_folder_of_other_files_or_an_app_that_wont_quit() {
+        let d = scratch("copy-in-refused");
+        let (zip, dest, programs) = (d.join("Downloads").join("Midna"), d.join("Programs").join("Midna Test"), d.join("Local").join("Midna Test"));
+        build(&zip, "1.2.0", b"app 1.2.0");
+        let untouched = |dest: &Path| std::fs::read_dir(dest).map(|r| r.count()).unwrap_or(0);
+        // A newer build installed stays, and so does every file of it.
+        build(&dest, "1.3.0", b"app 1.3.0");
+        let e = copy_in(&zip, &dest, &programs, "1.2.0", || Ok(())).unwrap_err();
+        assert!(e.contains("1.3.0 is already installed") && e.contains("Uninstall"), "{e}");
+        assert_eq!(std::fs::read(dest.join("midna-app.exe")).unwrap(), b"app 1.3.0");
+        std::fs::remove_dir_all(&dest).unwrap();
+        // An app that won't quit: nothing is copied.
+        let e = copy_in(&zip, &dest, &programs, "1.2.0", || Err("still running".into())).unwrap_err();
+        assert_eq!(e, "still running");
+        assert_eq!(untouched(&dest), 0);
+        // Someone's files beside the build: never copied, and the app isn't asked to quit.
+        std::fs::write(zip.join("taxes.xlsx"), "").unwrap();
+        let e = copy_in(&zip, &dest, &programs, "1.2.0", || panic!("asked to quit")).unwrap_err();
+        assert!(e.contains("taxes.xlsx"), "{e}");
+        assert_eq!(untouched(&dest), 0);
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -87,6 +87,18 @@ among someone's files never copies them. What it has to say goes to the console 
 else a message box. The first launch of the installed copy says in a toast that it's installed
 there (a note in `MIDNA_HOME\installed.txt` that it removes).
 
+`midna-app.exe --install` does the same with no window, for a package manager (winget, later) or
+a script (`install::install_main`): it copies the build in by the same rules, except that an older
+build is swapped in from that process with `swap_in` (it renames running files aside) instead of
+by the after-exit helper. Then it does what a launch from the install folder does (below) and
+exits, starting no app. An app it asked to quit stays closed, and a running midnad keeps its build
+until the app next starts and upgrades it. It prints each step to the console it was run from and
+exits 1 when any step failed (refusals included), else 0. A build already installed and run with
+`--install` brings its entries up to date. The headless commands (`--install`, `--start-daemon`)
+mark their own standard handles not inheritable first: Rust starts children with handle
+inheritance on, so the midnad they start would otherwise hold the caller's output pipe open, and
+a script reading `--install`'s output would never see it end.
+
 Explorer's Extract All marks every file of a downloaded zip with the Mark of the Web
 (`Zone.Identifier`, ZoneId=3), and a copy keeps it. The copy into the install folder drops it
 (`drop_web_mark`), so the installed `midna-app.exe` doesn't go through SmartScreen again when the

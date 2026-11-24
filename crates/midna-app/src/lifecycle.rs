@@ -350,6 +350,11 @@ fn show_note(line: String, cx: &mut App) {
 
 pub fn log(msg: &str) {
     eprintln!("midna-app: {msg}");
+    log_file(msg);
+}
+
+/// [`log`] without the stderr line, for a command that prints its own.
+pub fn log_file(msg: &str) {
     let home = midna_proto::paths::midna_home();
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(home.join("app.log")) {
         let _ = std::io::Write::write_all(&mut f, format!("{} v{} pid {} {msg}\n", midna_proto::time::now_rfc3339(), midna_proto::VERSION, std::process::id()).as_bytes());
@@ -665,6 +670,8 @@ impl Worker {
 ///   once this has exited, the app's folder.)
 /// - `--start-daemon` (Windows, what the login entry runs): start the installed midnad, with no
 ///   window, unless it's already answering.
+/// - `--install` (Windows, a packaged build): install it with no window and exit
+///   (`install::install_main`), for a package manager or a script.
 /// - `--quit` (Windows, any build): ask the app using this MIDNA_HOME to quit; exit 1 when none
 ///   is running.
 /// - `--apply-update <install folder> --wait <pid> [--no-launch]` (Windows, run from a staged
@@ -674,8 +681,8 @@ impl Worker {
 /// Returns the exit code when one of them ran.
 pub fn headless(args: &[String]) -> Option<i32> {
     let cmd = args.get(1)?.as_str();
-    let windows_only = matches!(cmd, "--start-daemon" | "--quit" | "--apply-update" | "--remove-install");
-    if !matches!(cmd, "--login-item-status" | "--uninstall" | "--start-daemon" | "--quit" | "--apply-update" | "--remove-install") || (windows_only && !cfg!(windows)) {
+    let windows_only = matches!(cmd, "--start-daemon" | "--install" | "--quit" | "--apply-update" | "--remove-install");
+    if !matches!(cmd, "--login-item-status" | "--uninstall" | "--start-daemon" | "--install" | "--quit" | "--apply-update" | "--remove-install") || (windows_only && !cfg!(windows)) {
         return None;
     }
     // Helpers with no console to print to.
@@ -690,6 +697,9 @@ pub fn headless(args: &[String]) -> Option<i32> {
     unsafe {
         windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
     }
+    // --install and --start-daemon start midnad, which mustn't keep the caller's output open.
+    #[cfg(windows)]
+    install::keep_std_handles();
     #[cfg(windows)]
     if cmd == "--quit" {
         return Some(if crate::instance::ask_to_quit() { 0 } else { 1 });
@@ -701,6 +711,10 @@ pub fn headless(args: &[String]) -> Option<i32> {
     if cmd == "--login-item-status" {
         println!("{:?}", install::login_status(&bundle));
         return Some(0);
+    }
+    #[cfg(windows)]
+    if cmd == "--install" {
+        return Some(install::install_main(&bundle));
     }
     #[cfg(windows)]
     if cmd == "--start-daemon" {
