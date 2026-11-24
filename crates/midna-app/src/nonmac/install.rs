@@ -466,6 +466,25 @@ pub fn detach(cmd: &mut Command) {
     cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 }
 
+/// Keep this process's standard handles to itself. Rust starts every child with handle
+/// inheritance on, so each inheritable handle goes along whatever its stdio is: a midnad a
+/// headless command starts (it outlives the command) would hold the pipe the caller reads the
+/// command's output from, and a script or package manager reading it would wait for good.
+#[cfg(windows)]
+pub fn keep_std_handles() {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    // SAFETY: plain calls on this process's own standard handles.
+    unsafe {
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let h = GetStdHandle(which);
+            if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
 #[cfg(not(windows))]
 pub fn detach(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -821,12 +840,12 @@ pub fn install_main(bundle: &Path) -> i32 {
     let (name, version) = (midna_proto::paths::app_name(), midna_proto::VERSION);
     let dest = install_dir();
     let say = |line: String| {
-        crate::lifecycle::log(&format!("--install: {line}"));
+        crate::lifecycle::log_file(&format!("--install: {line}"));
         println!("{line}");
     };
     let mut ok = true;
     let mut fail = |line: String| {
-        crate::lifecycle::log(&format!("--install: {line}"));
+        crate::lifecycle::log_file(&format!("--install: {line}"));
         eprintln!("midna-app --install: {line}");
         ok = false;
     };

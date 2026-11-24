@@ -350,6 +350,11 @@ fn show_note(line: String, cx: &mut App) {
 
 pub fn log(msg: &str) {
     eprintln!("midna-app: {msg}");
+    log_file(msg);
+}
+
+/// [`log`] without the stderr line, for a command that prints its own.
+pub fn log_file(msg: &str) {
     let home = midna_proto::paths::midna_home();
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(home.join("app.log")) {
         let _ = std::io::Write::write_all(&mut f, format!("{} v{} pid {} {msg}\n", midna_proto::time::now_rfc3339(), midna_proto::VERSION, std::process::id()).as_bytes());
@@ -692,6 +697,9 @@ pub fn headless(args: &[String]) -> Option<i32> {
     unsafe {
         windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
     }
+    // --install and --start-daemon start midnad, which mustn't keep the caller's output open.
+    #[cfg(windows)]
+    install::keep_std_handles();
     #[cfg(windows)]
     if cmd == "--quit" {
         return Some(if crate::instance::ask_to_quit() { 0 } else { 1 });

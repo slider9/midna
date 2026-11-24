@@ -92,7 +92,10 @@ by the after-exit helper. Then it does what a launch from the install folder doe
 exits, starting no app. An app it asked to quit stays closed, and a running midnad keeps its build
 until the app next starts and upgrades it. It prints each step to the console it was run from and
 exits 1 when any step failed (refusals included), else 0. A build already installed and run with
-`--install` brings its entries up to date.
+`--install` brings its entries up to date. The headless commands (`--install`, `--start-daemon`)
+mark their own standard handles not inheritable first: Rust starts children with handle
+inheritance on, so the midnad they start would otherwise hold the caller's output pipe open, and
+a script reading `--install`'s output would never see it end.
 
 Explorer's Extract All marks every file of a downloaded zip with the Mark of the Web
 (`Zone.Identifier`, ZoneId=3), and a copy keeps it. The copy into the install folder drops it
