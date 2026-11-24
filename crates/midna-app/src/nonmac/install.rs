@@ -107,9 +107,10 @@ mod login {
     const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     const APPROVED: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 
-    /// The Run value's name. Midna Dev has its own, so it never touches the installed Midna's.
+    /// The Run value's name. Midna Dev and a test build have their own, so they never touch the
+    /// installed Midna's.
     pub fn name() -> &'static str {
-        if midna_proto::paths::is_dev() { "Midna Dev" } else { "Midna" }
+        midna_proto::paths::app_name()
     }
 
     pub fn command(bundle: &Path) -> String {
@@ -266,7 +267,7 @@ pub fn prune_old_installs(home: &Path) {
     }
 }
 
-/// The Start menu entry: `Midna.lnk` (Midna Dev: `Midna Dev.lnk`) in the user's Start menu
+/// The Start menu entry: `Midna.lnk` (Midna Dev: `Midna Dev.lnk`, a test build: `Midna Test.lnk`) in the user's Start menu
 /// Programs folder.
 #[cfg(windows)]
 pub fn start_menu_entry() -> Option<PathBuf> {
@@ -346,8 +347,7 @@ mod apps_entry {
     use crate::winreg;
 
     pub fn key() -> String {
-        let id = if midna_proto::paths::is_dev() { format!("{}.dev", midna_proto::paths::BUNDLE_ID) } else { midna_proto::paths::BUNDLE_ID.to_string() };
-        format!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{id}")
+        format!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{}", midna_proto::paths::app_id())
     }
 
     pub enum Data {
@@ -729,7 +729,12 @@ mod tests {
         std::fs::create_dir_all(d.join("fonts")).unwrap();
         std::fs::write(d.join("fonts").join("a.ttf"), vec![0u8; 2000]).unwrap();
         assert_eq!(apps_entry::size_kb(&d), 5);
-        assert!(apps_entry::key().ends_with(if midna_proto::paths::is_dev() { r"\Uninstall\com.mrgnhnt.midna.dev" } else { r"\Uninstall\com.mrgnhnt.midna" }));
+        let id = match (midna_proto::paths::is_dev(), midna_proto::paths::TEST_BUILD) {
+            (false, _) => "com.mrgnhnt.midna",
+            (true, false) => "com.mrgnhnt.midna.dev",
+            (true, true) => "com.mrgnhnt.midna.test",
+        };
+        assert!(apps_entry::key().ends_with(&format!(r"\Uninstall\{id}")));
         // Written under a scratch key, never the real entry.
         let key = format!(r"Software\midna-test-apps-{}", std::process::id());
         apps_entry::write(&key, apps_entry::values(&d, 5)).unwrap();

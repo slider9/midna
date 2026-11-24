@@ -19,15 +19,20 @@
 #                         home (MIDNA_HOME and MIDNA_SOCKET are ignored), and refuses to write the
 #                         installed Midna's files (midna_proto::paths::guard_write); its icon is
 #                         inverted and Windows lists it as "Midna Dev"
+#     --test              with --dev-home: a test build of Midna Dev (packaging/e2e/update-e2e-windows.sh):
+#                         app id com.mrgnhnt.midna.test, listed as "Midna Test", refuses Midna Dev's
+#                         files too, and updates itself with MIDNA_UPDATE_PUBKEY
+#     --dev-drivers       honour the MIDNA_DEBUG_* / updater-override env vars (cargo feature
+#                         midna-app/dev-drivers). Test builds only: those drivers act as the human.
 #
 # Env: MIDNA_UPDATE_PUBKEY, the update keys to compile in (base64 ed25519 public keys, separated by
-# commas or spaces; the release workflow sets the fork's). Without it, or with --dev-home, the
-# build never updates itself. Unlike build-app.sh, there's no default dev key.
+# commas or spaces; the release workflow sets the fork's). Without it, or with --dev-home but not
+# --test, the build never updates itself. Unlike build-app.sh, there's no default dev key.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-VERSION="" OUT="" NAME="Midna" BUILD=1 TARGET_DIR="$ROOT/target/package" DEV_HOME="" CONPTY=""
+VERSION="" OUT="" NAME="Midna" BUILD=1 TARGET_DIR="$ROOT/target/package" DEV_HOME="" CONPTY="" TEST="" FEATURES=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) VERSION="$2"; shift 2 ;;
@@ -37,7 +42,9 @@ while [ $# -gt 0 ]; do
     --target-dir) TARGET_DIR="$2"; shift 2 ;;
     --dev-home) DEV_HOME="$2"; shift 2 ;;
     --conpty) CONPTY="$2"; shift 2 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    --test) TEST=1; shift ;;
+    --dev-drivers) FEATURES=(--features midna-app/dev-drivers); shift ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "build-windows.sh: unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -56,7 +63,11 @@ if [ -n "$DEV_HOME" ]; then
   if [ "${home,,}" = "${prod,,}" ] || [[ "${home,,}" == "${prod,,}\\"* ]]; then
     echo "build-windows.sh: --dev-home can't be the installed Midna's home" >&2; exit 2
   fi
+  if [ -n "$TEST" ] && [ "${home,,}" = "${prod,,}.dev" ]; then
+    echo "build-windows.sh: a --test build's --dev-home can't be Midna Dev's home" >&2; exit 2
+  fi
 fi
+[ -z "$TEST" ] || [ -n "$DEV_HOME" ] || { echo "build-windows.sh: --test needs --dev-home" >&2; exit 2; }
 DEST="$OUT/$NAME"
 # shellcheck disable=SC1091
 . "$ROOT/env.sh"
@@ -73,14 +84,14 @@ fi
 BIN="$TARGET_DIR/release"
 if [ "$BUILD" = 1 ]; then
   echo "==> cargo build --release (midna $VERSION, target $TARGET_DIR)"
-  if [ -n "${MIDNA_UPDATE_PUBKEY:-}" ] && [ -z "$DEV_HOME" ]; then
+  if [ -n "${MIDNA_UPDATE_PUBKEY:-}" ] && { [ -z "$DEV_HOME" ] || [ -n "$TEST" ]; }; then
     export MIDNA_UPDATE_PUBKEY
   else
     unset MIDNA_UPDATE_PUBKEY
     echo "build-windows.sh: no update key (MIDNA_UPDATE_PUBKEY): this build will never update itself" >&2
   fi
-  MIDNA_DEV_HOME="$DEV_HOME" MIDNA_BUILD_VERSION="$VERSION" CARGO_TARGET_DIR="$TARGET_DIR" CARGO_BUILD_BUILD_DIR="$TARGET_DIR" \
-    cargo build --release -p midna-app -p midnad -p midna-cli -p midna-pty --bin midna-app --bin midnad --bin midna --bin midna-pty
+  MIDNA_DEV_HOME="$DEV_HOME" MIDNA_TEST_BUILD="$TEST" MIDNA_BUILD_VERSION="$VERSION" CARGO_TARGET_DIR="$TARGET_DIR" CARGO_BUILD_BUILD_DIR="$TARGET_DIR" \
+    cargo build --release -p midna-app -p midnad -p midna-cli -p midna-pty --bin midna-app --bin midnad --bin midna --bin midna-pty ${FEATURES[@]+"${FEATURES[@]}"}
 fi
 for b in midna-app midnad midna midna-pty; do [ -f "$BIN/$b.exe" ] || { echo "missing $BIN/$b.exe" >&2; exit 1; }; done
 

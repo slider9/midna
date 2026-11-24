@@ -23,9 +23,36 @@ pub const DEV_HOME: Option<&str> = match option_env!("MIDNA_DEV_HOME") {
     _ => None,
 };
 
-/// Is this build Midna Dev? It never touches the installed Midna (see [`guard_write`]).
+/// Is this build Midna Dev? It never touches the installed Midna (see [`guard_write`]). A
+/// [test build](TEST_BUILD) is one too.
 pub fn is_dev() -> bool {
     DEV_HOME.is_some()
+}
+
+/// A test build: Midna Dev under another name (`packaging/build-windows.sh --dev-home DIR
+/// --test`, what `packaging/e2e/update-e2e-windows.sh` installs). Its app id is
+/// [`TEST_APP_ID`] and Windows lists it as "Midna Test", so it never touches Midna Dev either,
+/// and unlike Midna Dev it updates itself.
+pub const TEST_BUILD: bool = DEV_HOME.is_some() && matches!(option_env!("MIDNA_TEST_BUILD"), Some(v) if !v.is_empty());
+pub const DEV_APP_ID: &str = "com.mrgnhnt.midna.dev";
+pub const TEST_APP_ID: &str = "com.mrgnhnt.midna.test";
+
+/// This build's app id: [`BUNDLE_ID`], [`DEV_APP_ID`] or [`TEST_APP_ID`].
+pub const fn app_id() -> &'static str {
+    match (DEV_HOME, TEST_BUILD) {
+        (None, _) => BUNDLE_ID,
+        (Some(_), false) => DEV_APP_ID,
+        (Some(_), true) => TEST_APP_ID,
+    }
+}
+
+/// What Windows lists this build as: its Run value, Start menu entry and Settings ▸ Apps entry.
+pub const fn app_name() -> &'static str {
+    match (DEV_HOME, TEST_BUILD) {
+        (None, _) => "Midna",
+        (Some(_), false) => "Midna Dev",
+        (Some(_), true) => "Midna Test",
+    }
 }
 
 #[cfg(not(windows))]
@@ -118,10 +145,30 @@ pub fn production_paths() -> Vec<PathBuf> {
     paths
 }
 
+/// What a test build must never write besides production's: Midna Dev's home, its install
+/// folder (`scripts/dev-app-windows.sh`'s) and its Start menu entry.
+pub fn dev_paths() -> Vec<PathBuf> {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut paths = vec![app_data_dir().join(DEV_APP_ID)];
+    #[cfg(windows)]
+    {
+        paths.push(app_data_dir().join("Programs").join("Midna Dev"));
+        if let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {
+            paths.push(PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Midna Dev.lnk"));
+        }
+    }
+    paths
+}
+
 /// Midna Dev refuses to write `path` when it is, or is inside, one of production's
-/// ([`production_paths`]). Always Ok in every other build.
+/// ([`production_paths`]); a test build refuses Midna Dev's too ([`dev_paths`]). Always Ok in
+/// every other build.
 pub fn guard_write(path: &Path) -> std::io::Result<()> {
-    if is_dev() { check_write(path, &production_paths()) } else { Ok(()) }
+    match (is_dev(), TEST_BUILD) {
+        (false, _) => Ok(()),
+        (true, false) => check_write(path, &production_paths()),
+        (true, true) => check_write(path, &[production_paths(), dev_paths()].concat()),
+    }
 }
 
 fn check_write(path: &Path, protected: &[PathBuf]) -> std::io::Result<()> {
@@ -129,7 +176,7 @@ fn check_write(path: &Path, protected: &[PathBuf]) -> std::io::Result<()> {
     match protected.iter().find(|q| p.starts_with(resolved(q))) {
         Some(q) => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("Midna Dev never writes the installed Midna's files: {} is under {}", path.display(), q.display()),
+            format!("{} never writes another Midna's files: {} is under {}", app_name(), path.display(), q.display()),
         )),
         None => Ok(()),
     }

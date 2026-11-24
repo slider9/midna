@@ -12,9 +12,14 @@ pub const TAG_MAX: usize = 64;
 pub const ACTIONS_MAX: usize = 5;
 
 /// The AppUserModelID midna's toasts are posted under: Midna Dev's and debug builds' (`dev`) end
-/// in `.dev`, so a build from source never shows as, or changes, Midna's.
+/// in `.dev` (a test build's in `.test`), so a build from source never shows as, or changes,
+/// Midna's.
 pub fn app_id(dev: bool) -> &'static str {
-    if dev { "com.mrgnhnt.midna.dev" } else { crate::paths::BUNDLE_ID }
+    match (dev, crate::paths::TEST_BUILD) {
+        (false, _) => crate::paths::BUNDLE_ID,
+        (true, false) => crate::paths::DEV_APP_ID,
+        (true, true) => crate::paths::TEST_APP_ID,
+    }
 }
 
 /// What a click on a toast reports.

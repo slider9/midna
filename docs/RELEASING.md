@@ -365,6 +365,45 @@ reuses them, `--keep` skips deleting the installs):
   as a fallback, deletes the install, the test home and the LaunchServices registration, and
   stops the server
 
+### Windows
+
+`packaging/e2e/update-e2e-windows.sh`, from Git Bash (the two release builds take most of the
+time; `--no-build` reuses them, `--keep` leaves the test home and install folder to look at). It
+needs the newer ConPTY (`scripts/setup-conpty.sh`) and Python, and signs with the dev key,
+making it with `gen-update-key.sh` if there's none.
+
+- builds **test-flavored** v1 and v2 (`<version>.e2e.1` and `.e2e.2`) with `build-windows.sh
+  --dev-home %TEMP%\mdt-e2e --test --dev-drivers`: Midna Dev's mechanism (the home is built in,
+  so the `MIDNA_HOME` a Midna terminal exports can't point it at production) under its own
+  identity. App id `com.mrgnhnt.midna.test`, listed as "Midna Test" (login entry, Start menu,
+  Settings ▸ Apps), refusing both the installed Midna's and Midna Dev's files, and updating
+  itself with the dev key
+- signs v2's entry (`midna-update-v2`) with `make-update.sh --windows --channel beta` and serves
+  `windows-beta.json` and the zips from `python -m http.server` on 127.0.0.1
+- installs v1 to `%TEMP%\mdt-e2e-app\Midna Test`, starts it hidden with
+  `MIDNA_UPDATE_FEED_URL`, `MIDNA_UPDATE_CHECK_SECS=6` and `MIDNA_DEBUG_UPDATE=apply`, sets
+  `updates.channel` to beta, and opens a terminal running a PowerShell loop that prints
+  `tick-<n>` twice a second
+- **a bad build**: the feed offers v2 but its zip holds v1, so staging refuses it (`midnad
+  --selftest` reports the wrong version); the app, the daemon and the terminal carry on
+- **a file that can't be replaced**: the real v2 while `midna.exe` in the install is held open
+  without delete sharing. v1 downloads, verifies and applies it, the swap rolls back, and the
+  helper starts v1 again, which says why. The install is v1 with no `.new` or `.old` files, and
+  the daemon is the same process
+- **the update**: the file is let go and v1 applies v2. v2 starts from the install, the daemon
+  reports v2 (a new midnad, which the keepers were handed to; the old one exits), the old files
+  are cleared, and the terminal has the same id and shell pid, with the counter still going from
+  where it was
+- after each step it checks the terminal is listed, its shell is alive and its counter went up
+- cleans up: the app's `--uninstall` (daemon.stop, the login entry, Start menu and Settings ▸
+  Apps entries, the CLI copy and the install folder), then ends anything still running from the
+  test folders by pid, removes any entry that was left (the toast app id and click handler class
+  `--uninstall` leaves too), the test home and the server, and warns if Midna Dev's toast class
+  changed
+
+The test build's window opens hidden; the copy the update helper starts is shown, without
+taking focus.
+
 ## Checklist
 
 - [ ] `CHANGELOG.md`: `## Unreleased` renamed to the version; `cargo test` green

@@ -44,7 +44,7 @@ struct Toast {
     play: Option<(String, u8)>,
 }
 
-/// The app's rule: Midna Dev and debug builds use Midna Dev's id.
+/// The app's rule: Midna Dev and debug builds use Midna Dev's id (a test build its own).
 fn dev() -> bool {
     midna_proto::paths::is_dev() || cfg!(debug_assertions)
 }
@@ -176,7 +176,7 @@ fn register(home: &Path) {
         return;
     }
     let (name, png): (&str, &[u8]) = if dev() {
-        ("Midna Dev", include_bytes!("../../../packaging/assets/MidnaDev.png"))
+        (if midna_proto::paths::TEST_BUILD { "Midna Test" } else { "Midna Dev" }, include_bytes!("../../../packaging/assets/MidnaDev.png"))
     } else {
         ("Midna", include_bytes!("../../../packaging/assets/Midna.png"))
     };
