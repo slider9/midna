@@ -1,5 +1,7 @@
 //! `midna`: the CLI for agents and humans. Every verb maps to a catalog method; `midna call`
 //! reaches any method directly. Exit codes: 0 ok, 1 refused/failed, 2 bad args, 3 daemon unreachable.
+#[cfg(windows)]
+mod admit_wait;
 mod args;
 mod guide;
 mod help;
@@ -71,6 +73,11 @@ fn main() {
     // `claude` in a midna shell: every argument is Claude's, so none are parsed here.
     if raw.first().map(String::as_str) == Some("shim") {
         shim::run(&raw[1..]);
+    }
+    // Windows: a held agent terminal's process (midnad `admit.rs`). Not in the help: only midnad runs it.
+    #[cfg(windows)]
+    if raw.first().map(String::as_str) == Some("admit-wait") {
+        admit_wait::run(&raw[1..]);
     }
     // Windows: midnad's `claude.exe` and `codex.exe` shims are this binary under another name.
     #[cfg(windows)]

@@ -25,8 +25,9 @@ for a in "$@"; do
 done
 
 nice -n 10 cargo test ${scope[@]+"${scope[@]}"} ${cargo_args[@]+"${cargo_args[@]}"} --no-run
-# Windows terminals run in the keeper, midna-pty.exe, which a test's midnad finds beside the
-# test binaries; cargo builds another package's binary only when asked.
+# Windows terminals run in the keeper, midna-pty.exe, and a held agent waits in midna.exe
+# (`midna admit-wait`), which a test's midnad finds beside the test binaries; cargo builds
+# another package's binary only when asked.
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
     profile=()
@@ -34,7 +35,7 @@ case "$(uname -s)" in
       [ "$a" = "--" ] && break
       [ "$a" = "--release" ] && profile=(--release)
     done
-    nice -n 10 cargo build -p midna-pty --bin midna-pty ${profile[@]+"${profile[@]}"}
+    nice -n 10 cargo build -p midna-pty --bin midna-pty -p midna-cli --bin midna ${profile[@]+"${profile[@]}"}
     ;;
 esac
 if command -v lockf >/dev/null 2>&1; then

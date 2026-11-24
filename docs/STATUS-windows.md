@@ -12,7 +12,9 @@ Needs (installed by hand):
 - Rust stable, `x86_64-pc-windows-msvc` (tested with 1.99.1, via rustup-init x64)
 - Visual Studio Build Tools: MSVC and a Windows SDK (tested with MSVC 14.51, SDK 10.0.26100)
 - Zig **0.15.2** unpacked to `.toolchain/zig/` in the main checkout (libghostty-vt)
-- Git for Windows: Git Bash is the build shell, and midna uses its `bash.exe` as the POSIX `sh`
+- Git for Windows: Git Bash is the build shell, and the tests use its `bash.exe` as the POSIX
+  `sh`. Build and tests only: an installed midna runs nothing through it, so a PC without Git
+  runs it too
 - Python 3 as `python` (tests only: the fake agents in `crates/midnad/tests`)
 - Microsoft's newer ConPTY in `.toolchain/conpty/`: `scripts/setup-conpty.sh` downloads the
   pinned `Microsoft.Windows.Console.ConPTY` from nuget.org and checks it, or takes a `.nupkg` you
@@ -208,6 +210,7 @@ would build them in with `\r\n`.
 | Shell integration | zsh (`ZDOTDIR`), bash (`--init-file`) and fish (`XDG_DATA_DIRS`) run midna's startup file: shims kept first on PATH, `claude`/`codex` aliases routed through them; zsh marks its prompt (OSC 133) | **PowerShell** (5.1 and 7) starts with `-NoExit -EncodedCommand`, a command that runs `shell/powershell/midna.ps1` after the profiles (no execution policy applies to it). Its wrapper around the user's prompt keeps the shims first, makes PowerShell's location the process's working folder (`Set-Location` never changes it, and midna reads a terminal's folder from there), and marks the prompt and input (OSC 133 A, B). With PSReadLine, Enter marks the output (C) unless the command is unfinished. ConPTY on Windows 10 passes a mark on at once but text on its next paint, so a mark written with text arrives ahead of it: each mark is written on its own, after a 15 ms pause. **Git Bash** gets `init.bash` as bash does on macOS (matched by program name, `bash.exe`), with `MIDNA_SHIMS` turned into a `/c/…` path by `cygpath`. Like bash on macOS it has no marks. Its `cd` moves the process's folder. **cmd**: the shims are first on PATH at start, and `cd` moves the folder |
 | In-place upgrade / restart | exec with the same pid, terminals kept | a new midnad takes every terminal over from its keeper, so the pid changes; terminals kept (`upgrade_windows.rs`) |
 | Agents' config folders | `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, else `~/.claude` / `~/.codex` under `$HOME` | the same, with `~` as `%USERPROFILE%` (`paths::home_var`, as everywhere midna expands `~/`). A midnad started at login has no `HOME` (Git Bash sets one, Windows doesn't), and it looked for a relative `.claude`, so Settings ▸ Agents said Claude Code wasn't set up |
+| Held agent (`guard.hold_agents_at`) | a `sh -c` wrapper waits for its go file, then execs the agent | `midna.exe admit-wait GO MSG -- AGENT…` waits, then runs the agent as its child; midnad counts it started once it has a child (`admit::waiting`), or, for a Git Bash wrapper an older build left running, once its `.started` mark appears |
 | Codex `notify` | `sh -c` wrapper chains the previous notify | `midna.exe hook codex notify [--global] -- PREV…`; the CLI runs PREV with the payload |
 | Title bar | hidden; AppKit draws the traffic lights and drags by the top | hidden; `ui/caption.rs` draws a 32px row above each window: the caption (`WindowControlArea::Drag`: move, Snap, double-click) and minimise / maximise / close |
 | App icon and name | the bundle's `Midna.icns` and `CFBundleName` | `midna-app/build.rs` links in `packaging/assets/Midna.ico` (from `make-icon.py`; Midna Dev: `MidnaDev.ico`, inverted) as icon resource 1, where GPUI loads the window icon from, and a version resource whose `FileDescription` ("Midna", or "Midna Dev") is the name Task Manager and Startup apps show |
