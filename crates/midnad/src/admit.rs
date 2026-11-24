@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 
 /// The custom status a held terminal shows.
 pub const WAITING: &str = midna_proto::wording::os("Waiting for the Mac", "Waiting for the PC");
-/// The wrapper's `$0`: how a terminal still waiting is told from one whose agent runs.
-#[cfg(unix)]
+/// The wrapper's `$0`: how a terminal still waiting is told from one whose agent runs. On
+/// Windows it marks a Git Bash wrapper an older midnad started (see [`waiting`]).
 const WRAPPER: &str = "midna-wait";
 const TICK: Duration = Duration::from_secs(2);
 /// Least time between two terminals starting from the line.
@@ -177,18 +177,25 @@ pub fn start(d: &Arc<Daemon>) {
     });
 }
 
-/// Whether the terminal's process `pid` is still the wrapper waiting for its go file.
+/// Whether the terminal's process `pid` is still the wrapper waiting for its go file `go`.
 #[cfg(unix)]
-fn waiting(pid: Option<i32>) -> bool {
+fn waiting(_go: &std::path::Path, pid: Option<i32>) -> bool {
     pid.and_then(crate::procs::command_line).is_some_and(|c| c.split(' ').any(|a| a == WRAPPER))
 }
 
 /// Windows: it runs and hasn't started the agent, its only child (there's no exec, so its
 /// command line never changes). A child is a process started since the wrapper was: one whose
 /// parent had that pid before it is older.
+///
+/// A held terminal can outlive an upgrade, and older builds held it in a Git Bash `sh -c`
+/// wrapper (`$0` [`WRAPPER`]) whose `sleep` loop has children while it waits. That one left
+/// `<go file>.started` before it ran the agent, so that mark still tells for it.
 #[cfg(windows)]
-fn waiting(pid: Option<i32>) -> bool {
+fn waiting(go: &std::path::Path, pid: Option<i32>) -> bool {
     let Some(pid) = pid.filter(|&p| crate::sys::alive(p)) else { return false };
+    if crate::procs::command_line(pid).is_some_and(|c| c.split(' ').any(|a| a == WRAPPER)) {
+        return !go.with_extension("started").exists();
+    }
     let Some(born) = crate::procs::start_time(pid) else { return false };
     let snap = crate::procs::snapshot();
     !snap.iter().any(|(&c, &(parent, _))| parent == pid && c != pid && crate::procs::start_time(c).is_some_and(|t| t >= born))
@@ -207,7 +214,7 @@ fn tick(d: &Daemon) {
     for (sid, pid) in pids {
         match pid {
             None => leave(d, &sid, None),
-            Some(pid) if !waiting(pid) => leave(d, &sid, Some("started")),
+            Some(pid) if !waiting(&go_file(d, &sid), pid) => leave(d, &sid, Some("started")),
             _ => {}
         }
     }
@@ -236,6 +243,9 @@ fn tick(d: &Daemon) {
 fn leave(d: &Daemon, sid: &str, why: Option<&str>) {
     d.core().state.admit_line.retain(|s| s != sid);
     d.mark_dirty();
+    // An older build's Git Bash wrapper's mark (see `waiting`).
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(go_file(d, sid).with_extension("started"));
     let Some(why) = why else {
         let _ = std::fs::remove_file(go_file(d, sid));
         return;
@@ -296,7 +306,7 @@ mod tests {
             .unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert!(child.try_wait().unwrap().is_none(), "it waits");
-        assert!(waiting(Some(child.id() as i32)));
+        assert!(waiting(&go, Some(child.id() as i32)));
         std::fs::write(&go, b"").unwrap();
         assert!(child.wait().unwrap().success());
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "ran a b\n");
@@ -305,27 +315,42 @@ mod tests {
     }
 
     /// Windows: the wrapper is `midna admit-wait` (`tests/admit.rs` runs it), and it waits until
-    /// it has a child, the agent.
+    /// it has a child, the agent. An older build's Git Bash wrapper waits until its mark.
     #[cfg(windows)]
     #[test]
     fn a_wrapper_waits_until_it_starts_a_child() {
-        use std::process::{Command, Stdio};
+        use std::process::{Child, Command, Stdio};
         let v = wrapper(r"C:\m\midna.exe", r"C:\h\admit\s1".into(), "msg".into());
         assert_eq!(v, [r"C:\m\midna.exe", "admit-wait", r"C:\h\admit\s1", "msg", "--"]);
+        let dir = std::env::temp_dir().join(format!("midna-admit-win-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let go = dir.join("go");
+        // `cmd /c ping …` (and its words after), once cmd has started ping.
+        let with_child = |more: &[&str]| -> (Child, i32) {
+            let p = Command::new("cmd").args(["/c", "ping", "-n", "30", "127.0.0.1", ">nul"]).args(more).spawn().unwrap();
+            let pid = p.id() as i32;
+            let c = (0..50).find_map(|_| {
+                std::thread::sleep(Duration::from_millis(100));
+                crate::procs::snapshot().into_iter().find(|&(_, (parent, _))| parent == pid).map(|(c, _)| c)
+            });
+            (p, c.expect("cmd started ping"))
+        };
         let mut alone = Command::new("ping").args(["-n", "30", "127.0.0.1"]).stdout(Stdio::null()).spawn().unwrap();
-        assert!(waiting(Some(alone.id() as i32)), "no child yet");
-        let mut parent = Command::new("cmd").args(["/c", "ping -n 30 127.0.0.1 >nul"]).spawn().unwrap();
-        let pid = parent.id() as i32;
-        let child = (0..50).find_map(|_| {
-            std::thread::sleep(Duration::from_millis(100));
-            crate::procs::snapshot().into_iter().find(|&(_, (p, _))| p == pid).map(|(c, _)| c)
-        });
-        assert!(child.is_some(), "cmd started ping");
-        assert!(!waiting(Some(pid)), "its agent runs");
-        assert!(!waiting(None), "closed");
-        if let Some(c) = child {
+        assert!(waiting(&go, Some(alone.id() as i32)), "no child yet");
+        let (mut runs, runs_child) = with_child(&[]);
+        assert!(!waiting(&go, Some(runs.id() as i32)), "its agent runs");
+        assert!(!waiting(&go, None), "closed");
+        // The old wrapper's `sleep` is a child too; only its mark says the agent started.
+        let (mut old, old_child) = with_child(&["&", "echo", WRAPPER]);
+        assert!(waiting(&go, Some(old.id() as i32)), "an old wrapper with a child still waits");
+        std::fs::write(go.with_extension("started"), b"").unwrap();
+        assert!(!waiting(&go, Some(old.id() as i32)), "its mark says it started");
+        for c in [runs_child, old_child] {
             crate::sys::signal(c, crate::sys::Sig::Kill);
         }
-        let _ = (alone.kill(), parent.kill(), alone.wait(), parent.wait());
+        for p in [&mut alone, &mut runs, &mut old] {
+            let _ = (p.kill(), p.wait());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
