@@ -5,8 +5,12 @@
 # com.mrgnhnt.midna.test, listed as "Midna Test", its home built in under %TEMP%, installed to a
 # folder under %TEMP%), so neither the installed Midna nor Midna Dev is touched. Signs their feed
 # entries with the dev update key (packaging/gen-update-key.sh makes it if it's missing) and serves
-# windows-beta.json and the zips from 127.0.0.1. Installs v1, starts it, and opens a terminal
-# running a PowerShell loop that prints a counter. Then:
+# windows-beta.json and the zips from 127.0.0.1. Installs v1 the way a person does: runs it from
+# an unpacked copy elsewhere (its files marked as Explorer's Extract All marks a downloaded zip's),
+# which copies itself into the install folder (MIDNA_INSTALL_DIR, the test build's stand-in for
+# %LOCALAPPDATA%\Programs\Midna Test) without the marks, starts that copy and exits; running it
+# again only brings the installed copy to the front. Then it opens a terminal running a PowerShell
+# loop that prints a counter, and:
 #
 #   1. A bad build: the feed offers v2, but its zip holds v1, whose midnad --selftest reports the
 #      wrong version. v1 refuses it at staging and keeps running.
@@ -15,6 +19,7 @@
 #      helper starts v1 again, which says why.
 #   3. The file is let go and v1 applies v2 for real: v2 starts, the daemon hands every terminal to
 #      v2's midnad, and the terminal keeps its id, its shell and its counter.
+#   4. The unpacked v1 is run again: v2 is installed, so it refuses and changes nothing.
 #
 # After each step the daemon, the terminal, its shell and the counter are checked. Then everything
 # is cleaned up: the app's --uninstall (daemon.stop, the login entry, Start menu and Settings > Apps
@@ -33,7 +38,7 @@ for a in "$@"; do
   case "$a" in
     --no-build) BUILD=0 ;;
     --keep) KEEP=1 ;;
-    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
     *) echo "update-e2e-windows.sh: unknown option $a" >&2; exit 2 ;;
   esac
 done
@@ -46,6 +51,7 @@ TH_U="$TMP_U/mdt-e2e"                    # the test home (short: AF_UNIX paths a
 TH="$(cygpath -w "$TH_U")"
 DEST_ROOT="$TMP_U/mdt-e2e-app"
 DEST="$DEST_ROOT/$NAME"                  # the install folder
+UNPACKED="$DEST_ROOT/Downloads/Midna-windows/$NAME"  # v1 as a person unpacks it
 APP="$DEST/midna-app.exe"
 PORT="" FEED=""                          # a free port, picked once Python is known
 KEY_DIR="$HOME/.config/midna-dev"
@@ -112,11 +118,26 @@ mark_log() { LOG_MARK="$(wc -l < "$TH_U/app.log")"; }
 new_log_has() { tail -n +"$((LOG_MARK + 1))" "$TH_U/app.log" 2>/dev/null | grep -q -- "$1"; }
 leftovers() { find "$DEST" \( -name '*.old' -o -name '*.new' -o -name midna-update-leftovers.txt \) 2>/dev/null; }
 
-start_app() {
-  # Hidden and without taking focus. Its environment is this script's: the helper that applies an
-  # update, and the app that helper starts, inherit it.
-  powershell.exe -NoProfile -NonInteractive -Command "Start-Process -FilePath '$(cygpath -w "$APP")' -WorkingDirectory '$(cygpath -w "$DEST")' -WindowStyle Hidden"
+# Start the unpacked copy as a person's double-click does once SmartScreen let it run. Its
+# environment is this script's: the installed copy it starts, the helper that applies an update
+# and the app that helper starts inherit it (MIDNA_NO_ACTIVATE: no focus taken). Not through
+# Start-Process: Explorer's ShellExecute checks a marked, unsigned exe first, and with nobody to
+# click "Run anyway" that fails ("The operation was canceled by the user").
+start_unpacked() { ( cd "$UNPACKED" && ./midna-app.exe >/dev/null 2>&1 & ); }
+# Mark every file under $1 as downloaded (the Zone.Identifier stream Extract All writes), and
+# list the files under $1 that carry one.
+mark_web() {
+  powershell.exe -NoProfile -NonInteractive -Command "Get-ChildItem -LiteralPath '$(cygpath -w "$1")' -Recurse -File | ForEach-Object { Set-Content -LiteralPath \$_.FullName -Stream Zone.Identifier -Value \"[ZoneTransfer]\`r\`nZoneId=3\" }"
 }
+web_marked() {
+  powershell.exe -NoProfile -NonInteractive -Command "Get-ChildItem -LiteralPath '$(cygpath -w "$1")' -Recurse -File | Where-Object { Get-Item -LiteralPath \$_.FullName -Stream Zone.Identifier -ErrorAction SilentlyContinue } | ForEach-Object { \$_.Name }" | tr -d '\r'
+}
+install_unmarked() { [ -z "$(web_marked "$DEST")" ]; }
+unpacked_marked() { [ -n "$(web_marked "$UNPACKED")" ]; }
+unpacked_idle() { [ -z "$(pids_under "$UNPACKED" midna-app)" ]; }
+# What the Settings > Apps entry and the login entry name.
+apps_location() { MSYS2_ARG_CONV_EXCL='*' reg.exe query "$APPS_KEY" /v InstallLocation 2>/dev/null | tr -d '\r' | sed -n 's/.*REG_SZ *//p'; }
+run_command() { MSYS2_ARG_CONV_EXCL='*' reg.exe query "$RUN_KEY" /v "$NAME" 2>/dev/null | tr -d '\r' | sed -n 's/.*REG_SZ *//p'; }
 
 # What must hold after every step: one daemon, the terminal with its shell, and a counter that
 # went on from where it was.
@@ -216,24 +237,44 @@ if ! wait_for 10 "[ \"\$(curl -sf http://127.0.0.1:$PORT/token.txt | tr -d '\r')
 fi
 ok "feed server up on 127.0.0.1:$PORT"
 
-say "install $V1 to $(cygpath -w "$DEST")"
-rm -rf "$TH_U" "$DEST_ROOT"; mkdir -p "$TH_U" "$DEST_ROOT"
-cp -R "$WORK/$V1/$NAME" "$DEST"
+say "install $V1: run it from $(cygpath -w "$UNPACKED")"
+rm -rf "$TH_U" "$DEST_ROOT"; mkdir -p "$TH_U" "$(dirname "$UNPACKED")"
+cp -R "$WORK/$V1/$NAME" "$UNPACKED"
+mark_web "$UNPACKED"
+check "the unpacked files are marked as downloaded" unpacked_marked
 # Straight to the terminal, past the first-run setup.
 echo '{"onboarding":{"finished":true}}' > "$TH_U/app-state.json"
-export MIDNA_UPDATE_FEED_URL="$FEED" MIDNA_UPDATE_CHECK_SECS=6 MIDNA_DEBUG_UPDATE=apply MIDNA_NO_ACTIVATE=1
-start_app
-check "app $V1 started" "wait_for 30 '[ -n \"\$(app_pids)\" ]'"
+MIDNA_INSTALL_DIR="$(cygpath -w "$DEST")"
+export MIDNA_INSTALL_DIR MIDNA_UPDATE_FEED_URL="$FEED" MIDNA_UPDATE_CHECK_SECS=6 MIDNA_DEBUG_UPDATE=apply MIDNA_NO_ACTIVATE=1
+start_unpacked
+check "it copied itself into $(cygpath -w "$DEST")" "wait_for 30 '[ \"\$(installed_version)\" = \"$V1\" ]'"
+check "app $V1 started from the install" "wait_for 30 '[ -n \"\$(app_pids)\" ]'"
+check "and not from the unpacked folder" "wait_for 10 unpacked_idle"
+check "the installed copy says where it is" "wait_for 30 'log_has \"$V1 is installed in\"'"
+check "the installed files carry no Mark of the Web" install_unmarked
+check "the unpacked folder keeps its mark" unpacked_marked
 check "first launch installed midnad into the test home" "wait_for 30 'cli_path >/dev/null'"
 check "daemon up" "wait_for 30 'cli info >/dev/null 2>&1'"
 check "login entry \"$NAME\" written" "reg_has '$RUN_KEY' /v '$NAME'"
 check "Start menu and Settings > Apps entries are the test build's" "[ -f '$LNK' ] && reg_has '$APPS_KEY'"
+check "Settings > Apps and the login entry name the install folder" "[ \"\$(apps_location)\" = '$MIDNA_INSTALL_DIR' ] && run_command | grep -qF '$MIDNA_INSTALL_DIR\midna-app.exe'"
 check "toasts registered under the test build's own app id and class" "wait_for 10 \"reg_has '$TOAST_KEY' && reg_has '$TOAST_CLASS_KEY'\""
 check "Midna Dev's toast class untouched" "[ \"\$(dev_toast_server)\" = \"\$DEV_TOAST0\" ]"
 INFO0="$(cli info --json)"; echo "  $INFO0" | head -c 400; echo
 D_PID0="$(echo "$INFO0" | json "v['pid']")"
 check "daemon reports $V1" "[ \"\$(echo '$INFO0' | json \"v['version']\")\" = '$V1' ]"
 check "daemon runs from the test home" "echo '$INFO0' | grep -qi 'mdt-e2e'"
+APP_PID0="$(app_pids)"
+mark_log
+start_unpacked
+check "running the unpacked $V1 again brings the installed one to the front" "wait_for 20 'new_log_has \"launch: another launch handed over\"'"
+check "the same app runs (pid $APP_PID0)" "wait_for 10 unpacked_idle && [ \"\$(app_pids)\" = '$APP_PID0' ]"
+# As its login entry, a toast click or the Start menu start it: without MIDNA_INSTALL_DIR it
+# still takes its registered folder, rather than moving into Programs.
+PROGRAMS_DIR="$(cygpath -u "$LOCALAPPDATA")/Programs/$NAME"
+mark_log
+( cd "$DEST" && env -u MIDNA_INSTALL_DIR ./midna-app.exe >/dev/null 2>&1 & )
+check "started without MIDNA_INSTALL_DIR, the installed copy stays where it is" "wait_for 20 'new_log_has \"launch: another launch handed over\"' && ! new_log_has 'launch from' && [ ! -e '$PROGRAMS_DIR' ] && [ \"\$(app_pids)\" = '$APP_PID0' ]"
 cli settings set updates.channel beta >/dev/null || bad "set updates.channel beta"
 # The upgrade waits while the PC is busy; a test run shouldn't.
 cli settings set system.busy_load 2000 >/dev/null 2>&1 || echo "  (system.busy_load not raised: a busy PC may postpone the daemon upgrade)"
@@ -295,6 +336,12 @@ SCREEN="$(cli read "$SID" --screen 2>/dev/null)"
 check "the screen still shows ticks from before the update" "echo \"\$SCREEN\" | grep -q 'tick-'"
 check "exactly one app process" "one_app"
 check "the old files are cleared from the install" "wait_for 20 '[ -z \"\$(leftovers)\" ]'"
+say "4. the unpacked $V1 is run again, with $V2 installed"
+APP_PID1="$(app_pids)"
+mark_log
+start_unpacked
+check "it refuses: $V2 is newer" "wait_for 20 'new_log_has \"$V2 is already installed in\"'"
+check "the install is still $V2 and the same app runs (pid $APP_PID1)" "wait_for 10 unpacked_idle && [ \"\$(installed_version)\" = '$V2' ] && [ \"\$(app_pids)\" = '$APP_PID1' ]"
 echo "  app.log:"; sed 's/^/    /' "$TH_U/app.log"
 echo "  midnad.log (last 15):"; tail -n 15 "$TH_U/midnad.log" 2>/dev/null | sed 's/^/    /'
 

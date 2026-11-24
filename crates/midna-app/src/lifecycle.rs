@@ -67,6 +67,9 @@ enum Msg {
     DaemonPostponed { load: Option<midna_proto::SystemLoad>, ask: bool },
     /// Windows: the daemon restarts onto the installed build once these agents are idle.
     DaemonWaiting(Option<Vec<String>>),
+    /// Windows: one line for the main window, once (a newly installed build says where it is).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Note(String),
     Quit,
 }
 
@@ -154,6 +157,9 @@ pub fn start(backend: Arc<dyn Backend>, cx: &mut App) {
                     return;
                 }
                 let is_update = matches!(msg, Msg::Update(_));
+                if let Msg::Note(line) = &msg {
+                    show_note(line.clone(), cx);
+                }
                 if let Msg::DaemonPostponed { load, ask } = &msg {
                     use crate::ui::system_window::{self as sw, Kind};
                     match load {
@@ -170,7 +176,7 @@ pub fn start(backend: Arc<dyn Backend>, cx: &mut App) {
                     Msg::DaemonUpgrade(e) => l.daemon_upgrade_error = e,
                     Msg::DaemonPostponed { load, .. } => l.daemon_postponed = load,
                     Msg::DaemonWaiting(w) => l.daemon_waiting = w,
-                    Msg::Quit => {}
+                    Msg::Note(_) | Msg::Quit => {}
                 });
                 if is_update && !fake {
                     report_updates(reporter.clone());
@@ -325,6 +331,23 @@ fn waiting_for(v: &Value) -> Option<Vec<String>> {
     Some(names.unwrap_or_default())
 }
 
+/// Show `line` in the main window's toast, once one is open (the first may not be yet).
+fn show_note(line: String, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        for _ in 0..80 {
+            let shown = cx.update(|cx| {
+                let Some(w) = cx.windows().into_iter().find_map(|w| w.downcast::<crate::app::MainWindow>()) else { return false };
+                w.update(cx, |m, _, cx| m.toast_for(line.clone(), Duration::from_secs(12), cx)).is_ok()
+            });
+            if shown {
+                return;
+            }
+            cx.background_executor().timer(Duration::from_millis(250)).await;
+        }
+    })
+    .detach();
+}
+
 pub fn log(msg: &str) {
     eprintln!("midna-app: {msg}");
     let home = midna_proto::paths::midna_home();
@@ -364,6 +387,12 @@ impl Worker {
         // says why (its helper put the old build back and started it).
         #[cfg(windows)]
         let apply_failed = crate::update_windows::after_update(bundle, &home);
+        // Windows: the first launch after a launch from elsewhere installed this build here.
+        #[cfg(windows)]
+        if let Some(line) = install::take_install_note(bundle) {
+            log(&line);
+            self.send(Msg::Note(line));
+        }
         // 1. the stable daemon binary
         match install::install_daemon(bundle, &home) {
             Ok(_) => self.send(Msg::Install(None)),

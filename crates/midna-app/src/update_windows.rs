@@ -112,7 +112,7 @@ fn find_bundle(dir: &Path) -> Result<PathBuf, String> {
 }
 
 /// The version `midnad --selftest` reports (bounded by [`SELFTEST_TIMEOUT`]).
-fn selftest_version(midnad: &Path) -> Result<String, String> {
+pub fn selftest_version(midnad: &Path) -> Result<String, String> {
     let mut cmd = Command::new(midnad);
     cmd.arg("--selftest").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     crate::install::detach(&mut cmd);
@@ -223,13 +223,15 @@ pub fn swap_in(new: &Path, install: &Path) -> Result<(), String> {
     for rel in &files {
         let to = install.join(rel);
         let copy = suffixed(&to, ".new");
-        let r = (|| {
+        let r = (|| -> std::io::Result<()> {
             midna_proto::paths::guard_write(&to)?;
             if let Some(dir) = to.parent() {
                 std::fs::create_dir_all(dir)?;
             }
             let _ = std::fs::remove_file(&copy);
-            std::fs::copy(new.join(rel), &copy).map(|_| ())
+            std::fs::copy(new.join(rel), &copy)?;
+            drop_web_mark(&copy);
+            Ok(())
         })();
         if let Err(e) = r {
             let _ = std::fs::remove_file(&copy);
@@ -272,6 +274,18 @@ fn note_leftovers(install: &Path, olds: &[PathBuf]) -> std::io::Result<()> {
         }
     }
     write_list(&list, &lines)
+}
+
+/// Take the Mark of the Web (the `Zone.Identifier` stream) off a file copied into the install.
+/// Explorer's Extract All marks every file of a downloaded zip, and a copy keeps the mark, so
+/// without this the installed `midna-app.exe` would go through SmartScreen again when the Start
+/// menu starts it, after the person already ran this very build from the zip. Only the copy in
+/// the install loses it; the zip and the folder unpacked from it keep theirs. (A downloaded
+/// update has none: the updater writes it itself, after checking the feed's signature.)
+fn drop_web_mark(file: &Path) {
+    let mut stream = file.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    let _ = std::fs::remove_file(stream);
 }
 
 /// Write `lines` to `list`, or remove it when there are none.
@@ -443,8 +457,34 @@ fn record_failure(error: &str) {
 
 /// What a Midna build's folder holds (`packaging/build-windows.sh`), besides the marker and the
 /// `Fonts` folder. Only these are removed, so a build unpacked among other files takes only its
-/// own away.
+/// own away, and a folder holding anything else isn't installed from (`install::place`). A file
+/// the build gains must be added here.
 const BUILD_FILES: [&str; 7] = [APP_EXE, "midnad.exe", "midna.exe", "midna-pty.exe", "conpty.dll", "OpenConsole.exe", "ConPTY-LICENSE.txt"];
+
+/// What in `dir` (a build to install from) isn't the build's: anything but [`BUILD_FILES`], the
+/// marker and font files in `Fonts`. An update's leftovers count as someone else's too: the
+/// whole folder is copied. Names relative to `dir`.
+pub fn not_the_build(dir: &Path) -> Result<Vec<String>, String> {
+    let is_font_file = |n: &str| is_font_file(n) && leftover_of(n).is_none();
+    let is_build_file = |n: &str| BUILD_FILES.contains(&n) || n == BUNDLE_MARKER;
+    let mut others = vec![];
+    for e in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+        if is_dir && name == "Fonts" {
+            for f in std::fs::read_dir(e.path()).into_iter().flatten().flatten() {
+                let fname = f.file_name().to_string_lossy().to_string();
+                if !f.file_type().is_ok_and(|t| t.is_file()) || !is_font_file(&fname) {
+                    others.push(format!("Fonts\\{fname}"));
+                }
+            }
+        } else if is_dir || !is_build_file(&name) {
+            others.push(name);
+        }
+    }
+    others.sort();
+    Ok(others)
+}
 
 /// After `--uninstall` exits, take the build in `install` away: a copy of this executable in
 /// `%TEMP%` waits for this process and removes it (an executable can't delete the folder it runs
@@ -886,6 +926,59 @@ mod tests {
         // Never a folder without the marker.
         assert!(remove_install(&downloads).unwrap_err().contains("isn't an installed Midna"));
         assert_eq!(names(&downloads), ["Fonts", "report.old", "report.pdf", "tool.exe.new"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn web_mark(p: &Path) -> Option<String> {
+        let mut stream = p.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        std::fs::read_to_string(stream).ok()
+    }
+
+    fn mark(p: &Path) {
+        let mut stream = p.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        std::fs::write(stream, "[ZoneTransfer]\r\nZoneId=3\r\n").unwrap();
+    }
+
+    #[test]
+    fn an_install_into_an_empty_folder_drops_the_web_mark_from_its_copies() {
+        // Explorer's Extract All marks every file it unpacks from a downloaded zip, and a plain
+        // copy keeps the mark.
+        let d = scratch("mark");
+        let (zip, dest) = (d.join("Downloads").join("Midna"), d.join("Programs").join("Midna"));
+        build(&zip, &NEW, "v2");
+        for f in files_of(&zip).unwrap() {
+            mark(&zip.join(f));
+        }
+        std::fs::copy(zip.join("midnad.exe"), d.join("copied.exe")).unwrap();
+        assert!(web_mark(&d.join("copied.exe")).is_some_and(|m| m.contains("ZoneId=3")), "std::fs::copy keeps the mark");
+        swap_in(&zip, &dest).unwrap();
+        for (rel, text) in NEW {
+            assert_eq!(read(&dest.join(rel)), text, "{rel}");
+            assert_eq!(web_mark(&dest.join(rel)), None, "{rel}");
+            assert!(web_mark(&zip.join(rel)).is_some(), "the unpacked folder keeps its mark: {rel}");
+        }
+        assert_eq!(read(&dest.join(BUNDLE_MARKER)), "v2");
+        assert_eq!(web_mark(&dest.join(BUNDLE_MARKER)), None);
+        assert!(!dest.join(LEFTOVERS_FILE).exists(), "nothing was set aside");
+        assert_eq!(names(&dest), ["Fonts", "midna-app.exe", "midna-bundle.txt", "midna-pty.exe", "midnad.exe"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_folder_to_install_from_holds_only_the_build() {
+        let d = scratch("foreign");
+        let zip = d.join("Midna");
+        let own = [("midna-app.exe", ""), ("midnad.exe", ""), ("midna.exe", ""), ("midna-pty.exe", ""), ("conpty.dll", ""), ("OpenConsole.exe", ""), ("ConPTY-LICENSE.txt", ""), ("Fonts/a.ttf", ""), ("Fonts/OFL.txt", "")];
+        build(&zip, &own, "");
+        assert_eq!(not_the_build(&zip), Ok(vec![]));
+        for other in ["report.pdf", "midnad.exe.old", "Fonts/a.ttf.old", "Fonts/mine.psd", "Photos/x.jpg", LEFTOVERS_FILE] {
+            let p = zip.join(other);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "").unwrap();
+        }
+        assert_eq!(not_the_build(&zip).unwrap(), [r"Fonts\a.ttf.old", r"Fonts\mine.psd", "Photos", "midna-update-leftovers.txt", "midnad.exe.old", "report.pdf"]);
         let _ = std::fs::remove_dir_all(&d);
     }
 
