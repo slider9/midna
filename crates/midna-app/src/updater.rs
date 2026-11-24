@@ -119,11 +119,30 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
-pub fn fetch_feed(url: &str) -> Result<FeedEntry, String> {
-    let resp = agent().get(url).call().map_err(|e| format!("feed {url}: {e}"))?;
+/// The feed's entry. With `missing_ok`, None when the server has no such file (HTTP 404);
+/// without it, that's an error like any other.
+pub fn fetch_feed(url: &str, missing_ok: bool) -> Result<Option<FeedEntry>, String> {
+    let resp = match agent().get(url).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(404, _)) if missing_ok => return Ok(None),
+        Err(e) => return Err(format!("feed {url}: {e}")),
+    };
     let mut body = String::new();
     resp.into_reader().take(1 << 20).read_to_string(&mut body).map_err(|e| e.to_string())?;
-    serde_json::from_str(&body).map_err(|e| format!("feed {url}: {e}"))
+    serde_json::from_str(&body).map(Some).map_err(|e| format!("feed {url}: {e}"))
+}
+
+/// Whether a feed file that doesn't exist means there's nothing newer: on Windows' stable
+/// channel of the feed this build was made with (`template` is
+/// [`midna_proto::settings::DEFAULT_FEED_URL`]), which has no windows-stable.json until the
+/// first Windows build of a stable base is released. Anywhere else, a feed set by hand
+/// included, a missing feed is an error worth showing: it's likely a typo.
+pub fn missing_feed_is_current(template: &str, channel: &str) -> bool {
+    missing_feed_is_current_for(template, channel, std::env::consts::OS)
+}
+
+fn missing_feed_is_current_for(template: &str, channel: &str, os: &str) -> bool {
+    os == "windows" && channel == "stable" && template == midna_proto::settings::DEFAULT_FEED_URL
 }
 
 /// The keys in a list like `MIDNA_UPDATE_PUBKEY`: separated by commas or whitespace.
@@ -554,6 +573,46 @@ mod tests {
         assert_eq!(feed_url_for(t, "stable", "windows"), "https://h/releases/download/channels/windows-stable.json");
         assert_eq!(feed_url_for(t, "beta", "windows"), "https://h/releases/download/channels/windows-beta.json");
         assert_eq!(feed_url_for("http://127.0.0.1:8791/feed.json", "beta", "windows"), "http://127.0.0.1:8791/feed.json");
+    }
+
+    #[test]
+    fn only_windows_stable_takes_a_missing_feed_as_current() {
+        let built = midna_proto::settings::DEFAULT_FEED_URL;
+        assert!(missing_feed_is_current_for(built, "stable", "windows"));
+        assert!(!missing_feed_is_current_for(built, "beta", "windows"));
+        assert!(!missing_feed_is_current_for(built, "stable", "macos"));
+        assert!(!missing_feed_is_current_for(built, "beta", "macos"));
+        // A feed set by hand (updates.feed_url, MIDNA_UPDATE_FEED_URL) keeps the error: a typo.
+        assert!(!missing_feed_is_current_for("https://github.com/slider9/midan/releases/download/channels/{channel}.json", "stable", "windows"));
+    }
+
+    /// A server that answers each of `n` requests with `status` and `body`.
+    fn serve(n: usize, status: &'static str, body: &'static str) -> String {
+        use std::io::Write;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/channels/windows-stable.json", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for s in l.incoming().take(n) {
+                let mut s = s.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut s, &mut buf);
+                let _ = write!(s, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn a_missing_feed_is_none_only_when_allowed() {
+        let url = serve(2, "404 Not Found", "Not Found");
+        assert!(fetch_feed(&url, true).unwrap().is_none());
+        let e = fetch_feed(&url, false).unwrap_err();
+        assert!(e.contains("404"), "{e}");
+        // Any other failure stays an error.
+        let url = serve(1, "500 Internal Server Error", "x");
+        assert!(fetch_feed(&url, true).is_err());
+        let url = serve(1, "200 OK", r#"{"version":"0.1.1","url":"u","sha256":"ab","signature":"s"}"#);
+        assert_eq!(fetch_feed(&url, true).unwrap().unwrap().version, "0.1.1");
     }
 
     #[cfg(windows)]

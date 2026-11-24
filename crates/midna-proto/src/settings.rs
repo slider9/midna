@@ -610,9 +610,39 @@ pub const STATUS_ITEMS: &[&str] = &["daemon", "usage", "cache", "policy", "webho
 /// `theme`'s listed choices (any custom theme id is accepted too).
 pub const THEME_CHOICES: &[&str] = &["system", "twilight", "nord", "dracula", "gruvbox", "tokyo-night", "daylight", "solarized-light", "latte"];
 
-/// Where the app looks for updates by default: the manifests the release workflow
-/// (.github/workflows/release.yml) keeps on the `channels` GitHub release.
-pub const DEFAULT_FEED_URL: &str = "https://github.com/mrgnhnt96/midna/releases/download/channels/{channel}.json";
+/// Where the app looks for updates by default: the manifests a release workflow keeps on its
+/// repository's `channels` GitHub release. `MIDNA_DEFAULT_FEED_URL` at build time names that feed
+/// (release-windows.yml passes its own repository's); without it, upstream's (release.yml).
+pub const DEFAULT_FEED_URL: &str = match option_env!("MIDNA_DEFAULT_FEED_URL") {
+    Some(u) if !u.is_empty() => u,
+    _ => UPSTREAM_FEED_URL,
+};
+
+/// The feed upstream's release workflow (.github/workflows/release.yml) keeps.
+pub const UPSTREAM_FEED_URL: &str = "https://github.com/mrgnhnt96/midna/releases/download/channels/{channel}.json";
+
+/// `updates.channel` until the user picks one: beta on a Windows build whose own version is a
+/// beta (Windows betas are published only to windows-beta.json, so stable would never offer
+/// them their next build), else stable.
+pub const DEFAULT_CHANNEL: &str = if cfg!(windows) && is_beta(crate::VERSION) { "beta" } else { "stable" };
+
+/// A version with `-beta` in it (0.1.0-beta.58, 0.1.0-beta.58.w.1), the rule release-windows.yml
+/// picks its feeds by.
+pub const fn is_beta(version: &str) -> bool {
+    let (v, pat) = (version.as_bytes(), b"-beta");
+    let mut i = 0;
+    while i + pat.len() <= v.len() {
+        let mut j = 0;
+        while j < pat.len() && v[i + j] == pat[j] {
+            j += 1;
+        }
+        if j == pat.len() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
 
 pub static SETTINGS: &[SettingSpec] = &[
     s!("theme", en_path(THEME_CHOICES), S("system"), "appearance", false,
@@ -658,7 +688,8 @@ pub static SETTINGS: &[SettingSpec] = &[
         "The color for your own activity in Insights charts: a theme color (accent, work, need, ok, err, fg, dim) or #RRGGBB."),
     s!("insights.colors.waiting", en_other(CHART_COLORS), S("need"), "appearance", false,
         "The color for agents blocked on you in Insights charts: a theme color (accent, work, need, ok, err, fg, dim) or #RRGGBB."),
-    s!("updates.channel", en(&["stable", "beta"]), S("stable"), "general", false, "Which update channel midna follows."),
+    s!("updates.channel", en(&["stable", "beta"]), S(DEFAULT_CHANNEL), "general", false,
+        os("Which update channel midna follows.", "Which update channel midna follows. A beta build follows beta until you pick one.")),
     s!("windows.close_with_terminals", en(&["ask", "close", "move"]), S("ask"), "general", false,
         os("Closing a main window that still has terminals while another window of the same Mac is open: ask, close its terminals, or move them to that Mac's window you used last.", "Closing a main window that still has terminals while another main window is open: ask, close its terminals, or move them to the window you used last.")),
     s!("projects.empty_opens", en(&["terminal", "agent"]), S("agent"), "general", false,
@@ -983,6 +1014,21 @@ pub fn setting(key: &str) -> Option<&'static SettingSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn beta_versions_and_the_channel_default() {
+        for v in ["0.1.0-beta.58", "0.1.0-beta.58.w.1", "1.0.0-beta"] {
+            assert!(is_beta(v), "{v}");
+        }
+        for v in ["0.2.0", "0.2.0-w.1", "0.1.0-alpha.1", "beta", ""] {
+            assert!(!is_beta(v), "{v}");
+        }
+        let want = if cfg!(windows) && is_beta(crate::VERSION) { "beta" } else { "stable" };
+        assert_eq!(setting("updates.channel").unwrap().default.to_json(), serde_json::json!(want));
+        if option_env!("MIDNA_DEFAULT_FEED_URL").is_none() {
+            assert_eq!(DEFAULT_FEED_URL, UPSTREAM_FEED_URL);
+        }
+    }
 
     #[test]
     fn every_number_has_a_range() {

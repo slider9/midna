@@ -28,6 +28,9 @@
 # Env: MIDNA_UPDATE_PUBKEY, the update keys to compile in (base64 ed25519 public keys, separated by
 # commas or spaces; the release workflow sets the fork's). Without it, or with --dev-home but not
 # --test, the build never updates itself. Unlike build-app.sh, there's no default dev key.
+# MIDNA_DEFAULT_FEED_URL, the update feed compiled in as updates.feed_url's default ({channel}
+# becomes windows-<channel>; the release workflow sets its own repository's channels release).
+# Without it, upstream's (midna_proto::settings::UPSTREAM_FEED_URL).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"

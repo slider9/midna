@@ -194,13 +194,16 @@ PUBKEY="$(tr -d '[:space:]' < "$KEY_DIR/update-ed25519.pub")"
 DEV_TOAST0="$(dev_toast_server)"
 PORT="$("$PY" -c "import socket; s = socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1])" | tr -d '\r')"
 FEED="http://127.0.0.1:$PORT/{channel}.json"
+# Compiled in as updates.feed_url's default, the way release-windows.yml compiles in its own
+# repository's; the run itself reads $FEED (MIDNA_UPDATE_FEED_URL), so this one is never fetched.
+BUILT_FEED="https://midna-e2e.invalid/releases/download/channels/{channel}.json"
 trap cleanup EXIT
 
 if [ "$BUILD" = 1 ]; then
   for v in "$V2" "$V1"; do
     say "build $v (test flavor)"
     mkdir -p "$WORK/$v"
-    if ! MIDNA_UPDATE_PUBKEY="$PUBKEY" LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast packaging/build-windows.sh --version "$v" \
+    if ! MIDNA_UPDATE_PUBKEY="$PUBKEY" MIDNA_DEFAULT_FEED_URL="$BUILT_FEED" LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast packaging/build-windows.sh --version "$v" \
       --out "$WORK/$v" --name "$NAME" --target-dir "$ROOT/target/e2e" --dev-home "$TH" --test --dev-drivers > "$WORK/$v/build.log" 2>&1; then
       grep -E "^error|^build-windows\.sh:" "$WORK/$v/build.log" >&2 || tail -n 20 "$WORK/$v/build.log" >&2
       echo "the $v build failed (log: $WORK/$v/build.log)" >&2
@@ -275,6 +278,10 @@ PROGRAMS_DIR="$(cygpath -u "$LOCALAPPDATA")/Programs/$NAME"
 mark_log
 ( cd "$DEST" && env -u MIDNA_INSTALL_DIR ./midna-app.exe >/dev/null 2>&1 & )
 check "started without MIDNA_INSTALL_DIR, the installed copy stays where it is" "wait_for 20 'new_log_has \"launch: another launch handed over\"' && ! new_log_has 'launch from' && [ ! -e '$PROGRAMS_DIR' ] && [ \"\$(app_pids)\" = '$APP_PID0' ]"
+# Until the user picks one, a beta build follows beta and a stable one stable.
+case "$V1" in *-beta*) WANT_CHANNEL=beta ;; *) WANT_CHANNEL=stable ;; esac
+check "updates.channel defaults to $WANT_CHANNEL for $V1" "[ \"\$(cli settings get updates.channel | tr -d '\r')\" = '$WANT_CHANNEL' ]"
+check "updates.feed_url defaults to the feed the build compiled in" "[ \"\$(cli settings get updates.feed_url | tr -d '\r')\" = '$BUILT_FEED' ]"
 cli settings set updates.channel beta >/dev/null || bad "set updates.channel beta"
 # The upgrade waits while the PC is busy; a test run shouldn't.
 cli settings set system.busy_load 2000 >/dev/null 2>&1 || echo "  (system.busy_load not raised: a busy PC may postpone the daemon upgrade)"

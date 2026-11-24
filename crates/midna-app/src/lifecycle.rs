@@ -588,7 +588,7 @@ impl Worker {
             return UpdateState::Off("this build has no update key".into());
         };
         self.send(Msg::Update(UpdateState::Checking));
-        let channel = self.setting("updates.channel").unwrap_or_else(|| "stable".into());
+        let channel = self.setting("updates.channel").unwrap_or_else(|| midna_proto::settings::DEFAULT_CHANNEL.into());
         let template = crate::dev::var("MIDNA_UPDATE_FEED_URL")
             .ok()
             .filter(|s| !s.is_empty())
@@ -596,7 +596,10 @@ impl Worker {
             .unwrap_or_else(|| midna_proto::settings::DEFAULT_FEED_URL.into());
         let url = updater::feed_url(&template, &channel);
         let r = (|| -> Result<UpdateState, String> {
-            let e: FeedEntry = updater::fetch_feed(&url)?;
+            let Some(e): Option<FeedEntry> = updater::fetch_feed(&url, updater::missing_feed_is_current(&template, &channel))? else {
+                log(&format!("update check: no {url} yet, so nothing newer on {channel}"));
+                return Ok(UpdateState::UpToDate { at: Instant::now() });
+            };
             if !updater::check_entry(&e, midna_proto::VERSION, pubkey)? {
                 return Ok(UpdateState::UpToDate { at: Instant::now() });
             }

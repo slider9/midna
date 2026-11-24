@@ -154,6 +154,17 @@ A `windows-v` tag runs `.github/workflows/release-windows.yml`; a bare `v` tag r
      `windows-beta.json` (the newest of any, by `scripts/newest-version.py`). `stable.json` and
      `beta.json` are macOS's and stay as they are.
 
+**Feed and channel.** The build step compiles in `MIDNA_DEFAULT_FEED_URL`, this repository's
+`channels` release (`https://github.com/${{ github.repository }}/releases/download/channels/{channel}.json`),
+as `updates.feed_url`'s default, so an installed Windows Midna reads the fork's
+`windows-<channel>.json`; moving releases upstream changes the workflow, not the code. The
+setting and `MIDNA_UPDATE_FEED_URL` still override it; a build without the variable (macOS's
+`release.yml`, local builds) keeps upstream's feed. `updates.channel` defaults to `beta` on a
+Windows build whose own version has `-beta` in it, until the user picks a channel, since a
+build of a beta base is only ever in `windows-beta.json`. On `stable`, a missing
+`windows-stable.json` on the compiled-in feed (none until the first Windows build of a stable
+base) reads as up to date rather than an error; on a feed set by hand it stays an error.
+
 **Version.** A Windows version is the upstream version the fork last merged, which is what
 `Cargo.toml` says, plus a Windows counter:
 
@@ -302,7 +313,7 @@ up every terminal), unregisters the login item and removes our CLI link. It leav
 
 **Feed**: the setting `updates.feed_url` (human only; default
 `https://github.com/mrgnhnt96/midna/releases/download/channels/{channel}.json`, where `{channel}`
-is replaced by `updates.channel`, `stable` or `beta`; `midna_proto::settings::DEFAULT_FEED_URL`). `MIDNA_UPDATE_FEED_URL` overrides it (tests). The feed is one JSON object:
+is replaced by `updates.channel`, `stable` or `beta`; `midna_proto::settings::DEFAULT_FEED_URL`; a Windows release build has the fork's, see "Feed and channel" under Windows releases). `MIDNA_UPDATE_FEED_URL` overrides it (tests). The feed is one JSON object:
 
 ```json
 {

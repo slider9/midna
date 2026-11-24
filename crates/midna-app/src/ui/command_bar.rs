@@ -635,7 +635,7 @@ fn report_issue(m: &mut MainWindow, cx: &mut Context<MainWindow>) {
         }
     }
     let backend = m.backend.clone();
-    let known = (m.setting_str("updates.channel").unwrap_or_else(|| "stable".into()), m.sessions.len(), m.sessions.iter().filter(|s| s.agent.is_some()).count());
+    let known = (m.setting_str("updates.channel").unwrap_or_else(|| midna_proto::settings::DEFAULT_CHANNEL.into()), m.sessions.len(), m.sessions.iter().filter(|s| s.agent.is_some()).count());
     m.toast("Opening a new GitHub issue…", cx);
     cx.spawn(async move |this, cx| {
         let (channel, terminals, agent_count) = known;
