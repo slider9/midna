@@ -65,7 +65,9 @@ packaging/notarize.sh dist/<v>/Midna.app     # opt-in, uploads to Apple
 packaging/e2e/update-e2e.sh                  # full install + auto-update test (test bundle id, temp home)
 ```
 
-What happens on first launch of the packaged app:
+On Windows 10 and 11 (a beta port from the fork), unzip a release and run `midna-app.exe`; it installs itself into `%LOCALAPPDATA%\Programs\Midna`. See [`docs/INSTALL-windows.md`](docs/INSTALL-windows.md) for the download, the SmartScreen warning, the `midna` command, updates and uninstalling.
+
+What happens on first launch of the packaged macOS app:
 - It installs `midnad` into `MIDNA_HOME/bin/<version>`.
 - It registers the LaunchAgent through SMAppService.
 - It links the CLI into `~/.local/bin`.
