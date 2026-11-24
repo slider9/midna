@@ -290,6 +290,20 @@ pub fn adopt(d: &Arc<Daemon>, sid: &str, master: pty::Master, pid: i32, snap: &c
     run(d, sid, master, pid, true, Box::new(move |replies| Engine::restored(&snap, Some(replies))), title)
 }
 
+/// Windows: run a session again on the keeper a killed or crashed midnad left
+/// (`pty_recover_windows.rs`). Its engine starts as `vt` drawn on a blank `cols` x `rows`: the
+/// visible screen the keeper's console holds, as plain text, colours and the cursor.
+#[cfg(windows)]
+pub fn reattach(d: &Arc<Daemon>, sid: &str, master: pty::Master, pid: i32, cols: u16, rows: u16, vt: Vec<u8>) -> RtHandle {
+    let (cols, rows) = clamp_size(cols, rows);
+    let make: MakeEngine = Box::new(move |replies| {
+        let mut e = Engine::new(cols, rows, Some(replies));
+        e.feed(&vt, now_ns());
+        e
+    });
+    run(d, sid, master, pid, true, make, String::new())
+}
+
 /// Builds the engine on its own thread (libghostty's Terminal is !Send), given the session's
 /// input queue for its replies to the app.
 type MakeEngine = Box<dyn FnOnce(Sender<Vec<u8>>) -> Engine + Send>;

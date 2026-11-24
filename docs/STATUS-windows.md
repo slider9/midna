@@ -322,6 +322,16 @@ In rough order of how much they matter:
      shell by typing it again there. Whatever ran in a shell is lost, and a monitor isn't
      reopened. `daemon.upgraded` and a needs-you note say what was reopened. With Windows 10's
      own ConPTY an agent never looks idle (see above), so only `force` restarts.
+   - **A midnad that's killed or crashes** (`taskkill /F`) leaves each terminal running in its
+     keeper. The next one re-attaches to every keeper whose session is still open
+     (`pty_recover_windows.rs`): it drops what piled up in the output pipe, reads the visible
+     screen from the console (text, the 16 colours, underline, inverse and the cursor) into the
+     session's engine, and carries on. Scrollback, other colours, the alternate screen's flag and
+     modes an app asked for (mouse, kitty keys, bracketed paste) are lost until the app sets them
+     again, and output that came between the drain and the screen read can show twice until the
+     next change redraws it. A keeper whose session was closed is hung up; one the new midnad
+     can't attach to (it serves only `midnad.exe` from the home's `bin` or beside it) is ended,
+     and its session can be restarted. `daemon.started` lists the sessions re-attached.
 5. **App stubs.** Twilight, Kass composer, haptics and app link previews are missing. Commands that only exist on macOS (`sips`, `plutil`, `mdfind`, `xed`, `open -a`, `defaults`) do nothing. Notifications show as toasts, but:
    - Starting the app from a click after it quit (on the app's toast or midnad's) is registered by release builds, Midna and Midna Dev (`LocalServer32`), and hasn't been tried. Debug builds don't register it, so a click then does nothing, or starts Midna Dev, whose class they share. A dismissal while the app isn't running isn't reported.
    - A toast holds at most 5 buttons, so `notify send` with 6 loses the last one.

@@ -97,8 +97,13 @@ impl Bin {
 
     /// Start v1 in `home`, logging to daemon.log (appended to, for a second midnad).
     fn launch(home: &Path, load1: f64, env: &[(&str, String)]) -> Child {
+        Bin::launch_exe(home, &home.join(V1), load1, env)
+    }
+
+    /// Start the midnad at `exe` in `home`.
+    fn launch_exe(home: &Path, exe: &Path, load1: f64, env: &[(&str, String)]) -> Child {
         let log = std::fs::OpenOptions::new().create(true).append(true).open(home.join("daemon.log")).unwrap();
-        Command::new(home.join(V1))
+        Command::new(exe)
             .args(["--foreground", "--home"])
             .arg(&home)
             .env_remove("MIDNA_SOCKET")
@@ -899,12 +904,14 @@ fn a_stopped_midnad_leaves_no_keeper_console_host_or_shell_on_windows() {
     assert!(midna_pty::names::records(&d.home).is_empty(), "keeper records left: {:?}", midna_pty::names::records(&d.home));
 }
 
-/// A midnad that's killed leaves its keepers running, with shells no terminal shows. Until a new
-/// midnad can re-attach to them, it ends them, with what they started, and the sessions they
-/// held can be restarted.
+/// A midnad that's killed leaves its keepers running. A next one the keepers won't serve (here
+/// a copy of midnad.exe in a folder of its own: a keeper serves only `midnad.exe`, from the home's
+/// `bin` or beside it) can't
+/// re-attach to them, so it ends them, with what they started, and the sessions they held can be
+/// restarted. Re-attaching is `tests/crash_windows.rs`.
 #[cfg(windows)]
 #[test]
-fn a_killed_midnads_keepers_are_ended_by_the_next_and_its_terminals_restart_on_windows() {
+fn a_killed_midnads_keepers_the_next_cant_attach_to_are_ended_and_its_terminals_restart_on_windows() {
     let mut d = Bin::start();
     let mut c = d.human();
     let id = call(&mut c, "session.open", json!({ "kind": "shell", "cwd": common::tmp(), "command": ["cmd.exe"] }))["id"].as_str().unwrap().to_string();
@@ -920,6 +927,11 @@ fn a_killed_midnads_keepers_are_ended_by_the_next_and_its_terminals_restart_on_w
     });
     let records = midna_pty::names::records(&d.home);
     assert_eq!(records.len(), 1, "{records:?}");
+    // The next midnad hangs up a keeper whose session isn't in the state it loads.
+    wait_for(10, "state.json with the session", || {
+        let state: Value = serde_json::from_slice(&std::fs::read(d.home.join("state.json")).ok()?).ok()?;
+        state["sessions"].as_array()?.iter().any(|s| s["id"] == id.as_str()).then_some(())
+    });
     let (keeper, shell) = (records[0].1.pid as i32, records[0].1.shell_pid as i32);
     let table = midnad::procs::snapshot();
     let theirs: Vec<i32> = [keeper, shell].into_iter().chain(hidden).collect();
@@ -933,12 +945,16 @@ fn a_killed_midnads_keepers_are_ended_by_the_next_and_its_terminals_restart_on_w
     d.child.wait().unwrap();
     assert_eq!(running(&theirs).len(), theirs.len(), "the keeper is meant to outlive midnad");
 
-    d.child = Bin::launch(&d.home, 0., &[]);
+    let stranger = d.home.join("stranger");
+    std::fs::create_dir_all(&stranger).unwrap();
+    for f in std::fs::read_dir(d.home.join("bin/v1")).unwrap().flatten() {
+        std::fs::copy(f.path(), stranger.join(f.file_name())).unwrap();
+    }
+    d.child = Bin::launch_exe(&d.home, &stranger.join("midnad.exe"), 0., &[]);
     let mut c = d.human();
-    let left = running(&theirs);
-    assert!(left.is_empty(), "still running after the next midnad started: {left:?}");
-    assert!(midna_pty::names::records(&d.home).is_empty());
-    assert!(d.log().contains("left by an earlier midnad"), "{}", d.log());
+    wait_for(10, "the keeper, its shell and the ping to end", || running(&theirs).is_empty().then_some(()));
+    wait_for(5, "its record to go", || midna_pty::names::records(&d.home).is_empty().then_some(()));
+    assert!(d.log().contains(&format!("can't re-attach session {id}")), "{}", d.log());
     let s = call(&mut c, "session.restart", json!({ "id": id }));
     assert_eq!(s["status"]["reason"], "restarted", "{s}");
     call(&mut c, "session.input", json!({ "id": id, "text": "echo back-again", "enter": true }));
