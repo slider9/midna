@@ -257,8 +257,8 @@ fn deferred_words(cli: &str, detail: &str, title: &str) -> String {
         "rule.add" => "Add a policy rule".into(),
         "rule.restore" => "Restore a removed policy rule".into(),
         "rule.remove" | "rule.request_removal" => "Remove a policy rule".into(),
-        // Anything else: plain, and never the parameters.
-        _ => format!("Run {head}"),
+        // Anything else: the item's own title (it names the owner or target), never the parameters.
+        _ => agent_asks(title),
     }
 }
 
@@ -902,7 +902,8 @@ mod tests {
         // A line the call already wrote itself, and a method with no words: never JSON.
         assert_eq!(deferred_words("settings set theme gruvbox", "", t), "Change the setting theme to gruvbox");
         assert_eq!(deferred_words("stream remove builds", "", "Agent asks to remove stream builds"), "Remove stream builds");
-        assert_eq!(deferred_words(r#"project.remove {"id":"p_1"}"#, "", t), "Run project.remove");
+        assert_eq!(deferred_words(r#"project.remove {"id":"p_1"}"#, "", "Agent asks to run project.remove"), "Run project.remove");
+        assert_eq!(deferred_words(r#"links.patterns.approve {"id":"lp_1"}"#, "", "Agent asks to allow link previews for example.com"), "Allow link previews for example.com");
         // The summary is cut at 240 characters, so its JSON may not parse.
         assert_eq!(deferred_words(r#"daemon.upgrade {"binary_path":"C:\\a…"#, "", t), "Upgrade the daemon");
         let detail = "Human-only action requested by an agent: daemon.upgrade {…\nApproving runs exactly: daemon.upgrade {\"binary_path\":\"\\\\\\\\?\\\\C:\\\\very\\\\long\\\\midnad.exe\",\"force\":false}";
