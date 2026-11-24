@@ -16,8 +16,10 @@ fn windows_resources() {
     }
     println!("cargo:rerun-if-env-changed=MIDNA_DEV_HOME");
     println!("cargo:rerun-if-env-changed=MIDNA_BUILD_VERSION");
+    println!("cargo:rerun-if-env-changed=MIDNA_TEST_BUILD");
     let dev = std::env::var("MIDNA_DEV_HOME").is_ok_and(|h| !h.is_empty());
-    let name = if dev { "Midna Dev" } else { "Midna" };
+    let test = dev && std::env::var("MIDNA_TEST_BUILD").is_ok_and(|v| !v.is_empty());
+    let name = if test { "Midna Test" } else if dev { "Midna Dev" } else { "Midna" };
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let ico = manifest.join("../../packaging/assets").join(if dev { "MidnaDev.ico" } else { "Midna.ico" });
     println!("cargo:rerun-if-changed={}", ico.display());

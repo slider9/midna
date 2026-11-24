@@ -575,7 +575,7 @@ fn open_folder(a: &Args, path: &str) -> Res {
         return Err(Fail::Usage(format!("one folder at a time: `midna {path}`")));
     }
     let abs = std::fs::canonicalize(path).map_err(|e| Fail::Usage(format!("{path}: {e}")))?;
-    let bundle = if midna_proto::paths::is_dev() { "com.mrgnhnt.midna.dev" } else { midna_proto::paths::BUNDLE_ID };
+    let bundle = midna_proto::paths::app_id();
     let status = std::process::Command::new("/usr/bin/open").args(["-b", bundle]).arg(&abs).status();
     match status {
         Ok(s) if s.success() => Ok(()),

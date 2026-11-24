@@ -34,10 +34,11 @@ use std::process::Command;
 
 /// The update keys this build trusts, as a list (see [`keys`]). Several keys let one release
 /// accept both an old and a new signer, so the release key can move without stranding anyone.
-/// Midna Dev never updates itself, whatever key it was built with.
-pub const PUBKEY: Option<&str> = match midna_proto::paths::DEV_HOME {
-    Some(_) => None,
-    None => option_env!("MIDNA_UPDATE_PUBKEY"),
+/// Midna Dev never updates itself, whatever key it was built with; a test build of it
+/// (`paths::TEST_BUILD`, for the end-to-end update test) does.
+pub const PUBKEY: Option<&str> = match (midna_proto::paths::DEV_HOME, midna_proto::paths::TEST_BUILD) {
+    (Some(_), false) => None,
+    _ => option_env!("MIDNA_UPDATE_PUBKEY"),
 };
 pub const CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 /// Windows 10 1809, the first with ConPTY.
