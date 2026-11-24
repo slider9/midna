@@ -8,8 +8,9 @@
 //!
 //! - It never fails. `session.open` returns the terminal at once, so callers (and the task
 //!   board's terminal cap, which counts open terminals) see it and don't retry. Its process is a
-//!   small `/bin/sh` (Git Bash on Windows, `sys::posix_sh`) that prints why it waits and execs the agent once its go file
-//!   (`<home>/admit/<id>`) appears. Ctrl-C in the terminal starts it now.
+//!   small `/bin/sh` script that prints why it waits and execs the agent once its go file
+//!   (`<home>/admit/<id>`) appears; on Windows, `midna admit-wait`, which runs the agent as its
+//!   child (no Git Bash needed). Ctrl-C in the terminal starts it now.
 //! - It shows: the custom status [`WAITING`], with the load in its detail, until it starts.
 //! - Its queued messages wait too (`queue::readiness`): nothing is typed into the wrapper.
 //! - The line is `State.admit_line`, oldest first, so it outlives a daemon upgrade (the wrappers
@@ -31,6 +32,7 @@ use std::time::{Duration, Instant};
 /// The custom status a held terminal shows.
 pub const WAITING: &str = midna_proto::wording::os("Waiting for the Mac", "Waiting for the PC");
 /// The wrapper's `$0`: how a terminal still waiting is told from one whose agent runs.
+#[cfg(unix)]
 const WRAPPER: &str = "midna-wait";
 const TICK: Duration = Duration::from_secs(2);
 /// Least time between two terminals starting from the line.
@@ -41,10 +43,6 @@ const CALM_SHARE: f64 = 0.8;
 /// SIGINT (Ctrl-C) starts it now; exec puts the trap back to the default for the agent.
 #[cfg(unix)]
 const SCRIPT: &str = r#"f=$1; trap 'go=1' INT; printf '%s\n' "$2"; shift 2; while [ -z "$go" ] && [ ! -e "$f" ]; do sleep 1; done; rm -f "$f"; exec "$@""#;
-/// Windows: Git Bash's exec starts the agent as a child and stays, so the terminal's process
-/// still reads as the wrapper. It leaves `<go file>.started` (see [`waiting`]) before it execs.
-#[cfg(windows)]
-const SCRIPT: &str = r#"f=$1; trap 'go=1' INT; printf '%s\n' "$2"; shift 2; while [ -z "$go" ] && [ ! -e "$f" ]; do sleep 1; done; rm -f "$f"; : > "$f.started"; exec "$@""#;
 
 #[derive(Default)]
 pub struct Runtime {
@@ -118,9 +116,21 @@ pub fn wrap(d: &Daemon, sid: &str, l: &SystemLoad, argv: Vec<String>) -> Vec<Str
         midna_proto::wording::MAC,
         describe(l)
     );
-    let mut v = vec![crate::sys::posix_sh(), "-c".into(), SCRIPT.into(), WRAPPER.into(), go.to_string_lossy().into_owned(), msg];
+    let mut v = wrapper(&d.cfg.cli_path, go.to_string_lossy().into_owned(), msg);
     v.extend(argv);
     v
+}
+
+/// The wrapper's argv up to the agent's: the go file, then the message.
+#[cfg(unix)]
+fn wrapper(_cli: &str, go: String, msg: String) -> Vec<String> {
+    vec![crate::sys::posix_sh(), "-c".into(), SCRIPT.into(), WRAPPER.into(), go, msg]
+}
+
+/// Windows: midna.exe itself (`midna admit-wait`), so a PC without Git for Windows runs it too.
+#[cfg(windows)]
+fn wrapper(cli: &str, go: String, msg: String) -> Vec<String> {
+    vec![cli.into(), "admit-wait".into(), go, msg, "--".into()]
 }
 
 /// Put a just-opened terminal running [`wrap`] in line.
@@ -167,16 +177,21 @@ pub fn start(d: &Arc<Daemon>) {
     });
 }
 
-/// Whether the terminal's process `pid` is still the wrapper waiting for its go file `go`.
+/// Whether the terminal's process `pid` is still the wrapper waiting for its go file.
 #[cfg(unix)]
-fn waiting(_go: &std::path::Path, pid: Option<i32>) -> bool {
+fn waiting(pid: Option<i32>) -> bool {
     pid.and_then(crate::procs::command_line).is_some_and(|c| c.split(' ').any(|a| a == WRAPPER))
 }
 
-/// Windows: it runs and hasn't left its `.started` mark (its command line never changes).
+/// Windows: it runs and hasn't started the agent, its only child (there's no exec, so its
+/// command line never changes). A child is a process started since the wrapper was: one whose
+/// parent had that pid before it is older.
 #[cfg(windows)]
-fn waiting(go: &std::path::Path, pid: Option<i32>) -> bool {
-    pid.is_some_and(crate::sys::alive) && !go.with_extension("started").exists()
+fn waiting(pid: Option<i32>) -> bool {
+    let Some(pid) = pid.filter(|&p| crate::sys::alive(p)) else { return false };
+    let Some(born) = crate::procs::start_time(pid) else { return false };
+    let snap = crate::procs::snapshot();
+    !snap.iter().any(|(&c, &(parent, _))| parent == pid && c != pid && crate::procs::start_time(c).is_some_and(|t| t >= born))
 }
 
 fn tick(d: &Daemon) {
@@ -192,7 +207,7 @@ fn tick(d: &Daemon) {
     for (sid, pid) in pids {
         match pid {
             None => leave(d, &sid, None),
-            Some(pid) if !waiting(&go_file(d, &sid), pid) => leave(d, &sid, Some("started")),
+            Some(pid) if !waiting(pid) => leave(d, &sid, Some("started")),
             _ => {}
         }
     }
@@ -221,8 +236,6 @@ fn tick(d: &Daemon) {
 fn leave(d: &Daemon, sid: &str, why: Option<&str>) {
     d.core().state.admit_line.retain(|s| s != sid);
     d.mark_dirty();
-    #[cfg(windows)]
-    let _ = std::fs::remove_file(go_file(d, sid).with_extension("started"));
     let Some(why) = why else {
         let _ = std::fs::remove_file(go_file(d, sid));
         return;
@@ -268,6 +281,7 @@ mod tests {
         assert!(calm(&load(900, true), 0));
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_wrapper_waits_for_its_go_file_then_execs() {
         let dir = std::env::temp_dir().join(format!("midna-admit-{}", std::process::id()));
@@ -282,11 +296,36 @@ mod tests {
             .unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert!(child.try_wait().unwrap().is_none(), "it waits");
-        assert!(waiting(&go, Some(child.id() as i32)));
+        assert!(waiting(Some(child.id() as i32)));
         std::fs::write(&go, b"").unwrap();
         assert!(child.wait().unwrap().success());
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "ran a b\n");
         assert!(!go.exists(), "the go file is gone");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows: the wrapper is `midna admit-wait` (`tests/admit.rs` runs it), and it waits until
+    /// it has a child, the agent.
+    #[cfg(windows)]
+    #[test]
+    fn a_wrapper_waits_until_it_starts_a_child() {
+        use std::process::{Command, Stdio};
+        let v = wrapper(r"C:\m\midna.exe", r"C:\h\admit\s1".into(), "msg".into());
+        assert_eq!(v, [r"C:\m\midna.exe", "admit-wait", r"C:\h\admit\s1", "msg", "--"]);
+        let mut alone = Command::new("ping").args(["-n", "30", "127.0.0.1"]).stdout(Stdio::null()).spawn().unwrap();
+        assert!(waiting(Some(alone.id() as i32)), "no child yet");
+        let mut parent = Command::new("cmd").args(["/c", "ping -n 30 127.0.0.1 >nul"]).spawn().unwrap();
+        let pid = parent.id() as i32;
+        let child = (0..50).find_map(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            crate::procs::snapshot().into_iter().find(|&(_, (p, _))| p == pid).map(|(c, _)| c)
+        });
+        assert!(child.is_some(), "cmd started ping");
+        assert!(!waiting(Some(pid)), "its agent runs");
+        assert!(!waiting(None), "closed");
+        if let Some(c) = child {
+            crate::sys::signal(c, crate::sys::Sig::Kill);
+        }
+        let _ = (alone.kill(), parent.kill(), alone.wait(), parent.wait());
     }
 }

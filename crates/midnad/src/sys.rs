@@ -84,8 +84,10 @@ pub fn private_file(opts: &mut OpenOptions) -> &mut OpenOptions {
     imp::private_file(opts)
 }
 
-/// A POSIX `sh` for midna's own wrapper scripts (`sh -c '…'`): `/bin/sh` on Unix; Git for
-/// Windows' `bash.exe` on Windows, which Claude Code needs there anyway.
+/// A POSIX `sh` for midna's own wrapper scripts (`sh -c '…'`): `/bin/sh` on Unix. On Windows,
+/// Git for Windows' `bash.exe`, for the tests only: midna runs nothing through it there (a held
+/// agent waits in `midna admit-wait`, Codex's notify is `midna hook codex notify`), since a PC
+/// may have no Git.
 pub fn posix_sh() -> String {
     imp::posix_sh()
 }
