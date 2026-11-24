@@ -1,0 +1,6 @@
+# Windows dev and test builds link with LLVM's lld (rust-lld.exe, shipped with every Rust
+# toolchain) instead of MSVC's link.exe. Rebuilding midnad's tests after an edit to its library
+# went from 18.5 s to 12.6 s (45 test exes relinked); the app's icon and manifest come out the
+# same. Release builds keep link.exe: packaging/build-windows.sh passes its own --config.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"

@@ -93,8 +93,10 @@ if [ "$BUILD" = 1 ]; then
     unset MIDNA_UPDATE_PUBKEY
     echo "build-windows.sh: no update key (MIDNA_UPDATE_PUBKEY): this build will never update itself" >&2
   fi
+  # Shipped builds link with MSVC's link.exe; dev and test builds use rust-lld (.cargo/config.toml).
+  # rustc finds MSVC's link.exe itself, not the coreutils `link` on Git Bash's PATH.
   MIDNA_DEV_HOME="$DEV_HOME" MIDNA_TEST_BUILD="$TEST" MIDNA_BUILD_VERSION="$VERSION" CARGO_TARGET_DIR="$TARGET_DIR" CARGO_BUILD_BUILD_DIR="$TARGET_DIR" \
-    cargo build --release -p midna-app -p midnad -p midna-cli -p midna-pty --bin midna-app --bin midnad --bin midna --bin midna-pty ${FEATURES[@]+"${FEATURES[@]}"}
+    cargo build --config 'target.x86_64-pc-windows-msvc.linker="link.exe"' --release -p midna-app -p midnad -p midna-cli -p midna-pty --bin midna-app --bin midnad --bin midna --bin midna-pty ${FEATURES[@]+"${FEATURES[@]}"}
 fi
 for b in midna-app midnad midna midna-pty; do [ -f "$BIN/$b.exe" ] || { echo "missing $BIN/$b.exe" >&2; exit 1; }; done
 
