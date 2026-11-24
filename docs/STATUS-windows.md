@@ -32,6 +32,9 @@ scripts/test.sh -p midnad -p midna-cli
 Without `.toolchain/ghostty-src`, libghostty-vt-sys fetches Ghostty itself. With
 `.toolchain/conpty`, `env.sh` sets `MIDNA_CONPTY` to its `conpty.dll`, so a cargo build's midnad
 and the tests' daemons use it.
+Dev and test builds link with `rust-lld.exe` (`.cargo/config.toml`), which comes with the
+toolchain and relinks a test-heavy crate about a third faster than MSVC's `link.exe`. Shipped
+builds keep `link.exe`: `packaging/build-windows.sh` overrides the linker with `--config`.
 `scripts/test.sh` falls back to a lock directory (`/tmp/midna-tests.lock.d`) where there's no `lockf`.
 
 ### Terminals: which ConPTY
