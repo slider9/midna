@@ -125,16 +125,22 @@ jobs:
           ./scripts/setup-conpty.sh
 
       # The update keys are compiled in; without them the app would never accept an update, so
-      # refuse to build rather than ship that.
+      # refuse to build rather than ship that. So is the feed: this repository's channels release,
+      # where the publish job below puts windows-{stable,beta}.json.
       - name: Build
         env:
           MIDNA_UPDATE_PUBKEY: ${{ vars.MIDNA_UPDATE_PUBKEY }}
+          MIDNA_DEFAULT_FEED_URL: https://github.com/${{ github.repository }}/releases/download/channels/{channel}.json
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           [ -n "$MIDNA_UPDATE_PUBKEY" ] || { echo "::error::Set the MIDNA_UPDATE_PUBKEY repository variable"; exit 1; }
           packaging/build-windows.sh --version "$VERSION" --out dist/release
           got="$(dist/release/Midna/midnad.exe --version | awk '{print $2}' | tr -d '\r')"
           [ "$got" = "$VERSION" ] || { echo "::error::midnad.exe says $got, expected $VERSION"; exit 1; }
+          for b in midna-app midnad; do
+            grep -qaF "$MIDNA_DEFAULT_FEED_URL" "dist/release/Midna/$b.exe" ||
+              { echo "::error::$b.exe doesn't have the feed $MIDNA_DEFAULT_FEED_URL compiled in"; exit 1; }
+          done
 
       - name: Build release tool
         run: |
