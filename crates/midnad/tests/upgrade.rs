@@ -97,8 +97,13 @@ impl Bin {
 
     /// Start v1 in `home`, logging to daemon.log (appended to, for a second midnad).
     fn launch(home: &Path, load1: f64, env: &[(&str, String)]) -> Child {
+        Bin::launch_exe(home, &home.join(V1), load1, env)
+    }
+
+    /// Start the midnad at `exe` in `home`.
+    fn launch_exe(home: &Path, exe: &Path, load1: f64, env: &[(&str, String)]) -> Child {
         let log = std::fs::OpenOptions::new().create(true).append(true).open(home.join("daemon.log")).unwrap();
-        Command::new(home.join(V1))
+        Command::new(exe)
             .args(["--foreground", "--home"])
             .arg(&home)
             .env_remove("MIDNA_SOCKET")
@@ -900,7 +905,8 @@ fn a_stopped_midnad_leaves_no_keeper_console_host_or_shell_on_windows() {
 }
 
 /// A midnad that's killed leaves its keepers running. A next one the keepers won't serve (here
-/// `v1.exe`: a keeper serves only `midnad.exe`, from the home's `bin` or beside it) can't
+/// a copy of midnad.exe in a folder of its own: a keeper serves only `midnad.exe`, from the home's
+/// `bin` or beside it) can't
 /// re-attach to them, so it ends them, with what they started, and the sessions they held can be
 /// restarted. Re-attaching is `tests/crash_windows.rs`.
 #[cfg(windows)]
@@ -939,7 +945,12 @@ fn a_killed_midnads_keepers_the_next_cant_attach_to_are_ended_and_its_terminals_
     d.child.wait().unwrap();
     assert_eq!(running(&theirs).len(), theirs.len(), "the keeper is meant to outlive midnad");
 
-    d.child = Bin::launch(&d.home, 0., &[]);
+    let stranger = d.home.join("stranger");
+    std::fs::create_dir_all(&stranger).unwrap();
+    for f in std::fs::read_dir(d.home.join("bin/v1")).unwrap().flatten() {
+        std::fs::copy(f.path(), stranger.join(f.file_name())).unwrap();
+    }
+    d.child = Bin::launch_exe(&d.home, &stranger.join("midnad.exe"), 0., &[]);
     let mut c = d.human();
     wait_for(10, "the keeper, its shell and the ping to end", || running(&theirs).is_empty().then_some(()));
     wait_for(5, "its record to go", || midna_pty::names::records(&d.home).is_empty().then_some(()));
