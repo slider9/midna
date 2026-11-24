@@ -106,9 +106,27 @@ next_of() {
   echo "$b${s}w.$(( ${n:-0} + 1 ))"
 }
 
-# Whether a tag's release is published: a draft (a workflow_dispatch run) or no release isn't.
-published() {
-  [ "$(gh release view "$1" --repo "$repo" --json isDraft -q .isDraft 2>/dev/null || true)" = false ]
+# A tag's release: published, draft (a workflow_dispatch run) or none. Any other gh failure
+# (network, sign-in) stops the cut: guessing "none" would say to delete a published tag.
+# gh says "release not found" for a missing repo too, so the repo is checked once up front.
+if ! out=$(gh repo view "$repo" --json name -q .name 2>&1); then
+  echo "Couldn't reach $repo with gh: $out" >&2
+  exit 1
+fi
+release_state() {
+  local out
+  if out=$(gh release view "$1" --repo "$repo" --json isDraft -q .isDraft 2>&1); then
+    case "$out" in
+      false) echo published ;;
+      true) echo draft ;;
+      *) echo "gh said '$out' for $1's release on $repo." >&2; return 1 ;;
+    esac
+  elif [ "$out" = "release not found" ]; then
+    echo none
+  else
+    echo "Couldn't look up $1's release on $repo: $out" >&2
+    return 1
+  fi
 }
 recut_hint() {
   echo "Don't skip it. Once no run is going (gh run list --repo $repo --workflow release-windows.yml)," >&2
@@ -118,7 +136,8 @@ recut_hint() {
 
 if echo "$versions" | grep -qxF -- "$version"; then
   echo "$tag is already tagged; a version is never reused." >&2
-  if ! published "$tag"; then
+  state=$(release_state "$tag") || exit 1
+  if [ "$state" != published ]; then
     echo "It has no published release: its workflow failed, was cancelled or is still running." >&2
     recut_hint "$tag"
   fi
@@ -145,10 +164,14 @@ if [ "$version" != "$next" ]; then
 fi
 
 # Never skip a version: a tag whose release was never published gets cut again, not a new one.
-if [ -n "$latest" ] && ! published "windows-v$latest"; then
-  echo "windows-v$latest has no published release (none, or only a draft): its workflow failed, was cancelled or is still running." >&2
-  recut_hint "windows-v$latest"
-  exit 1
+if [ -n "$latest" ]; then
+  state=$(release_state "windows-v$latest") || exit 1
+  if [ "$state" != published ]; then
+    [ "$state" = draft ] && what="only a draft" || what="no release at all"
+    echo "windows-v$latest has no published release ($what): its workflow failed, was cancelled or is still running." >&2
+    recut_hint "windows-v$latest"
+    exit 1
+  fi
 fi
 
 # The push the cut ends with, without making it: it has to get past sign-in on its own.
@@ -164,6 +187,9 @@ if [ -n "$dry_run" ]; then
   exit 0
 fi
 
+sha=$(git rev-parse HEAD)
+# A minute's slack for this PC's clock against GitHub's.
+since=$(date -u -d '-60 seconds' +%Y-%m-%dT%H:%M:%SZ)
 git tag -a "$tag" -m "Midna $version for Windows"
 if ! git push origin "refs/tags/$tag" </dev/null; then
   git tag -d "$tag" >/dev/null
@@ -176,7 +202,9 @@ echo "Pushed $tag. The Windows release workflow builds it and publishes the rele
 workflow="https://github.com/$repo/actions/workflows/release-windows.yml"
 run=
 for _ in $(seq 1 15); do
-  run=$(gh run list --repo "$repo" --workflow release-windows.yml --branch "$tag" --limit 1 --json url -q '.[0].url' 2>/dev/null || true)
+  # This push's run, not an earlier one of the same tag (a version cut again after a failure).
+  run=$(gh run list --repo "$repo" --workflow release-windows.yml --branch "$tag" --commit "$sha" --event push \
+    --json url,createdAt -q "[.[] | select(.createdAt >= \"$since\")][0].url // empty" 2>/dev/null || true)
   [ -z "$run" ] || break
   sleep 2
 done
