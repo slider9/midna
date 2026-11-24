@@ -67,7 +67,8 @@ There's no separate installer: the build installs itself. Its install folder is
 `%LOCALAPPDATA%\Programs\<its name>` (`Midna`; Midna Dev's `Midna Dev`, a test build's `Midna
 Test`; those two take `MIDNA_INSTALL_DIR` instead when it's set, else the folder their Settings ▸
 Apps entry names when it holds a build, so a test install started later without the variable
-stays put; never another Midna's folder, and Midna never looks anywhere but Programs). Run from
+stays put; never another Midna's folder, and Midna never looks anywhere but Programs). A build
+run from `Programs\<its name>` always runs there. Run from
 anywhere else, such as the folder a release zip unpacks to in Downloads, it doesn't run there
 (`install::place`, before anything else at launch):
 

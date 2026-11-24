@@ -630,6 +630,12 @@ pub fn install_dir() -> PathBuf {
             return d;
         }
     }
+    programs_dir()
+}
+
+/// `%LOCALAPPDATA%\Programs\<this build's name>`: where it installs itself by default.
+#[cfg(windows)]
+pub fn programs_dir() -> PathBuf {
     midna_proto::paths::app_data_dir().join("Programs").join(midna_proto::paths::app_name())
 }
 
@@ -657,10 +663,13 @@ pub enum Placement {
 }
 
 /// What to do for a build in `here` whose install folder is `dest`, holding the version
-/// `installed` (None: nothing installed there; "": a build whose version can't be read).
+/// `installed` (None: nothing installed there; "": a build whose version can't be read). A build
+/// in `programs` ([`programs_dir`], the default install folder) runs there too, whatever `dest`
+/// is: a Midna Dev or test build's `dest` can be a folder its Settings ▸ Apps entry still names
+/// from an earlier install elsewhere, and `scripts/dev-app-windows.sh` installs into Programs.
 #[cfg(windows)]
-pub fn placement(here: &Path, dest: &Path, installed: Option<&str>, version: &str) -> Placement {
-    if same_dir(here, dest) {
+pub fn placement(here: &Path, dest: &Path, programs: &Path, installed: Option<&str>, version: &str) -> Placement {
+    if same_dir(here, dest) || same_dir(here, programs) {
         return Placement::Here;
     }
     match installed {
@@ -723,7 +732,7 @@ pub fn place() -> Option<i32> {
     let installed = dest.join(BUNDLE_MARKER).is_file().then(|| installed_version(&dest));
     let name = midna_proto::paths::app_name();
     let version = midna_proto::VERSION;
-    let step = placement(&bundle, &dest, installed.as_deref(), version);
+    let step = placement(&bundle, &dest, &programs_dir(), installed.as_deref(), version);
     if step != Placement::Here {
         crate::lifecycle::log(&format!("launch from {}: {step:?} ({} in {})", bundle.display(), installed.as_deref().map_or("nothing", |v| if v.is_empty() { "a build" } else { v }), dest.display()));
     }
@@ -1005,20 +1014,24 @@ mod tests {
     fn a_build_run_from_elsewhere_installs_starts_updates_or_refuses() {
         let d = scratch("place");
         let (zip, dest) = (d.join("Downloads").join("Midna-1.2.0-windows-x86_64").join("Midna"), d.join("Programs").join("Midna"));
+        let programs = d.join("Local").join("Programs").join("Midna");
         std::fs::create_dir_all(&zip).unwrap();
         std::fs::create_dir_all(&dest).unwrap();
         // Run from the install folder, however it's spelled: as usual.
         let upper = PathBuf::from(dest.to_string_lossy().to_uppercase() + "\\");
-        assert_eq!(placement(&upper, &dest, Some("1.0.0"), "1.2.0"), Placement::Here);
-        assert_eq!(placement(&dest, &dest, None, "1.2.0"), Placement::Here);
+        assert_eq!(placement(&upper, &dest, &programs, Some("1.0.0"), "1.2.0"), Placement::Here);
+        assert_eq!(placement(&dest, &dest, &programs, None, "1.2.0"), Placement::Here);
         // From anywhere else.
-        assert_eq!(placement(&zip, &dest, None, "1.2.0"), Placement::Install);
-        assert_eq!(placement(&zip, &dest, Some("1.2.0"), "1.2.0"), Placement::StartInstalled);
-        assert_eq!(placement(&zip, &dest, Some("1.1.9"), "1.2.0"), Placement::Update);
-        assert_eq!(placement(&zip, &dest, Some("1.2.0-beta.3"), "1.2.0"), Placement::Update);
-        assert_eq!(placement(&zip, &dest, Some(""), "1.2.0"), Placement::Update, "a build whose version can't be read is replaced");
-        assert_eq!(placement(&zip, &dest, Some("1.3.0"), "1.2.0"), Placement::Newer("1.3.0".into()));
-        assert_eq!(placement(&zip, &dest, Some("1.2.0-beta.4"), "1.2.0-beta.3"), Placement::Newer("1.2.0-beta.4".into()));
+        assert_eq!(placement(&zip, &dest, &programs, None, "1.2.0"), Placement::Install);
+        assert_eq!(placement(&zip, &dest, &programs, Some("1.2.0"), "1.2.0"), Placement::StartInstalled);
+        assert_eq!(placement(&zip, &dest, &programs, Some("1.1.9"), "1.2.0"), Placement::Update);
+        assert_eq!(placement(&zip, &dest, &programs, Some("1.2.0-beta.3"), "1.2.0"), Placement::Update);
+        assert_eq!(placement(&zip, &dest, &programs, Some(""), "1.2.0"), Placement::Update, "a build whose version can't be read is replaced");
+        assert_eq!(placement(&zip, &dest, &programs, Some("1.3.0"), "1.2.0"), Placement::Newer("1.3.0".into()));
+        assert_eq!(placement(&zip, &dest, &programs, Some("1.2.0-beta.4"), "1.2.0-beta.3"), Placement::Newer("1.2.0-beta.4".into()));
+        // A Dev or test build whose registered folder is elsewhere, run from Programs: it stays.
+        assert_eq!(placement(&programs, &zip, &programs, Some("1.0.0"), "1.2.0"), Placement::Here);
+        assert_eq!(placement(&programs, &zip, &programs, None, "1.2.0"), Placement::Here);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1026,6 +1039,7 @@ mod tests {
     #[test]
     fn the_install_folder_is_named_for_the_build() {
         let want = midna_proto::paths::app_data_dir().join("Programs").join(midna_proto::paths::app_name());
+        assert_eq!(programs_dir(), want);
         // Midna Dev and test builds may also take MIDNA_INSTALL_DIR or their registered folder.
         if !midna_proto::paths::is_dev() {
             assert_eq!(want, midna_proto::paths::windows_install_dir());
