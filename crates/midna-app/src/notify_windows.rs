@@ -3,7 +3,8 @@
 //!
 //! An app that isn't packaged needs an AppUserModelID for its toasts. midna registers one for
 //! the current user, `HKCU\Software\Classes\AppUserModelId\com.mrgnhnt.midna` (Midna Dev's and
-//! debug builds' end in `.dev`), with the name and icon its toasts show, and posts under it.
+//! debug builds' end in `.dev`, a test build's in `.test`), with the name and icon its toasts
+//! show, and posts under it.
 //! That needs no installer or Start menu shortcut.
 //!
 //! A toast's group is its terminal, so `clear` takes a terminal's toasts away; its tag is
@@ -56,6 +57,8 @@ const KEEP: usize = 64;
 const ACTIVATOR: GUID = GUID::from_u128(0x71fc9e00_807f_45b6_a69b_8163f48f5562);
 /// Midna Dev's and debug builds' class.
 const ACTIVATOR_DEV: GUID = GUID::from_u128(0xb130edb7_f2f7_45b7_8aa1_ff07b076ee68);
+/// A test build's (`paths::TEST_BUILD`), so it never takes Midna Dev's clicks.
+const ACTIVATOR_TEST: GUID = GUID::from_u128(0x2f9eca2d_874c_4854_a07f_81bb897bcffb);
 
 /// The AppUserModelID midna's toasts are posted under. Midna Dev and debug builds (run from
 /// `target\`) have their own, so a build from source never shows as, or changes, Midna's.
@@ -64,7 +67,11 @@ fn app_id() -> &'static str {
 }
 
 fn activator() -> GUID {
-    if dev() { ACTIVATOR_DEV } else { ACTIVATOR }
+    match (dev(), midna_proto::paths::TEST_BUILD) {
+        (false, _) => ACTIVATOR,
+        (true, false) => ACTIVATOR_DEV,
+        (true, true) => ACTIVATOR_TEST,
+    }
 }
 
 fn dev() -> bool {
@@ -339,7 +346,7 @@ fn taking_notifications() -> bool {
 /// last.
 fn register() {
     let (name, png): (&str, &[u8]) = if dev() {
-        ("Midna Dev", include_bytes!("../../../packaging/assets/MidnaDev.png"))
+        (if midna_proto::paths::TEST_BUILD { "Midna Test" } else { "Midna Dev" }, include_bytes!("../../../packaging/assets/MidnaDev.png"))
     } else {
         ("Midna", include_bytes!("../../../packaging/assets/Midna.png"))
     };
@@ -424,5 +431,7 @@ mod tests {
     fn class_ids() {
         assert_eq!(braced(&ACTIVATOR), "{71FC9E00-807F-45B6-A69B-8163F48F5562}");
         assert_eq!(braced(&ACTIVATOR_DEV), "{B130EDB7-F2F7-45B7-8AA1-FF07B076EE68}");
+        // packaging/e2e/update-e2e-windows.sh removes this class's key at cleanup.
+        assert_eq!(braced(&ACTIVATOR_TEST), "{2F9ECA2D-874C-4854-A07F-81BB897BCFFB}");
     }
 }

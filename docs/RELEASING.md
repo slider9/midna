@@ -397,7 +397,9 @@ making it with `gen-update-key.sh` if there's none.
 - after each step it checks the terminal is listed, its shell is alive and its counter went up
 - cleans up: the app's `--uninstall` (daemon.stop, the login entry, Start menu and Settings ▸
   Apps entries, the CLI copy and the install folder), then ends anything still running from the
-  test folders by pid, removes any entry that was left, the test home and the server
+  test folders by pid, removes any entry that was left (the toast app id and click handler class
+  `--uninstall` leaves too), the test home and the server, and warns if Midna Dev's toast class
+  changed
 
 The test build's window opens hidden; the copy the update helper starts is shown, without
 taking focus.

@@ -51,6 +51,12 @@ PORT="" FEED=""                          # a free port, picked once Python is kn
 KEY_DIR="$HOME/.config/midna-dev"
 RUN_KEY='HKCU\Software\Microsoft\Windows\CurrentVersion\Run'
 APPS_KEY='HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\com.mrgnhnt.midna.test'
+# The test build's toast registration (midna-app/src/notify_windows.rs: its app id and its own
+# click handler class, ACTIVATOR_TEST), which --uninstall leaves; and Midna Dev's class, which a
+# test build must never point at itself.
+TOAST_KEY='HKCU\Software\Classes\AppUserModelId\com.mrgnhnt.midna.test'
+TOAST_CLASS_KEY='HKCU\Software\Classes\CLSID\{2F9ECA2D-874C-4854-A07F-81BB897BCFFB}'
+DEV_CLASS_KEY='HKCU\Software\Classes\CLSID\{B130EDB7-F2F7-45B7-8AA1-FF07B076EE68}\LocalServer32'
 LNK="$(cygpath -u "$APPDATA")/Microsoft/Windows/Start Menu/Programs/$NAME.lnk"
 PY="$(command -v python3 || command -v python)"
 SRV_PID="" HOLD_PID=""
@@ -70,6 +76,8 @@ wait_for() {  # <secs> <cmd...>
 }
 json() { "$PY" -c "import json,sys; v=json.load(sys.stdin); print($1)"; }
 reg_has() { MSYS2_ARG_CONV_EXCL='*' reg.exe query "$1" "${@:2}" >/dev/null 2>&1; }
+# Midna Dev's toast click server, or nothing.
+dev_toast_server() { MSYS2_ARG_CONV_EXCL='*' reg.exe query "$DEV_CLASS_KEY" /ve 2>/dev/null | tr -d '\r' | grep -i 'REG_SZ'; }
 
 # Nothing of the terminal this runs in may reach the test build (its own home is built in, but
 # a MIDNA_SESSION would make its processes look like this terminal's).
@@ -139,12 +147,16 @@ cleanup() {
   [ -n "${SHELL_PID:-}" ] && alive "$SHELL_PID" 2>/dev/null && taskkill //PID "$SHELL_PID" //F >/dev/null 2>&1 && echo "  ended the test shell (pid $SHELL_PID)"
   reg_has "$RUN_KEY" /v "$NAME" && MSYS2_ARG_CONV_EXCL='*' reg.exe delete "$RUN_KEY" /v "$NAME" /f >/dev/null && echo "  removed the leftover login entry"
   reg_has "$APPS_KEY" && MSYS2_ARG_CONV_EXCL='*' reg.exe delete "$APPS_KEY" /f >/dev/null && echo "  removed the leftover Settings > Apps entry"
+  for k in "$TOAST_KEY" "$TOAST_CLASS_KEY"; do
+    reg_has "$k" && MSYS2_ARG_CONV_EXCL='*' reg.exe delete "$k" /f >/dev/null && echo "  removed $k"
+  done
+  if [ "$(dev_toast_server)" != "$DEV_TOAST0" ]; then echo "  WARNING: Midna Dev's toast class changed: '$DEV_TOAST0' -> '$(dev_toast_server)'"; fi
   rm -f "$LNK"
   if [ "$KEEP" = 0 ]; then
     sleep 1
     rm -rf "$TH_U" "$DEST_ROOT" "$WORK/srv" "$WORK/pub" 2>/dev/null || echo "  couldn't remove all of $TH_U and $DEST_ROOT (in use?)"
   fi
-  if reg_has "$RUN_KEY" /v "$NAME" || reg_has "$APPS_KEY" || [ -e "$LNK" ]; then echo "  WARNING: an entry of $NAME is still registered"; else echo "  no $NAME entries left"; fi
+  if reg_has "$RUN_KEY" /v "$NAME" || reg_has "$APPS_KEY" || reg_has "$TOAST_KEY" || reg_has "$TOAST_CLASS_KEY" || [ -e "$LNK" ]; then echo "  WARNING: an entry of $NAME is still registered"; else echo "  no $NAME entries left"; fi
 }
 
 say "versions $V1 -> $V2; home $TH; install $(cygpath -w "$DEST")"
@@ -158,6 +170,7 @@ if [ ! -f "$KEY_DIR/update-ed25519.key" ]; then
   packaging/gen-update-key.sh "$KEY_DIR" || exit 1
 fi
 PUBKEY="$(tr -d '[:space:]' < "$KEY_DIR/update-ed25519.pub")"
+DEV_TOAST0="$(dev_toast_server)"
 PORT="$("$PY" -c "import socket; s = socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1])" | tr -d '\r')"
 FEED="http://127.0.0.1:$PORT/{channel}.json"
 trap cleanup EXIT
@@ -215,6 +228,8 @@ check "first launch installed midnad into the test home" "wait_for 30 'cli_path 
 check "daemon up" "wait_for 30 'cli info >/dev/null 2>&1'"
 check "login entry \"$NAME\" written" "reg_has '$RUN_KEY' /v '$NAME'"
 check "Start menu and Settings > Apps entries are the test build's" "[ -f '$LNK' ] && reg_has '$APPS_KEY'"
+check "toasts registered under the test build's own app id and class" "wait_for 10 \"reg_has '$TOAST_KEY' && reg_has '$TOAST_CLASS_KEY'\""
+check "Midna Dev's toast class untouched" "[ \"\$(dev_toast_server)\" = \"\$DEV_TOAST0\" ]"
 INFO0="$(cli info --json)"; echo "  $INFO0" | head -c 400; echo
 D_PID0="$(echo "$INFO0" | json "v['pid']")"
 check "daemon reports $V1" "[ \"\$(echo '$INFO0' | json \"v['version']\")\" = '$V1' ]"
