@@ -611,19 +611,33 @@ fn is_our_cli(link: &Path) -> bool {
 // ------------------------------------------------------------------ the install folder
 
 /// Where this build installs itself: `%LOCALAPPDATA%\Programs\<its name>` (`Midna`, `Midna Dev`
-/// or `Midna Test`, from [`midna_proto::paths::app_name`]). Midna Dev and a test build take
-/// `MIDNA_INSTALL_DIR` instead when it's set (the tests' temp folders) and isn't another
-/// Midna's; Midna never does.
+/// or `Midna Test`, from [`midna_proto::paths::app_name`]). Midna never looks anywhere else.
+///
+/// Midna Dev and a test build take `MIDNA_INSTALL_DIR` instead when it's set (the tests' temp
+/// folders). Without it, they take the folder their Settings ▸ Apps entry names when it holds a
+/// build: one installed through `MIDNA_INSTALL_DIR` and started later without it (by its login
+/// entry, a toast click, the Start menu) stays where it is instead of moving into Programs.
+/// Neither is ever another Midna's folder (`guard_write`): this build would start or replace that.
 #[cfg(windows)]
 pub fn install_dir() -> PathBuf {
-    // Never another Midna's folder (`guard_write`): this build would start or replace that one.
-    if midna_proto::paths::is_dev()
-        && let Some(d) = std::env::var_os("MIDNA_INSTALL_DIR").filter(|v| !v.is_empty()).map(PathBuf::from)
-        && midna_proto::paths::guard_write(&d).is_ok()
-    {
-        return d;
+    let ours = |d: PathBuf| (midna_proto::paths::guard_write(&d).is_ok()).then_some(d);
+    if midna_proto::paths::is_dev() {
+        if let Some(d) = std::env::var_os("MIDNA_INSTALL_DIR").filter(|v| !v.is_empty()).map(PathBuf::from) {
+            if let Some(d) = ours(d) {
+                return d;
+            }
+        } else if let Some(d) = registered_install(&apps_entry::key()).and_then(ours) {
+            return d;
+        }
     }
     midna_proto::paths::app_data_dir().join("Programs").join(midna_proto::paths::app_name())
+}
+
+/// The folder the Settings ▸ Apps entry at `key` names, when it holds a build.
+#[cfg(windows)]
+fn registered_install(key: &str) -> Option<PathBuf> {
+    let dir = PathBuf::from(crate::winreg::get_string(key, "InstallLocation")?);
+    dir.join(BUNDLE_MARKER).is_file().then_some(dir)
 }
 
 /// What a launch of a packaged build does about where it runs from ([`place`]).
@@ -1012,12 +1026,25 @@ mod tests {
     #[test]
     fn the_install_folder_is_named_for_the_build() {
         let want = midna_proto::paths::app_data_dir().join("Programs").join(midna_proto::paths::app_name());
+        // Midna Dev and test builds may also take MIDNA_INSTALL_DIR or their registered folder.
         if !midna_proto::paths::is_dev() {
             assert_eq!(want, midna_proto::paths::windows_install_dir());
-        }
-        if !midna_proto::paths::is_dev() || std::env::var_os("MIDNA_INSTALL_DIR").is_none() {
             assert_eq!(install_dir(), want);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_registered_install_counts_only_while_it_holds_a_build() {
+        let d = scratch("registered");
+        let key = format!(r"Software\midna-test-registered-{}", std::process::id());
+        assert_eq!(registered_install(&key), None);
+        crate::winreg::set_string(&key, Some("InstallLocation"), &d.display().to_string()).unwrap();
+        assert_eq!(registered_install(&key), None, "no build there");
+        std::fs::write(d.join(BUNDLE_MARKER), "Midna Test 1.0.0.").unwrap();
+        assert_eq!(registered_install(&key), Some(d.clone()));
+        crate::winreg::delete_key(&key).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[cfg(windows)]

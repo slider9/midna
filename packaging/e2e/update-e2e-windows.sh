@@ -269,6 +269,12 @@ mark_log
 start_unpacked
 check "running the unpacked $V1 again brings the installed one to the front" "wait_for 20 'new_log_has \"launch: another launch handed over\"'"
 check "the same app runs (pid $APP_PID0)" "wait_for 10 unpacked_idle && [ \"\$(app_pids)\" = '$APP_PID0' ]"
+# As its login entry, a toast click or the Start menu start it: without MIDNA_INSTALL_DIR it
+# still takes its registered folder, rather than moving into Programs.
+PROGRAMS_DIR="$(cygpath -u "$LOCALAPPDATA")/Programs/$NAME"
+mark_log
+( cd "$DEST" && env -u MIDNA_INSTALL_DIR ./midna-app.exe >/dev/null 2>&1 & )
+check "started without MIDNA_INSTALL_DIR, the installed copy stays where it is" "wait_for 20 'new_log_has \"launch: another launch handed over\"' && ! new_log_has 'launch from' && [ ! -e '$PROGRAMS_DIR' ] && [ \"\$(app_pids)\" = '$APP_PID0' ]"
 cli settings set updates.channel beta >/dev/null || bad "set updates.channel beta"
 # The upgrade waits while the PC is busy; a test run shouldn't.
 cli settings set system.busy_load 2000 >/dev/null 2>&1 || echo "  (system.busy_load not raised: a busy PC may postpone the daemon upgrade)"
