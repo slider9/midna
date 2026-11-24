@@ -119,10 +119,13 @@ To try a change in a real app, `scripts/dev-app-windows.sh` (the Windows `dev-ap
 - an inverted icon (`packaging/assets/MidnaDev.ico`) and the Gruvbox theme.
 
 It quits the running copy with `midna-app.exe --quit` and starts the new one through Explorer.
-midnad can't upgrade in place on Windows. The new app asks the running daemon to move onto its
-build, and that daemon restarts once every agent is idle, reopening each terminal (see "Upgrades"
-under "Not done yet"). A daemon from before that refuses, and stays on its old build until it's
-stopped (the app says so); `--restart-daemon` stops it first, which closes its terminals.
+The daemon keeps running. As on macOS, the new app installs its midnad (`midnad --install-self`)
+and calls `daemon.upgrade`, and the running daemon hands every terminal to the new midnad through
+its keeper, so shells and agents keep running (see "Upgrades" under "Not done yet"); the script
+then prints the old midnad's "resumed N session(s)" or why it kept running. A daemon from before
+the keepers restarts once every agent is idle and reopens each terminal instead, and one older
+still refuses and stays on its build until it's stopped (the app says so). `--restart-daemon`
+stops it first, which closes its terminals.
 
 Windows won't rename or delete a folder that a running process works in. midnad used to keep the
 working folder it was started in, which was the app's folder when the app started it, so the

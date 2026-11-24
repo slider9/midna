@@ -7,8 +7,11 @@
 # copy (in its home's cli folder), and it refuses to write the installed Midna's files. It has
 # an inverted icon and the Gruvbox theme.
 #
-# Windows can't upgrade a daemon in place yet (its terminals would close), so a rerun leaves a
-# running daemon on its old build; the app says so. --restart-daemon stops it first.
+# A rerun leaves Midna Dev's daemon running: the new app installs its midnad and asks the running
+# one to upgrade (daemon.upgrade), which hands every terminal to the new midnad through its keeper,
+# so shells keep running. A daemon from before the keepers can't hand over: one with the idle
+# restart reopens the terminals once every agent is idle, an older one stays on its build (the app
+# says so). --restart-daemon stops it first, which closes its terminals.
 #
 #   scripts/dev-app-windows.sh [--test[=CRATES]] [--no-build] [--restart-daemon]
 #     --test            run all the tests (scripts/test.sh) first and stop if they fail
@@ -16,7 +19,7 @@
 #                       the crates that depend on them
 #     --no-build        skip the build; just reinstall and restart from the last dev build
 #     --restart-daemon  stop Midna Dev's daemon, which closes its terminals, so the new build's
-#                       starts
+#                       starts (for a daemon too old to hand its terminals over)
 #   scripts/dev-app-windows.sh --uninstall   quit it, stop its daemon, remove its login entry,
 #                                            Start menu entry and CLI copy, and delete the app
 #                                            (its home stays). Run it from a shell outside any
@@ -44,7 +47,7 @@ for a in "$@"; do
     --no-build) BUILD=0 ;;
     --restart-daemon) RESTART=1 ;;
     --uninstall) UNINSTALL=1 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "dev-app-windows.sh: unknown option $a" >&2; exit 2 ;;
   esac
 done
@@ -158,8 +161,9 @@ rmdir "$NEW"
 rm -rf "$OLD" 2>/dev/null || echo "    left $OLD (something in it is in use)"
 
 echo "==> start $(cygpath -w "$APP")"
-lines=0
+lines=0 dlines=0
 [ -f "$LOG" ] && lines=$(wc -l < "$LOG")
+[ -f "$HOME_U/midnad.log" ] && dlines=$(wc -l < "$HOME_U/midnad.log")
 # Through Explorer, the way a human starts it: with Explorer's environment, holding none of this
 # script's handles (one would keep a pipe the script is read through open while the app runs),
 # and outside any app package the script runs in. The Claude desktop app is one: AppData writes
@@ -175,6 +179,21 @@ for _ in $(seq 1 40); do
     break
   fi
 done
+# A handover or an immediate reopen (a daemon from before the keepers, nothing to wait for)
+# started: say how it went, from the old midnad's or the new one's log line.
+case "$line" in
+  *'daemon.upgrade: '*'"when":"now"'*)
+    for _ in $(seq 1 60); do
+      sleep 0.5
+      d="$(tail -n +"$((dlines + 1))" "$HOME_U/midnad.log" 2>/dev/null | grep -E "resumed [0-9]+ session|terminal\(s\) reopened|failed, this midnad keeps running" | tail -1 || true)"
+      if [ -n "$d" ]; then
+        echo "    ${d#midnad\[*\]: }"
+        break
+      fi
+    done
+    [ -n "$d" ] || echo "    the daemon hasn't reported the restart after 30s (see $(cygpath -w "$HOME_U/midnad.log"))"
+    ;;
+esac
 # A fresh dev home starts on the default theme; give it Gruvbox so it can't pass for the real
 # Midna (Twilight). A theme picked by hand is left alone.
 if cli="$(dev_cli)" && [ "$("$cli" settings get theme 2>/dev/null)" = "system" ]; then
