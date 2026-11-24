@@ -204,6 +204,69 @@ pub(crate) fn running(info: &AgentInfo) -> impl Iterator<Item = &BackgroundTask>
     info.background.iter().filter(|b| b.status.is_empty() || b.status == "running")
 }
 
+/// A path as a person writes it: without Windows' `\\?\` (verbatim) prefix.
+fn plain_path(p: &str) -> String {
+    match p.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => p.strip_prefix(r"\\?\").unwrap_or(p).to_string(),
+    }
+}
+
+/// What a deferred human-only call (an approval's `Cli` action: `method {params}`, or a
+/// ready-made line such as `settings set key value`) asks for, in words. The needs-you item's
+/// detail keeps the exact call; this is only the toast's text.
+fn deferred_words(cli: &str, detail: &str, title: &str) -> String {
+    let (head, rest) = cli.split_once(' ').unwrap_or((cli, ""));
+    let is_method = head.contains('.') && head.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c == '.');
+    if !is_method {
+        return match head {
+            "settings" => match rest.split_once(' ') {
+                Some(("set", kv)) => match kv.split_once(' ') {
+                    Some((key, value)) => format!("Change the setting {key} to {value}"),
+                    None => format!("Change the setting {kv}"),
+                },
+                Some(("reset", key)) => format!("Reset the setting {key} to its default"),
+                _ => agent_asks(title),
+            },
+            _ => agent_asks(title),
+        };
+    }
+    // `cli` is the summary, cut at 240 characters; the detail's last line has the exact params.
+    let exact = detail.lines().find_map(|l| l.strip_prefix("Approving runs exactly: ")).and_then(|l| l.strip_prefix(head)).map(str::trim);
+    let params: Value = exact.and_then(|j| serde_json::from_str(j).ok()).or_else(|| serde_json::from_str(rest).ok()).unwrap_or(Value::Null);
+    let p = |k: &str| params.get(k).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty());
+    match head {
+        "daemon.upgrade" => {
+            let busy = if params.get("force").and_then(Value::as_bool) == Some(true) { " even if the machine is busy" } else { "" };
+            match p("binary_path") {
+                Some(path) => format!("Upgrade the daemon to {}{busy}", plain_path(path)),
+                None => format!("Upgrade the daemon{busy}"),
+            }
+        }
+        "daemon.restart" => "Restart the daemon".into(),
+        "daemon.stop" => "Stop the daemon".into(),
+        "settings.set" => match (p("key"), params.get("value")) {
+            (Some(key), Some(Value::String(v))) => format!("Change the setting {key} to {v}"),
+            (Some(key), Some(v)) => format!("Change the setting {key} to {v}"),
+            _ => "Change a setting".into(),
+        },
+        "settings.reset" => p("key").map(|k| format!("Reset the setting {k} to its default")).unwrap_or_else(|| "Reset a setting".into()),
+        "secret.set" | "secret.replace" => p("name").map(|n| format!("Store a new value for the secret {n}")).unwrap_or_else(|| "Store a secret".into()),
+        "secret.remove" => p("name").map(|n| format!("Remove the secret {n}")).unwrap_or_else(|| "Remove a secret".into()),
+        "secret.write" => p("name").map(|n| format!("Write the secret {n} to a file")).unwrap_or_else(|| "Write a secret to a file".into()),
+        "rule.add" => "Add a policy rule".into(),
+        "rule.restore" => "Restore a removed policy rule".into(),
+        "rule.remove" | "rule.request_removal" => "Remove a policy rule".into(),
+        // Anything else: plain, and never the parameters.
+        _ => format!("Run {head}"),
+    }
+}
+
+/// `Agent asks to change x` as `Change x`, for a call with no words of its own here.
+fn agent_asks(title: &str) -> String {
+    capitalize(title.strip_prefix("Agent asks to ").unwrap_or(title))
+}
+
 /// Map one event to a notification draft (and keep the notifier's book-keeping).
 fn draft_for(d: &Daemon, e: &Event) -> Option<Draft> {
     let sid = e.session_id.clone();
@@ -218,8 +281,14 @@ fn draft_for(d: &Daemon, e: &Event) -> Option<Draft> {
             };
             let mut body = capitalize(&item.title);
             let action = item.approval.as_ref().map(|a| a.action.value.clone()).unwrap_or_default();
-            if item.kind == NeedsYouKind::Approval && item.approval.is_some() {
-                body = format!("Approve? {action}");
+            if item.kind == NeedsYouKind::Approval
+                && let Some(a) = &item.approval
+            {
+                body = match a.action.kind {
+                    // A call an agent can't make itself: say what it wants, not the call.
+                    ActionKind::Cli => deferred_words(&a.action.value, &item.detail, &item.title),
+                    _ => format!("Approve? {action}"),
+                };
             }
             let kind = serde_json::to_value(item.kind).unwrap_or_default();
             let mut draft = Draft::new(category, e, body).var("title", capitalize(&item.title)).var("kind", kind).var("action", action);
@@ -817,6 +886,28 @@ mod tests {
         o.insert("enabled".to_string(), false);
         assert_eq!(blocked(&defaults, Some(&o), "approval"), Some("muted"));
         assert_eq!(blocked(&settings(&["notify.enabled"]), None, "approval"), Some("disabled"));
+    }
+
+    #[test]
+    fn an_approval_toast_says_what_the_agent_wants() {
+        let t = "Agent asks to run daemon.upgrade";
+        let upgrade = r#"daemon.upgrade {"binary_path":"\\\\?\\C:\\Users\\me\\Temp\\t187b2\\midnad.exe","force":false}"#;
+        assert_eq!(deferred_words(upgrade, "", t), r"Upgrade the daemon to C:\Users\me\Temp\t187b2\midnad.exe");
+        assert_eq!(deferred_words(r#"daemon.upgrade {"binary_path":"/opt/midnad","force":true}"#, "", t), "Upgrade the daemon to /opt/midnad even if the machine is busy");
+        assert_eq!(deferred_words("daemon.restart {}", "", t), "Restart the daemon");
+        assert_eq!(deferred_words("daemon.stop {}", "", t), "Stop the daemon");
+        assert_eq!(deferred_words(r#"settings.set {"key":"notify.enabled","value":false}"#, "", t), "Change the setting notify.enabled to false");
+        assert_eq!(deferred_words(r#"settings.reset {"key":"notify.enabled"}"#, "", t), "Reset the setting notify.enabled to its default");
+        assert_eq!(deferred_words(r#"secret.remove {"name":"GH_TOKEN"}"#, "", t), "Remove the secret GH_TOKEN");
+        // A line the call already wrote itself, and a method with no words: never JSON.
+        assert_eq!(deferred_words("settings set theme gruvbox", "", t), "Change the setting theme to gruvbox");
+        assert_eq!(deferred_words("stream remove builds", "", "Agent asks to remove stream builds"), "Remove stream builds");
+        assert_eq!(deferred_words(r#"project.remove {"id":"p_1"}"#, "", t), "Run project.remove");
+        // The summary is cut at 240 characters, so its JSON may not parse.
+        assert_eq!(deferred_words(r#"daemon.upgrade {"binary_path":"C:\\a…"#, "", t), "Upgrade the daemon");
+        let detail = "Human-only action requested by an agent: daemon.upgrade {…\nApproving runs exactly: daemon.upgrade {\"binary_path\":\"\\\\\\\\?\\\\C:\\\\very\\\\long\\\\midnad.exe\",\"force\":false}";
+        assert_eq!(deferred_words(r#"daemon.upgrade {"binary_path":"C:\\a…"#, detail, t), r"Upgrade the daemon to C:\very\long\midnad.exe");
+        assert_eq!(plain_path(r"\\?\UNC\srv\share\x"), r"\\srv\share\x");
     }
 
     #[test]
