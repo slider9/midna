@@ -80,6 +80,10 @@ comes to the front if it's already running). When the zip is a newer version tha
 one, running it updates the installed copy; when it's older than the installed one, Midna refuses
 and tells you to uninstall the newer one first.
 
+To install from a script with no window, run `midna-app.exe --install` from the unzipped folder.
+It does the same copy and setup, prints each step and exits (1 when a step failed) without
+starting Midna.
+
 ## 5. The `midna` command
 
 `midna.exe` is the command-line tool that agents, and you, use to drive Midna (`midna --help`,
