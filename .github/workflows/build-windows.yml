@@ -1,0 +1,143 @@
+name: Build and test (Windows)
+
+# Every PR into feat/windows-native, and every push to it, builds the workspace on Windows and
+# runs the tests that pass reliably there (docs/STATUS-windows.md, "What works"):
+#
+#   midna-proto            all of it
+#   midnad --lib           its unit tests
+#   midna-app              all of it
+#   midna-cli              unit and integration tests (they start real temp daemons)
+#
+# midnad's integration tests (crates/midnad/tests/*.rs) are left out: on Windows a few of them
+# fail now and then (stream_keys_scroll_and_selection, close_on_exit and the others G23's goal
+# notes and STATUS-windows.md's "Not done yet" item 2 list), and a check that fails at random
+# teaches people to re-run it. Run them by hand with scripts/test.sh -p midnad.
+#
+# Worked around until the board's backlog items are fixed (drop each workaround with its fix):
+#   Rust is pinned to 1.99.1 (B152, at "Install Rust")
+#   midna-app runs one test at a time (B154, at "midna-app")
+#   skipped: midna-app commands::tests::temp_folders_are_listed_only_with_a_terminal_open,
+#   which needs a \tmp folder on the checkout's drive (B153)
+#   skipped: midnad pty::windows::tests::a_killed_keeper_ends_its_terminal_and_what_the_shell_started,
+#   which on the runner hits a race in Master::wait_exit (B156)
+#
+# The toolchain is the one scripts/setup-toolchain.sh and scripts/setup-conpty.sh pin (Zig,
+# Ghostty's source, Microsoft's newer ConPTY), cached like release-windows.yml's; env.sh points
+# the build and the tests at it. macOS's workflows (build-macos.yml, release.yml) are separate.
+on:
+  pull_request:
+    branches: [feat/windows-native]
+  push:
+    branches: [feat/windows-native]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A CI build is built once; incremental artifacts would only fill the cache.
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    # Not windows-latest: its Visual Studio 2026 (MSVC 14.52) STL wants Clang 22, newer than the
+    # one in Zig 0.15.2, which builds Ghostty's C++ against the MSVC headers.
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      # Ghostty's source and cargo's build paths run past Windows' 260-character limit.
+      - name: Long paths
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@v4
+
+      # Pinned, not stable: from Rust 1.100 cargo puts test binaries under target/debug/build/,
+      # where midnad's keeper_exe doesn't look for midna-pty.exe, so every test that opens a
+      # terminal fails (B152). 1.99.1 is what the Windows port is built and tested with.
+      - name: Install Rust 1.99.1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+
+      # Dependencies' builds, libghostty-vt's Zig build among them (it lives in its OUT_DIR).
+      # A PR reads the cache feat/windows-native's last push saved. Saved when a test fails
+      # too: a red run's build is as good, and the re-run after a fix shouldn't start cold.
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: windows-test
+          cache-on-failure: true
+
+      # Zig, Ghostty's source and Microsoft's newer ConPTY, all pinned by their scripts. Saved
+      # as soon as it's set up, so a failed build or test doesn't fetch it all again.
+      - name: Restore toolchain
+        id: toolchain
+        uses: actions/cache/restore@v4
+        with:
+          path: .toolchain
+          key: toolchain-${{ runner.os }}-${{ hashFiles('scripts/setup-toolchain.sh', 'scripts/setup-conpty.sh') }}
+
+      - name: Set up toolchain
+        run: |
+          ./scripts/setup-toolchain.sh
+          ./scripts/setup-conpty.sh
+
+      - name: Save toolchain
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .toolchain
+          key: ${{ steps.toolchain.outputs.cache-primary-key }}
+
+      # The whole workspace, midna-pty.exe among it: the tests' daemons run their terminals in
+      # the keeper they find beside the test binaries. Then each test step's own build, with the
+      # same packages it names: cargo unifies features per invocation, so one --no-run of them
+      # all would leave each step to rebuild what its own feature set changes.
+      - name: Build
+        id: build
+        run: |
+          . ./env.sh
+          [ -n "${MIDNA_CONPTY:-}" ] || { echo "::error::env.sh found no ConPTY in .toolchain/conpty"; exit 1; }
+          echo "MIDNA_CONPTY=$MIDNA_CONPTY"
+          cargo build --workspace --locked
+          cargo test --locked -p midna-proto --no-run
+          cargo test --locked -p midnad --lib --no-run
+          cargo test --locked -p midna-app --no-run
+          cargo test --locked -p midna-cli --no-run
+
+      # Each crate runs once the build passed, so one crate's failure doesn't hide another's.
+      - name: midna-proto
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          . ./env.sh
+          cargo test --locked -p midna-proto
+
+      - name: midnad unit tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          . ./env.sh
+          cargo test --locked -p midnad --lib -- --skip pty::windows::tests::a_killed_keeper_ends_its_terminal_and_what_the_shell_started
+
+      # One test at a time: run side by side, one GPUI test's thread can wake another test's
+      # scheduler, which then fails as "not deterministic" (B154). Serial costs about 4 seconds.
+      - name: midna-app
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          . ./env.sh
+          cargo test --locked -p midna-app -- --test-threads=1 --skip commands::tests::temp_folders_are_listed_only_with_a_terminal_open
+
+      - name: midna-cli
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          . ./env.sh
+          cargo test --locked -p midna-cli
