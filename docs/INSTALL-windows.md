@@ -25,8 +25,8 @@ Leave the other things on that page alone:
 ## 2. Unzip
 
 Unzip it into a folder of its own, such as Downloads: right-click the zip ▸ **Extract All…**.
-You get a `Midna` folder with `midna-app.exe`, `midnad.exe`, `midna.exe`, `conpty.dll`,
-`OpenConsole.exe`, `midna-bundle.txt` and a `Fonts` folder.
+You get a `Midna` folder with `midna-app.exe`, `midnad.exe`, `midna.exe`, `midna-pty.exe`,
+`conpty.dll`, `OpenConsole.exe`, `ConPTY-LICENSE.txt`, `midna-bundle.txt` and a `Fonts` folder.
 
 Run it from a folder that holds only Midna. If `midna-bundle.txt` ends up among other files,
 Midna refuses to install from there rather than copy them. The Midna that gets installed is a
