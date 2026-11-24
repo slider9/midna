@@ -61,8 +61,35 @@ pressed.
 `dist/<version>-windows/Midna`, holding `midna-app.exe`, `midnad.exe`, `midna.exe`, the newer
 ConPTY (`conpty.dll`, `OpenConsole.exe`), the fonts' and ConPTY's licenses and
 `midna-bundle.txt`. It won't build without the ConPTY (`--conpty FILE` names another copy). With
-that marker next to it, `midna-app.exe` runs as an installed Midna (`nonmac/install.rs`). Copy
-the folder to `%LOCALAPPDATA%\Programs\Midna` and run `midna-app.exe`. On each launch it:
+that marker next to it, `midna-app.exe` runs as an installed Midna (`nonmac/install.rs`).
+
+There's no separate installer: the build installs itself. Its install folder is
+`%LOCALAPPDATA%\Programs\<its name>` (`Midna`; Midna Dev's `Midna Dev`, a test build's `Midna
+Test`; those two take `MIDNA_INSTALL_DIR` instead when it's set, Midna never does). Run from
+anywhere else, such as the folder a release zip unpacks to in Downloads, it doesn't run there
+(`install::place`, before anything else at launch):
+
+- nothing installed: it copies its folder in (`update_windows::swap_in`: each file as
+  `<name>.new`, then renamed into place, the marker last), starts that copy and exits;
+- the same version installed: it starts that copy and exits (a running one comes to the front);
+- an older version: it asks a running app to quit and hands the install to the update helper
+  (`update_windows::start_apply`), which swaps the files in with rollback once this launch has
+  exited and starts the new app, as an update does;
+- a newer version: it refuses, saying to uninstall that one first (Settings ▸ Apps).
+
+It refuses to install from a folder holding anything but the build (`not_the_build`), so a marker
+among someone's files never copies them. What it has to say goes to the console it was run from,
+else a message box. The first launch of the installed copy says in a toast that it's installed
+there (a note in `MIDNA_HOME\installed.txt` that it removes).
+
+Explorer's Extract All marks every file of a downloaded zip with the Mark of the Web
+(`Zone.Identifier`, ZoneId=3), and a copy keeps it. The copy into the install folder drops it
+(`drop_web_mark`), so the installed `midna-app.exe` doesn't go through SmartScreen again when the
+Start menu starts it: the person already chose to run that very build from the zip. The zip and
+its unpacked folder keep their marks. The helpers and midnad are started with `CreateProcess`,
+which SmartScreen never checks.
+
+On each launch from its install folder it:
 
 - installs midnad and the ConPTY files beside it (`midnad --install-self`) into
   `MIDNA_HOME\bin\<version>-<hash>`, unless that build is already there;
@@ -75,7 +102,7 @@ the folder to `%LOCALAPPDATA%\Programs\Midna` and run `midna-app.exe`. On each l
 - registers the login entry and starts midnad if it isn't answering;
 - copies the `midna` CLI into `~\.local\bin` when that folder is on PATH.
 
-There's no installer yet. `midna-app.exe --uninstall` (also what Settings ▸ Apps' Uninstall
+`midna-app.exe --uninstall` (also what Settings ▸ Apps' Uninstall
 runs) quits the running app (it would start midnad again), stops midnad (closing its terminals)
 and removes the login entry, the CLI copy, the Start menu entry and the Settings ▸ Apps entry.
 Once it has exited, a copy of it in `%TEMP%` (`--remove-install <folder> --wait <pid>`) removes
@@ -303,7 +330,7 @@ In rough order of how much they matter:
 3. **Shell integration, what's left.** A PowerShell alias for `claude` that names a full path skips the shims, and a profile that rebinds Enter to its own handler gets no output mark. Git Bash and cmd have no prompt marks: each prints its prompt in one write, which ConPTY would reorder. Marks depend on ConPTY painting within 15 ms, so on a very busy machine one may land early.
 4. **Installing and upgrading.** midnad starts at login and the app installs itself on launch
    (see Installing), but:
-   - There's no installer. The updater works (see Installing), but `packaging/build-windows.sh`
+   - A build installs itself when run from elsewhere, and the updater works (see Installing), but `packaging/build-windows.sh`
      embeds no update key yet, so a build from it reports updates off.
    - **Upgrades.** Each terminal runs in a keeper (`midna-pty.exe`) that outlives midnad, so
      `daemon.upgrade` and `daemon.restart` hand every terminal to the new midnad

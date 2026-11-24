@@ -2048,11 +2048,16 @@ impl MainWindow {
     }
 
     pub fn toast(&mut self, msg: impl Into<String>, cx: &mut Context<Self>) {
+        self.toast_for(msg, Duration::from_secs(4), cx);
+    }
+
+    /// A toast that stays `shown` long (a longer line than most).
+    pub fn toast_for(&mut self, msg: impl Into<String>, shown: Duration, cx: &mut Context<Self>) {
         self.toast = Some((msg.into(), Instant::now()));
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(4200)).await;
+            cx.background_executor().timer(shown + Duration::from_millis(200)).await;
             let _ = this.update(cx, |m, cx| {
-                if m.toast.as_ref().is_some_and(|(_, t)| t.elapsed() >= Duration::from_secs(4)) {
+                if m.toast.as_ref().is_some_and(|(_, t)| t.elapsed() >= shown) {
                     m.toast = None;
                     cx.notify();
                 }

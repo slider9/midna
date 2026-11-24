@@ -84,6 +84,14 @@ fn main() {
     if let Some(code) = lifecycle::headless(&std::env::args().collect::<Vec<_>>()) {
         std::process::exit(code);
     }
+    // Windows: a packaged build run from anywhere but its install folder (an unzipped release
+    // in Downloads) installs itself there and starts that copy instead (`install::place`).
+    #[cfg(windows)]
+    if single_instance()
+        && let Some(code) = install::place()
+    {
+        std::process::exit(code);
+    }
     // Windows: one app per MIDNA_HOME. A second launch brings the running one to the front and
     // exits (macOS does this itself). A fake backend, Slate and snapshot runs stand apart.
     #[cfg(windows)]

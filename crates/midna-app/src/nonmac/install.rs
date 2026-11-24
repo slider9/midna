@@ -608,6 +608,239 @@ fn is_our_cli(link: &Path) -> bool {
     std::fs::read(link).is_ok_and(|b| b.windows(id.len()).any(|w| w == id))
 }
 
+// ------------------------------------------------------------------ the install folder
+
+/// Where this build installs itself: `%LOCALAPPDATA%\Programs\<its name>` (`Midna`, `Midna Dev`
+/// or `Midna Test`, from [`midna_proto::paths::app_name`]). Midna Dev and a test build take
+/// `MIDNA_INSTALL_DIR` instead when it's set (the tests' temp folders) and isn't another
+/// Midna's; Midna never does.
+#[cfg(windows)]
+pub fn install_dir() -> PathBuf {
+    // Never another Midna's folder (`guard_write`): this build would start or replace that one.
+    if midna_proto::paths::is_dev()
+        && let Some(d) = std::env::var_os("MIDNA_INSTALL_DIR").filter(|v| !v.is_empty()).map(PathBuf::from)
+        && midna_proto::paths::guard_write(&d).is_ok()
+    {
+        return d;
+    }
+    midna_proto::paths::app_data_dir().join("Programs").join(midna_proto::paths::app_name())
+}
+
+/// What a launch of a packaged build does about where it runs from ([`place`]).
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Placement {
+    /// Run as usual: this is the install folder.
+    Here,
+    /// Nothing is installed: copy this build in, then start that copy.
+    Install,
+    /// This version is installed: start that copy.
+    StartInstalled,
+    /// An older build is installed: replace it the way an update does, then start it.
+    Update,
+    /// A newer version is installed: refuse.
+    Newer(String),
+}
+
+/// What to do for a build in `here` whose install folder is `dest`, holding the version
+/// `installed` (None: nothing installed there; "": a build whose version can't be read).
+#[cfg(windows)]
+pub fn placement(here: &Path, dest: &Path, installed: Option<&str>, version: &str) -> Placement {
+    if same_dir(here, dest) {
+        return Placement::Here;
+    }
+    match installed {
+        None => Placement::Install,
+        Some(v) if v == version => Placement::StartInstalled,
+        Some(v) if crate::updater::is_newer(v, version) => Placement::Newer(v.to_string()),
+        Some(_) => Placement::Update,
+    }
+}
+
+/// The same folder, however it's spelled (case, `/`, short names, a trailing separator).
+#[cfg(windows)]
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let full = |p: &Path| midna_proto::paths::canonical(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().to_string();
+    midna_proto::paths::same_path(&full(a), &full(b))
+}
+
+/// A build's version from its [`BUNDLE_MARKER`]'s text (`Midna 1.2.3. With this file…`): the
+/// first word of the first line that is a version.
+#[cfg(windows)]
+pub fn marker_version(text: &str) -> Option<String> {
+    let line = text.lines().next()?;
+    line.split_whitespace().map(|w| w.trim_end_matches(['.', ','])).find(|w| semver::Version::parse(w).is_ok()).map(str::to_string)
+}
+
+/// The installed build's version: its marker's, else what its midnad reports, else "".
+#[cfg(windows)]
+fn installed_version(dir: &Path) -> String {
+    let marked = std::fs::read_to_string(dir.join(BUNDLE_MARKER)).ok().as_deref().and_then(marker_version);
+    marked.or_else(|| crate::update_windows::selftest_version(&dir.join(exe_name("midnad"))).ok()).unwrap_or_default()
+}
+
+/// Where the launch that installed a build leaves a note for that build's first launch
+/// ([`take_install_note`]): `MIDNA_HOME\installed.txt`, the version on the first line and the
+/// install folder on the second.
+#[cfg(windows)]
+fn install_note() -> PathBuf {
+    midna_proto::paths::midna_home().join("installed.txt")
+}
+
+/// A packaged build run from anywhere but its install folder ([`install_dir`]) goes there, so
+/// the Start menu, Settings ▸ Apps and login entries always name the install folder:
+///
+/// - nothing installed: copy this build in ([`update_windows::swap_in`], the marker last, Mark
+///   of the Web dropped) and start that copy;
+/// - this version installed: start that copy (which hands over to it if it's running);
+/// - an older one: quit it if it's running, and replace it as an update does
+///   ([`update_windows::start_apply`]: once this launch has exited, the helper swaps the files
+///   with rollback and starts the app);
+/// - a newer one: refuse, saying how to uninstall it first.
+///
+/// Returns the exit code when this launch is done, None when it should run as usual.
+///
+/// [`update_windows::swap_in`]: crate::update_windows::swap_in
+/// [`update_windows::start_apply`]: crate::update_windows::start_apply
+#[cfg(windows)]
+pub fn place() -> Option<i32> {
+    let Mode::Installed { bundle } = mode() else { return None };
+    let dest = install_dir();
+    let installed = dest.join(BUNDLE_MARKER).is_file().then(|| installed_version(&dest));
+    let name = midna_proto::paths::app_name();
+    let version = midna_proto::VERSION;
+    let step = placement(&bundle, &dest, installed.as_deref(), version);
+    if step != Placement::Here {
+        crate::lifecycle::log(&format!("launch from {}: {step:?} ({} in {})", bundle.display(), installed.as_deref().map_or("nothing", |v| if v.is_empty() { "a build" } else { v }), dest.display()));
+    }
+    let r = match step {
+        Placement::Here => return None,
+        Placement::StartInstalled => start_installed(&dest),
+        Placement::Newer(v) => Err(format!(
+            "{name} {v} is already installed in {}, which is newer than this {version}. To install this one instead, uninstall {name} first (Settings ▸ Apps ▸ {name} ▸ Uninstall), then run this again.",
+            dest.display()
+        )),
+        Placement::Install => foreign_files(&bundle)
+            .and_then(|()| quit_running())
+            .and_then(|()| crate::update_windows::swap_in(&bundle, &dest).map_err(|e| format!("Couldn't install {name} in {}: {e}", dest.display())))
+            .and_then(|()| {
+                leave_install_note(&dest);
+                start_installed(&dest)
+            }),
+        Placement::Update => foreign_files(&bundle).and_then(|()| quit_running()).and_then(|()| {
+            leave_install_note(&dest);
+            crate::update_windows::start_apply(&bundle, &dest, true).map_err(|e| format!("Couldn't update {name} in {}: {e}", dest.display()))
+        }),
+    };
+    Some(match r {
+        Ok(()) => 0,
+        Err(e) => {
+            tell(&e);
+            1
+        }
+    })
+}
+
+/// A build to install from must hold only the build ([`update_windows::not_the_build`]): its
+/// whole folder is copied, so a marker that ended up among someone's files never copies those.
+///
+/// [`update_windows::not_the_build`]: crate::update_windows::not_the_build
+#[cfg(windows)]
+fn foreign_files(bundle: &Path) -> Result<(), String> {
+    let others = crate::update_windows::not_the_build(bundle)?;
+    if others.is_empty() {
+        return Ok(());
+    }
+    let shown: Vec<&str> = others.iter().take(5).map(String::as_str).collect();
+    Err(format!(
+        "{} holds files that aren't {}'s ({}{}). Unpack the release zip into a folder of its own and run midna-app.exe from there.",
+        bundle.display(),
+        midna_proto::paths::app_name(),
+        shown.join(", "),
+        if others.len() > shown.len() { ", …" } else { "" }
+    ))
+}
+
+/// Ask a running app of this home to quit (its install is about to change), and wait for it.
+#[cfg(windows)]
+fn quit_running() -> Result<(), String> {
+    if !crate::instance::ask_to_quit() {
+        return Ok(());
+    }
+    crate::lifecycle::log("asked the running app to quit");
+    let t0 = std::time::Instant::now();
+    while crate::instance::running() && t0.elapsed() < std::time::Duration::from_secs(15) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if crate::instance::running() {
+        return Err(format!("{} is still running. Quit it, then run this again.", midna_proto::paths::app_name()));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn leave_install_note(dest: &Path) {
+    let note = install_note();
+    let r = note.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&note, format!("{}\n{}\n", midna_proto::VERSION, dest.display())));
+    if let Err(e) = r {
+        crate::lifecycle::log(&format!("{}: {e}", note.display()));
+    }
+}
+
+/// The line the first launch of a newly installed build shows, once: the note the launch that
+/// installed it left ([`place`]), when it names this build's version and folder.
+#[cfg(windows)]
+pub fn take_install_note(bundle: &Path) -> Option<String> {
+    let note = install_note();
+    let text = std::fs::read_to_string(&note).ok()?;
+    let _ = std::fs::remove_file(&note);
+    let mut lines = text.lines();
+    let (version, dir) = (lines.next()?.trim(), Path::new(lines.next()?.trim()));
+    (version == midna_proto::VERSION && same_dir(dir, bundle)).then(|| install_line(midna_proto::paths::app_name(), version, bundle))
+}
+
+#[cfg(windows)]
+fn install_line(name: &str, version: &str, dir: &Path) -> String {
+    format!("{name} {version} is installed in {}. Start it from the Start menu from now on; the folder you ran it from can go.", dir.display())
+}
+
+/// Start the app in `dest` and let it come to the front.
+#[cfg(windows)]
+fn start_installed(dest: &Path) -> Result<(), String> {
+    let exe = dest.join(exe_name("midna-app"));
+    // SAFETY: a plain call. This launch came from a click; the copy it starts may take the front.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(windows_sys::Win32::UI::WindowsAndMessaging::ASFW_ANY);
+    }
+    let mut cmd = Command::new(&exe);
+    cmd.current_dir(dest).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    cmd.spawn().map(|_| ()).map_err(|e| format!("Couldn't start {}: {e}", exe.display()))
+}
+
+/// Say `msg` to whoever ran this: the console it was run from, else a message box (a release
+/// build has no console of its own), except with `MIDNA_NO_ACTIVATE` (a test run in the
+/// background), where app.log has it.
+#[cfg(windows)]
+fn tell(msg: &str) {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, GetLastError};
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK, MessageBoxW};
+    crate::lifecycle::log(msg);
+    // SAFETY: plain calls with NUL-terminated strings we own.
+    unsafe {
+        // Access denied: it has a console already (a debug build).
+        if AttachConsole(ATTACH_PARENT_PROCESS) != 0 || GetLastError() == ERROR_ACCESS_DENIED {
+            eprintln!("midna-app: {msg}");
+            return;
+        }
+        if std::env::var_os("MIDNA_NO_ACTIVATE").is_some() {
+            return;
+        }
+        let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        MessageBoxW(std::ptr::null_mut(), wide(msg).as_ptr(), wide(midna_proto::paths::app_name()).as_ptr(), MB_OK | MB_ICONWARNING);
+    }
+}
+
 // ------------------------------------------------------------------ relaunch
 
 /// Windows relaunches through the update's own helper (`update_windows::apply_main`).
@@ -751,6 +984,55 @@ mod tests {
         crate::winreg::delete_key(&key).unwrap();
         assert_eq!(text("DisplayName"), None);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_build_run_from_elsewhere_installs_starts_updates_or_refuses() {
+        let d = scratch("place");
+        let (zip, dest) = (d.join("Downloads").join("Midna-1.2.0-windows-x86_64").join("Midna"), d.join("Programs").join("Midna"));
+        std::fs::create_dir_all(&zip).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        // Run from the install folder, however it's spelled: as usual.
+        let upper = PathBuf::from(dest.to_string_lossy().to_uppercase() + "\\");
+        assert_eq!(placement(&upper, &dest, Some("1.0.0"), "1.2.0"), Placement::Here);
+        assert_eq!(placement(&dest, &dest, None, "1.2.0"), Placement::Here);
+        // From anywhere else.
+        assert_eq!(placement(&zip, &dest, None, "1.2.0"), Placement::Install);
+        assert_eq!(placement(&zip, &dest, Some("1.2.0"), "1.2.0"), Placement::StartInstalled);
+        assert_eq!(placement(&zip, &dest, Some("1.1.9"), "1.2.0"), Placement::Update);
+        assert_eq!(placement(&zip, &dest, Some("1.2.0-beta.3"), "1.2.0"), Placement::Update);
+        assert_eq!(placement(&zip, &dest, Some(""), "1.2.0"), Placement::Update, "a build whose version can't be read is replaced");
+        assert_eq!(placement(&zip, &dest, Some("1.3.0"), "1.2.0"), Placement::Newer("1.3.0".into()));
+        assert_eq!(placement(&zip, &dest, Some("1.2.0-beta.4"), "1.2.0-beta.3"), Placement::Newer("1.2.0-beta.4".into()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_install_folder_is_named_for_the_build() {
+        let want = midna_proto::paths::app_data_dir().join("Programs").join(midna_proto::paths::app_name());
+        if !midna_proto::paths::is_dev() {
+            assert_eq!(want, midna_proto::paths::windows_install_dir());
+        }
+        if !midna_proto::paths::is_dev() || std::env::var_os("MIDNA_INSTALL_DIR").is_none() {
+            assert_eq!(install_dir(), want);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_marker_names_the_version() {
+        let text = "Midna Test 0.9.0-e2e.1. With this file next to it, midna-app.exe runs as an installed Midna: it\ninstalls…";
+        assert_eq!(marker_version(text).as_deref(), Some("0.9.0-e2e.1"));
+        assert_eq!(marker_version("Midna 1.2.3. With this file").as_deref(), Some("1.2.3"));
+        assert_eq!(marker_version("Midna Dev 0.4.0-beta.2.\n").as_deref(), Some("0.4.0-beta.2"));
+        assert_eq!(marker_version(""), None);
+        assert_eq!(marker_version("a build\n1.2.3"), None, "only the first line");
+        assert_eq!(
+            install_line("Midna", "1.2.3", Path::new(r"C:\Users\me\AppData\Local\Programs\Midna")),
+            r"Midna 1.2.3 is installed in C:\Users\me\AppData\Local\Programs\Midna. Start it from the Start menu from now on; the folder you ran it from can go."
+        );
     }
 
     #[cfg(windows)]
