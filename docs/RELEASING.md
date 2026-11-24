@@ -162,8 +162,8 @@ setting and `MIDNA_UPDATE_FEED_URL` still override it; a build without the varia
 `release.yml`, local builds) keeps upstream's feed. `updates.channel` defaults to `beta` on a
 Windows build whose own version has `-beta` in it, until the user picks a channel, since a
 build of a beta base is only ever in `windows-beta.json`. On `stable`, a missing
-`windows-stable.json` (none until the first Windows build of a stable base) reads as up to date
-rather than an error.
+`windows-stable.json` on the compiled-in feed (none until the first Windows build of a stable
+base) reads as up to date rather than an error; on a feed set by hand it stays an error.
 
 **Version.** A Windows version is the upstream version the fork last merged, which is what
 `Cargo.toml` says, plus a Windows counter:

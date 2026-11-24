@@ -133,14 +133,16 @@ pub fn fetch_feed(url: &str, missing_ok: bool) -> Result<Option<FeedEntry>, Stri
 }
 
 /// Whether a feed file that doesn't exist means there's nothing newer: on Windows' stable
-/// channel, which has no windows-stable.json until the first Windows build of a stable base is
-/// released. Anywhere else a missing feed is an error worth showing.
-pub fn missing_feed_is_current(channel: &str) -> bool {
-    missing_feed_is_current_for(channel, std::env::consts::OS)
+/// channel of the feed this build was made with (`template` is
+/// [`midna_proto::settings::DEFAULT_FEED_URL`]), which has no windows-stable.json until the
+/// first Windows build of a stable base is released. Anywhere else, a feed set by hand
+/// included, a missing feed is an error worth showing: it's likely a typo.
+pub fn missing_feed_is_current(template: &str, channel: &str) -> bool {
+    missing_feed_is_current_for(template, channel, std::env::consts::OS)
 }
 
-fn missing_feed_is_current_for(channel: &str, os: &str) -> bool {
-    os == "windows" && channel == "stable"
+fn missing_feed_is_current_for(template: &str, channel: &str, os: &str) -> bool {
+    os == "windows" && channel == "stable" && template == midna_proto::settings::DEFAULT_FEED_URL
 }
 
 /// The keys in a list like `MIDNA_UPDATE_PUBKEY`: separated by commas or whitespace.
@@ -575,10 +577,13 @@ mod tests {
 
     #[test]
     fn only_windows_stable_takes_a_missing_feed_as_current() {
-        assert!(missing_feed_is_current_for("stable", "windows"));
-        assert!(!missing_feed_is_current_for("beta", "windows"));
-        assert!(!missing_feed_is_current_for("stable", "macos"));
-        assert!(!missing_feed_is_current_for("beta", "macos"));
+        let built = midna_proto::settings::DEFAULT_FEED_URL;
+        assert!(missing_feed_is_current_for(built, "stable", "windows"));
+        assert!(!missing_feed_is_current_for(built, "beta", "windows"));
+        assert!(!missing_feed_is_current_for(built, "stable", "macos"));
+        assert!(!missing_feed_is_current_for(built, "beta", "macos"));
+        // A feed set by hand (updates.feed_url, MIDNA_UPDATE_FEED_URL) keeps the error: a typo.
+        assert!(!missing_feed_is_current_for("https://github.com/slider9/midan/releases/download/channels/{channel}.json", "stable", "windows"));
     }
 
     /// A server that answers each of `n` requests with `status` and `body`.

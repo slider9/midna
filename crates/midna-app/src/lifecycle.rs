@@ -596,7 +596,7 @@ impl Worker {
             .unwrap_or_else(|| midna_proto::settings::DEFAULT_FEED_URL.into());
         let url = updater::feed_url(&template, &channel);
         let r = (|| -> Result<UpdateState, String> {
-            let Some(e): Option<FeedEntry> = updater::fetch_feed(&url, updater::missing_feed_is_current(&channel))? else {
+            let Some(e): Option<FeedEntry> = updater::fetch_feed(&url, updater::missing_feed_is_current(&template, &channel))? else {
                 log(&format!("update check: no {url} yet, so nothing newer on {channel}"));
                 return Ok(UpdateState::UpToDate { at: Instant::now() });
             };
