@@ -12,6 +12,9 @@ tb release cut v0.2.0          # public release, from main
 tb release cut v0.3.0-beta.1   # beta (prerelease), from any branch
 ```
 
+Windows builds from the fork are cut with `tb release cut windows-v<version>` and
+`scripts/release-windows.sh` instead; see "Windows releases".
+
 `tb release cut` runs `scripts/release.sh` with `TB_RELEASE` set and records the release on the
 task board when it succeeds. Run on its own, `release.sh` refuses unless you pass `--force`.
 `release.sh` checks the version is newer than the last one (`scripts/newest-version.py`), writes it
@@ -95,8 +98,41 @@ Windows builds ship from the fork, `slider9/midna`, with the fork's own update k
 Authenticode signature yet. Only slider9 runs them (the workflow checks `github.actor`).
 
 ```sh
-git tag windows-v0.1.0-beta.58.w.1 && git push origin windows-v0.1.0-beta.58.w.1
+tb release cut windows-v0.1.0-beta.58.w.1   # a build of a beta base (a prerelease)
+tb release cut windows-v0.2.0-w.1           # a build of a stable base
+scripts/release-windows.sh 0.1.0-beta.58.w.1 --dry-run   # every check below, no tag
 ```
+
+On slider9's board, midna's release script is `scripts/release-windows.sh`
+(`tb project set midna --releases on --release-script scripts/release-windows.sh`), so
+`tb release cut` there cuts Windows releases only; macOS releases are upstream's (`release.sh`,
+from `mrgnhnt96/midna`). The board runs a release script only in a checkout on `main` or a
+`release/*` branch, so until it accepts `feat/windows-native` (B155), it refuses the cut before
+the script runs. The script takes `windows-v<version>`, `v<version>` or `<version>`. Run on its own it refuses
+unless you pass `--force` (or `--dry-run`, which runs every check and stops before the tag).
+Unlike `release.sh` it never writes a version or commits: the files keep the upstream base and
+the counter lives only in the tag (below), so a cut is an annotated tag on
+`feat/windows-native`'s head, pushed to `origin` on its own. The push uses this PC's git sign-in
+for github.com (slider9's, in the credential manager) with prompts turned off, because the board
+runs the script in the background; it prints the run's link when it's done.
+
+It refuses, and cuts nothing, when:
+
+| It says | Why, and what to do |
+|---|---|
+| `Windows releases go out from feat/windows-native` | Betas and full releases alike come from that branch. Switch to it. |
+| `Commit or stash your changes first` | The tag would leave out what's in the working tree. |
+| `feat/windows-native isn't the same as origin's` | The tag goes on the commit everyone has: pull (or push) first. |
+| `… is already tagged; a version is never reused` | Pick the next one. When that tag never got a published release, it prints how to re-run or cut it again (see "A Windows release failed"). |
+| `… is a build of X, but the files say Y` | The version's base must be what `scripts/set-version.sh --check` says `Cargo.toml` has; it prints the next version of that base. |
+| `… isn't newer than the newest Windows tag` | Updates never go backwards (`scripts/newest-version.py`). |
+| `… skips a number` | The counter is the next one after the newest Windows tag of the same base, or 1 for a new base; it prints which. |
+| `… has no published release (none, or only a draft)` | The newest Windows tag's workflow failed, was cancelled or is still running, or a hand run left only a draft. Don't move past it: see "A Windows release failed". |
+| `Pushing to origin needs a sign-in this script can't give` | The push would stop at a prompt. Push something to `origin` by hand once so the credential manager keeps the sign-in, then cut again. |
+
+It looks only at `windows-v*` tags, here and on `origin`; bare `v` tags are macOS's and never
+count. A tag that is only in this checkout counts too, so a tag deleted from `origin` has to be
+deleted here as well (`git tag -d`).
 
 A `windows-v` tag runs `.github/workflows/release-windows.yml`; a bare `v` tag runs
 `release.yml` (macOS) and never this one. Two jobs:
@@ -153,11 +189,35 @@ that tag like a push would; on a branch it only ever makes drafts. A draft run r
 version that is already published, and a real run replaces a leftover draft of its version
 with a fresh release before any channel points at it.
 
-The same rules hold as for macOS: never skip a version, and a failed run is re-run or cut again
-at the same number. The fork's `MIDNA_UPDATE_KEY` secret and `MIDNA_UPDATE_PUBKEY` variable
-are the fork's key; its secret half is kept offline (`%USERPROFILE%\.config\midna-release-windows`).
-The workflow publishes with `GITHUB_TOKEN` (`contents: write`), and the fork has no ruleset, so
-it needs no deploy key.
+### A Windows release failed
+
+The same rule holds as for macOS: **never skip a version**. If the workflow fails or is
+cancelled before the release is published, nobody has that version, so it goes out again at the
+same number (`release-windows.sh` refuses a newer one until it has):
+
+1. A flaky step (a runner hiccup, a download): **Re-run failed jobs** on the run. The build's
+   zip is kept as an artifact for 7 days, so a failed publish re-runs without a rebuild. Stop there.
+2. Something to fix in the code: cancel any run still going (`gh run cancel <id>`), merge the
+   fix into `feat/windows-native`, then delete the tag and cut it again:
+   `git push origin :refs/tags/windows-vX && git tag -d windows-vX && tb release cut windows-vX`.
+   The new tag goes on the new head.
+
+A run by hand with `draft` on leaves a **draft** release, which is never published: installed
+copies can't see it and the channels never name it. A draft on a branch run has no tag, so it
+doesn't hold up a cut, and the real run of that version deletes it and publishes a fresh
+release. A draft on a `windows-v` tag counts as no release, so the script refuses to cut past
+it: publish it (run the workflow on the tag with `draft` off), or delete the tag and cut it again
+with the commands above (that run replaces the leftover draft too). Once a release
+*is* published its number is used up, because installed copies may already have it.
+
+### Keys and secrets
+
+The fork's `MIDNA_UPDATE_KEY` secret and `MIDNA_UPDATE_PUBKEY` variable are the fork's update
+key, not upstream's. The private half's only copy is in slider9's password manager; it isn't on
+any PC. To sign anything by hand, or to set the secret again, take it from there into a temp file
+and delete that afterwards. The workflow publishes with `GITHUB_TOKEN` (`contents: write`), and
+the fork has no ruleset, so it needs no deploy key; the tag push is the only thing done with
+slider9's own credentials.
 
 ## The bundle (`packaging/build-app.sh`)
 
