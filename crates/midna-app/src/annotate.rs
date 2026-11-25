@@ -22,9 +22,11 @@
 //! The composer's send (Kass, `composer.rs`) takes it too: the images, then its text and notes.
 //!
 //! Images are normalized into `$TMPDIR/midna-images/`: PNG, JPEG, GIF and WebP are kept as
-//! they are; anything else (HEIC, TIFF, …) is converted to PNG with `sips`. One turned by its
-//! EXIF orientation or longer than 2000 px is redrawn upright at that size (`fitted`), as a JPEG
-//! if it's a photo: Claude Code is slow to read a big file, and delivery waits on it.
+//! they are; anything else (HEIC, TIFF, BMP, …) is converted to PNG, with `sips` on macOS and
+//! the image crate elsewhere (BMP and TIFF: a screenshot pasted on Windows is a BMP). One
+//! turned by its EXIF orientation or longer than 2000 px is redrawn upright at that size
+//! (`fitted`), as a JPEG if it's a photo: Claude Code is slow to read a big file, and delivery
+//! waits on it.
 use crate::app::{MainWindow, Overlay};
 use crate::ui::text_input::{FieldChanged, TextField};
 use gpui_kit::prelude::*;
@@ -1209,8 +1211,9 @@ fn load(src: Source) -> anyhow::Result<Shot> {
         _ => None,
     };
     // A photo (JPEG, or HEIC and the like) is saved as a JPEG if it's redrawn below; a
-    // screenshot stays a PNG, so its text stays sharp.
-    let photo = matches!(kept, None | Some((ImageFormat::Jpeg, _)));
+    // screenshot stays a PNG, so its text stays sharp. A BMP is a screenshot: Windows pastes
+    // one as that.
+    let photo = matches!(kept, Some((ImageFormat::Jpeg, _))) || (kept.is_none() && !matches!(::image::guess_format(&bytes), Ok(::image::ImageFormat::Bmp)));
     let (format, path, bytes) = match kept {
         Some((f, ext)) => {
             let path = dir.join(format!("{stem}.{ext}"));
@@ -1218,17 +1221,12 @@ fn load(src: Source) -> anyhow::Result<Shot> {
             (f, path, bytes)
         }
         None => {
-            // HEIC, TIFF, …: let macOS convert it.
-            let src = dir.join(format!("{stem}.src"));
             let path = dir.join(format!("{stem}.png"));
-            std::fs::write(&src, &bytes)?;
-            let out = std::process::Command::new("/usr/bin/sips").args(["-s", "format", "png"]).arg(&src).arg("--out").arg(&path).output();
-            let _ = std::fs::remove_file(&src);
-            match out {
-                Ok(o) if o.status.success() => {}
-                _ => anyhow::bail!("{name} is not an image {} can read", midna_proto::wording::os("macOS", "midna on Windows")),
-            }
-            (ImageFormat::Png, path.clone(), std::fs::read(&path)?)
+            let Some(png) = to_png(&dir, &stem, &bytes) else {
+                anyhow::bail!("{name} is not an image {} can read", midna_proto::wording::os("macOS", "midna on Windows"))
+            };
+            std::fs::write(&path, &png)?;
+            (ImageFormat::Png, path, png)
         }
     };
     let (format, path, bytes) = match fitted(&bytes, photo) {
@@ -1244,6 +1242,35 @@ fn load(src: Source) -> anyhow::Result<Shot> {
     };
     let (w, h) = ::image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format()?.into_dimensions().map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
     Ok(Shot { name, path, image: Arc::new(Image::from_bytes(format, bytes)), w, h, notes: vec![] })
+}
+
+/// HEIC, TIFF, BMP, …: `bytes` as a PNG, converted by macOS (`sips`, through a scratch file in
+/// `dir` named after `stem`). None when it can't be read.
+#[cfg(target_os = "macos")]
+fn to_png(dir: &Path, stem: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+    let src = dir.join(format!("{stem}.src"));
+    let out = dir.join(format!("{stem}.conv.png"));
+    std::fs::write(&src, bytes).ok()?;
+    let ok = std::process::Command::new("/usr/bin/sips").args(["-s", "format", "png"]).arg(&src).arg("--out").arg(&out).output().is_ok_and(|o| o.status.success());
+    let _ = std::fs::remove_file(&src);
+    let png = ok.then(|| std::fs::read(&out).ok()).flatten();
+    let _ = std::fs::remove_file(&out);
+    png
+}
+
+/// BMP, TIFF, …: `bytes` as a PNG, converted by the image crate, since there's no `sips` here.
+/// A screenshot pasted on Windows arrives as a BMP (the clipboard's DIB). None when it can't be
+/// read (HEIC, for one).
+#[cfg(not(target_os = "macos"))]
+fn to_png(_dir: &Path, _stem: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut img = ::image::load_from_memory(bytes).ok()?;
+    // A 32-bit bitmap whose alpha bytes are all zero is opaque, not invisible.
+    if img.color().has_alpha() && img.to_rgba8().pixels().all(|p| p.0[3] == 0) {
+        img = ::image::DynamicImage::ImageRgb8(img.to_rgb8());
+    }
+    let mut png = vec![];
+    img.write_to(&mut std::io::Cursor::new(&mut png), ::image::ImageFormat::Png).ok()?;
+    Some(png)
 }
 
 /// The longest side an image keeps. Claude scales anything bigger down to this before it
@@ -1529,6 +1556,36 @@ mod tests {
         assert_eq!((s.w, s.h), (3, 2));
         assert!(s.path.exists() && s.path.extension().unwrap() == "png");
         assert!(load(Source::Bytes { name: "junk".into(), bytes: b"not an image".to_vec() }).is_err());
+    }
+
+    #[test]
+    fn converts_bmp_and_tiff_to_png() {
+        let enc = |img: ::image::DynamicImage, f| {
+            let mut out = vec![];
+            img.write_to(&mut std::io::Cursor::new(&mut out), f).unwrap();
+            out
+        };
+        for f in [::image::ImageFormat::Bmp, ::image::ImageFormat::Tiff] {
+            let s = load(Source::Bytes { name: "x".into(), bytes: enc(::image::RgbImage::new(3, 2).into(), f) }).unwrap();
+            assert_eq!((s.w, s.h), (3, 2), "{f:?}");
+            assert_eq!(::image::guess_format(&std::fs::read(&s.path).unwrap()).unwrap(), ::image::ImageFormat::Png, "{f:?}");
+        }
+        // A big screenshot pasted on Windows (a BMP) shrinks as a PNG, so its text stays sharp.
+        let s = load(Source::Bytes { name: "shot".into(), bytes: enc(::image::RgbImage::new(4000, 1000).into(), ::image::ImageFormat::Bmp) }).unwrap();
+        assert_eq!((s.w, s.h), (2000, 500));
+        assert_eq!(s.path.extension().unwrap(), "png");
+    }
+
+    /// A 32-bit DIB from the clipboard often leaves every alpha byte zero.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_bitmap_with_zero_alpha_is_opaque() {
+        let img = ::image::RgbaImage::from_pixel(3, 2, ::image::Rgba([10, 20, 30, 0]));
+        let mut bmp = vec![];
+        img.write_to(&mut std::io::Cursor::new(&mut bmp), ::image::ImageFormat::Bmp).unwrap();
+        let s = load(Source::Bytes { name: "x".into(), bytes: bmp }).unwrap();
+        let out = ::image::open(&s.path).unwrap().to_rgba8();
+        assert_eq!(out.get_pixel(0, 0), &::image::Rgba([10, 20, 30, 255]));
     }
 
     #[test]

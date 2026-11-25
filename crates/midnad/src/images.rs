@@ -4,8 +4,9 @@
 //!
 //! Every image is copied to `$MIDNA_HOME/images/` first: the pasted path is then plain ASCII
 //! with no spaces (which the agents' path detection can trip on), and it outlives a caller's
-//! temp file. PNG, JPEG, GIF and WebP are copied as they are; anything else macOS can read
-//! (HEIC, TIFF, …) is converted to PNG with `sips`. Copies older than a week are pruned.
+//! temp file. PNG, JPEG, GIF and WebP are copied as they are; anything else is converted to
+//! PNG: on macOS whatever `sips` can read (HEIC, TIFF, …), elsewhere BMP and TIFF, with the
+//! image crate. Copies older than a week are pruned.
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -69,23 +70,48 @@ pub fn prepare(dir: &Path, src: &str) -> Result<PathBuf, String> {
         }
         None => {
             let dst = dir.join(format!("{base}.png"));
-            let ok = std::process::Command::new("/usr/bin/sips")
-                .args(["-s", "format", "png"])
-                .arg(path)
-                .arg("--out")
-                .arg(&dst)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success());
-            if ok && dst.is_file() {
+            if convert(path, &dst) && dst.is_file() {
                 Ok(dst)
             } else {
                 let _ = std::fs::remove_file(&dst);
-                Err(format!("not an image (PNG, JPEG, GIF, WebP, or something sips can convert): {src}"))
+                Err(format!("not an image ({CONVERTS}): {src}"))
             }
         }
     }
+}
+
+/// What `prepare` takes, for its error.
+#[cfg(target_os = "macos")]
+const CONVERTS: &str = "PNG, JPEG, GIF, WebP, or something sips can convert";
+#[cfg(not(target_os = "macos"))]
+const CONVERTS: &str = "PNG, JPEG, GIF, WebP, BMP or TIFF";
+
+/// `src` converted to a PNG at `dst` by macOS's `sips`.
+#[cfg(target_os = "macos")]
+fn convert(src: &Path, dst: &Path) -> bool {
+    std::process::Command::new("/usr/bin/sips")
+        .args(["-s", "format", "png"])
+        .arg(src)
+        .arg("--out")
+        .arg(dst)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// `src` (a BMP or TIFF) converted to a PNG at `dst` by the image crate, since there's no
+/// `sips` here.
+#[cfg(not(target_os = "macos"))]
+fn convert(src: &Path, dst: &Path) -> bool {
+    let Some(mut img) = image::ImageReader::open(src).and_then(|r| r.with_guessed_format()).ok().and_then(|r| r.decode().ok()) else {
+        return false;
+    };
+    // A 32-bit bitmap whose alpha bytes are all zero is opaque, not invisible.
+    if img.color().has_alpha() && img.to_rgba8().pixels().all(|p| p.0[3] == 0) {
+        img = image::DynamicImage::ImageRgb8(img.to_rgb8());
+    }
+    img.save_with_format(dst, image::ImageFormat::Png).is_ok()
 }
 
 /// `<stamp>-<safe stem>`: a fresh name for a copy of `path`.
@@ -156,6 +182,30 @@ mod tests {
         let txt = dir.join("notes.txt");
         std::fs::write(&txt, b"hello").unwrap();
         assert!(prepare(&dir.join("out"), txt.to_str().unwrap()).unwrap_err().contains("not an image"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn converts_bmp_and_tiff_to_png() {
+        let dir = std::env::temp_dir().join(format!("midna-images-convert-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A 32-bit bitmap with every alpha byte zero, as a clipboard DIB often is: opaque.
+        let img = image::RgbaImage::from_pixel(3, 2, image::Rgba([10, 20, 30, 0]));
+        for (name, f) in [("shot.bmp", image::ImageFormat::Bmp), ("scan.tif", image::ImageFormat::Tiff)] {
+            let src = dir.join(name);
+            img.save_with_format(&src, f).unwrap();
+            let out = prepare(&dir.join("out"), src.to_str().unwrap()).unwrap();
+            assert_eq!(out.extension().unwrap(), "png", "{name}");
+            let png = image::open(&out).unwrap().to_rgba8();
+            assert_eq!(png.dimensions(), (3, 2), "{name}");
+            if f == image::ImageFormat::Bmp {
+                assert_eq!(png.get_pixel(0, 0), &image::Rgba([10, 20, 30, 255]));
+            }
+        }
+        let heic = dir.join("x.heic");
+        std::fs::write(&heic, b"....ftypheic").unwrap();
+        assert!(prepare(&dir.join("out"), heic.to_str().unwrap()).unwrap_err().contains("BMP or TIFF"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
