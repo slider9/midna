@@ -4,6 +4,8 @@ midna is a macOS terminal built for working with AI agents. It replaces Saggar.
 
 **[Download](https://midna.mrgnhnt.com/download/) · [Docs](https://midna.mrgnhnt.com/docs/) · [Changelog](https://midna.mrgnhnt.com/changelog/)**
 
+**Windows 10 and 11 (beta):** download `Midna-<version>-windows-x86_64.zip` from the newest **for Windows** release on the [releases page](https://github.com/slider9/midna/releases), unzip it and run `midna-app.exe`. [`docs/INSTALL-windows.md`](docs/INSTALL-windows.md) walks through it, from the SmartScreen warning to uninstalling.
+
 - **Projects** group **terminals**, which run shells, monitors, or agents (Claude Code, Codex).
 - **A daemon (`midnad`) is the source of truth.** It owns every PTY, the terminal engines (libghostty-vt), projects, rules, triggers, settings, and the event and audit log. Closing or upgrading the GUI never kills a shell.
 - **Everything is AI-managed.** Agents drive midna through the `midna` CLI, JSON-RPC over a Unix socket, or MCP. Every capability is a method in one discoverable catalog (`midna schema`).

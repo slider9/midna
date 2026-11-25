@@ -420,7 +420,8 @@ impl Worker {
         let mut login = install::register(bundle);
         log(&format!("login item: {login:?}"));
         self.send(Msg::Login(login.clone()));
-        // 3. the CLI for agents (a symlink; shell files are never edited)
+        // 3. the CLI for agents (macOS: a symlink, shell files are never edited; Windows: a copy,
+        // its folder added to the user's Path)
         let cli = self.link_cli(&home, false);
         self.send(Msg::Cli(cli));
         // 4. the daemon: running, and running the installed build
@@ -666,7 +667,8 @@ impl Worker {
 /// - `--uninstall`: stop midnad (`daemon.stop`, which hangs up every terminal), unregister the
 ///   login item and remove our `midna` CLI link. MIDNA_HOME's data is left in place. (Windows,
 ///   where Settings ▸ Apps' Uninstall runs it: first quit the app, which would start midnad
-///   again; also remove the CLI copy, the Start menu entry and the Settings ▸ Apps entry, and,
+///   again; also remove the CLI copy, the folder the install added to the user's Path, the Start
+///   menu entry and the Settings ▸ Apps entry, and,
 ///   once this has exited, the app's folder.)
 /// - `--start-daemon` (Windows, what the login entry runs): start the installed midnad, with no
 ///   window, unless it's already answering.
@@ -768,6 +770,12 @@ pub fn headless(args: &[String]) -> Option<i32> {
     {
         for removed in [install::unlink_cli(), install::remove_from_start_menu()].into_iter().flatten() {
             println!("removed {}", removed.display());
+        }
+        // Before the Settings ▸ Apps entry, which records what the install added to Path.
+        match install::remove_from_user_path() {
+            Ok(Some(dir)) => println!("removed {} from your Path", dir.display()),
+            Ok(None) => {}
+            Err(e) => eprintln!("Path: {e}"),
         }
         match install::remove_from_apps() {
             Ok(true) => println!("removed the Settings ▸ Apps entry"),

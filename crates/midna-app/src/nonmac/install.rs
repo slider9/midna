@@ -6,7 +6,8 @@
 //! [`BUNDLE_MARKER`]. Run from there, the app installs midnad into `MIDNA_HOME\bin` (`midnad
 //! --install-self`), starts it at login with a value under `HKCU\…\Run` (`midna-app.exe
 //! --start-daemon`, which starts it with no window and exits), copies the `midna` CLI into
-//! `~\.local\bin` and adds itself to the Start menu and Settings ▸ Apps. Anything else (a `cargo` build, Linux) is dev mode: if midnad isn't
+//! `~\.local\bin`, adds that folder to the user's `Path` and adds itself to the Start menu and
+//! Settings ▸ Apps. Anything else (a `cargo` build, Linux) is dev mode: if midnad isn't
 //! answering, the `midnad` next to this executable is started directly (opt out:
 //! `MIDNA_NO_SPAWN=1`), and the installed-only calls report that they aren't available.
 //!
@@ -548,13 +549,176 @@ pub fn cli_link() -> PathBuf {
 /// Windows: a symlink needs a privilege (or Developer Mode), so the CLI is a copy of the
 /// installed `midna.exe`, made again whenever that one changes. A copy keeps its source's time,
 /// so one of a different size or time is out of date. A running copy can't be replaced, only
-/// renamed: it's moved aside, and removed next time. `force_dir`: install even when the
-/// folder isn't on PATH (the human asked in Settings).
+/// renamed: it's moved aside, and removed next time.
+///
+/// The copy goes into `~\.local\bin`, and that folder onto the user's `Path` when it isn't on
+/// `shell_path` (this process's PATH) already ([`user_path::add`]), so a terminal opened after
+/// this has the midna command. A folder the human took off `Path` after the install added it
+/// stays off unless `force_dir` (they asked in Settings). Midna Dev and `MIDNA_CLI_LINK_DIR` keep
+/// their own folder and never touch `Path`.
 #[cfg(windows)]
 pub fn link_cli(home: &Path, shell_path: Option<&str>, force_dir: bool) -> CliLink {
     let dir = cli_link_dir();
+    let src = current_daemon(home).with_file_name(exe_name("midna"));
     let on_path = cli_link_dir_pinned() || shell_path.is_some_and(|p| dir_on_path(&dir, p));
-    copy_cli(&current_daemon(home).with_file_name(exe_name("midna")), &dir, on_path, force_dir)
+    let r = copy_cli(&src, &dir, true, force_dir);
+    let CliLink::Linked { link } = r else { return r };
+    if on_path {
+        return CliLink::Linked { link };
+    }
+    match user_path::add(user_path::ENV, &apps_entry::key(), &dir, force_dir) {
+        Ok(user_path::Added::Already) => CliLink::Linked { link },
+        Ok(user_path::Added::Now) => {
+            crate::lifecycle::log(&format!("added {} to the user's Path", dir.display()));
+            CliLink::Linked { link }
+        }
+        Ok(user_path::Added::TakenOff) => CliLink::NotOnPath { dir },
+        Err(e) => CliLink::Failed(format!("Couldn't add {} to your Path: {e}", dir.display())),
+    }
+}
+
+/// Take the folder the install added to the user's `Path` off it again (`--uninstall`): only
+/// that entry, and only when the install added it. Returns the folder when it was there.
+#[cfg(windows)]
+pub fn remove_from_user_path() -> Result<Option<PathBuf>, String> {
+    if cli_link_dir_pinned() {
+        return Ok(None);
+    }
+    user_path::remove(user_path::ENV, &apps_entry::key())
+}
+
+/// The user's `Path`: the `Path` value under `HKCU\Environment` (a `REG_EXPAND_SZ`), which Windows
+/// puts after the system's in every new process's PATH. The install adds the CLI's folder to it
+/// and records that under the Settings ▸ Apps entry, so `--uninstall` takes away only what it
+/// added, and a folder the human takes off `Path` isn't put back at the next launch.
+#[cfg(windows)]
+mod user_path {
+    use super::*;
+    use crate::winreg;
+
+    pub const ENV: &str = "Environment";
+    const VALUE: &str = "Path";
+    /// The folder the install added, under the Settings ▸ Apps entry's key.
+    const RECORD: &str = "MidnaAddedToPath";
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum Added {
+        /// One of `Path`'s folders is `dir` already (the human's, or an earlier install's).
+        Already,
+        Now,
+        /// The install added it earlier and the human took it off since: left off.
+        TakenOff,
+    }
+
+    /// Put `dir` on the `Path` under `HKCU\<env>`, recording it under `HKCU\<record>`, unless it's
+    /// there already or was [taken off](Added::TakenOff) (`force`: put it back anyway). The value
+    /// keeps its type, and a new one is a `REG_EXPAND_SZ`, as Windows makes it. A `Path` that
+    /// can't be read (or isn't a string) is an error, never taken for an empty one and replaced.
+    pub fn add(env: &str, record: &str, dir: &Path, force: bool) -> Result<Added, String> {
+        let (path, expand) = read_path(env)?.unwrap_or((String::new(), true));
+        let Some(new) = with_dir(&path, dir) else { return Ok(Added::Already) };
+        let ours = winreg::get_string(record, RECORD).is_some_and(|r| same_entry(&r, dir));
+        if ours && !force {
+            return Ok(Added::TakenOff);
+        }
+        write(env, &new, expand)?;
+        winreg::set_string(record, Some(RECORD), &dir.display().to_string()).map_err(|e| format!("{record}: {e}"))?;
+        Ok(Added::Now)
+    }
+
+    /// Take the folder [`add`] recorded under `HKCU\<record>` off the `Path` under `HKCU\<env>`
+    /// (its last entry naming it), and forget it. Returns the folder when it was on `Path`. A
+    /// `Path` that can't be read is an error, and the record stays for another try.
+    pub fn remove(env: &str, record: &str) -> Result<Option<PathBuf>, String> {
+        let Some(dir) = winreg::get_string(record, RECORD).map(PathBuf::from) else { return Ok(None) };
+        let had = match read_path(env)? {
+            Some((path, expand)) => match without_dir(&path, &dir) {
+                Some(new) => write(env, &new, expand).map(|()| true)?,
+                None => false,
+            },
+            None => false,
+        };
+        winreg::delete(record, RECORD).map_err(|e| format!("{record}: {e}"))?;
+        Ok(had.then_some(dir))
+    }
+
+    /// The `Path` under `HKCU\<env>` as stored, and whether it's a `REG_EXPAND_SZ`; None when
+    /// there's none.
+    fn read_path(env: &str) -> Result<Option<(String, bool)>, String> {
+        winreg::get_raw_string(env, VALUE).map_err(|e| format!(r"HKCU\{env}\{VALUE}: {e}"))
+    }
+
+    fn write(env: &str, path: &str, expand: bool) -> Result<(), String> {
+        let r = if expand { winreg::set_expand_string(env, VALUE, path) } else { winreg::set_string(env, Some(VALUE), path) };
+        r.map_err(|e| format!(r"HKCU\{env}\{VALUE}: {e}"))?;
+        if env == ENV {
+            broadcast();
+        }
+        Ok(())
+    }
+
+    /// Tell running programs the environment changed (`WM_SETTINGCHANGE` "Environment"), so
+    /// Explorer, and what's started from it (the Start menu, a new PowerShell window), picks up
+    /// the new `Path`. A program that doesn't answer within a second is skipped.
+    fn broadcast() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE};
+        let what: Vec<u16> = "Environment".encode_utf16().chain(std::iter::once(0)).collect();
+        let mut result = 0usize;
+        // SAFETY: a NUL-terminated UTF-16 string that outlives the call, and a result we own.
+        unsafe {
+            SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, what.as_ptr() as isize, SMTO_ABORTIFHUNG, 1000, &mut result);
+        }
+    }
+
+    /// `path` (`;`-separated) with `dir` added at the end, None when one of its entries already
+    /// is `dir`. The other entries stay exactly as they were.
+    pub fn with_dir(path: &str, dir: &Path) -> Option<String> {
+        if path.split(';').any(|e| same_entry(e, dir)) {
+            return None;
+        }
+        let dir = dir.display().to_string();
+        Some(match path.trim_end_matches(';') {
+            "" => dir,
+            rest => format!("{rest};{dir}"),
+        })
+    }
+
+    /// `path` without its last entry that is `dir`, None when none is.
+    pub fn without_dir(path: &str, dir: &Path) -> Option<String> {
+        let mut entries: Vec<&str> = path.split(';').collect();
+        let i = entries.iter().rposition(|e| same_entry(e, dir))?;
+        entries.remove(i);
+        Some(entries.join(";"))
+    }
+
+    /// Does the `Path` entry `entry` name `dir`? Its `%NAME%`s are expanded and quotes dropped,
+    /// then [`dir_on_path`]'s rules apply (no case, either slash, a trailing one).
+    pub fn same_entry(entry: &str, dir: &Path) -> bool {
+        let entry = expand(entry.trim().trim_matches('"'));
+        !entry.is_empty() && !entry.contains(';') && dir_on_path(dir, &entry)
+    }
+
+    /// `s` with each `%NAME%` of a set variable replaced by its value.
+    fn expand(s: &str) -> String {
+        let mut out = String::new();
+        let mut rest = s;
+        while let Some(i) = rest.find('%') {
+            let after = &rest[i + 1..];
+            match after.find('%').and_then(|j| std::env::var(&after[..j]).ok().map(|v| (j, v))) {
+                Some((j, v)) => {
+                    out.push_str(&rest[..i]);
+                    out.push_str(&v);
+                    rest = &after[j + 1..];
+                }
+                None => {
+                    out.push_str(&rest[..=i]);
+                    rest = after;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
 }
 
 /// Copy `src` to `dir\midna.exe` (see [`link_cli`]).
@@ -893,8 +1057,10 @@ pub fn install_main(bundle: &Path) -> i32 {
     }
     let shell_path = if cli_link_dir_pinned() { None } else { login_shell_path() };
     match link_cli(&home, shell_path.as_deref(), false) {
-        CliLink::Linked { link } => say(format!("midna CLI: {}", link.display())),
-        CliLink::NotOnPath { dir } => say(format!("midna CLI: not copied, {} isn't on PATH", dir.display())),
+        CliLink::Linked { link } => say(format!("midna CLI: {} (on PATH in terminals opened from now on)", link.display())),
+        CliLink::NotOnPath { dir } => {
+            say(format!("midna CLI: in {}, which was taken off your Path, so left off (Settings ▸ Agents ▸ midna CLI puts it back)", dir.display()))
+        }
         CliLink::Conflict { link } => say(format!("midna CLI: not copied, {} isn't Midna's", link.display())),
         CliLink::Failed(e) => fail(format!("midna CLI: {e}")),
         CliLink::Dev => {}
@@ -1291,6 +1457,72 @@ mod tests {
         assert!(dir_on_path(dir, r"C:\Windows;c:\users\ME\.local\bin\;D:\x"));
         assert!(dir_on_path(dir, "C:/Users/me/.local/bin"));
         assert!(!dir_on_path(dir, r"C:\Windows;C:\Users\me\.local\bin2;;"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_path_gets_the_folder_once_and_loses_only_that_entry() {
+        use user_path::{same_entry, with_dir, without_dir};
+        let dir = Path::new(r"C:\Users\me\.local\bin");
+        assert_eq!(with_dir("", dir).as_deref(), Some(r"C:\Users\me\.local\bin"));
+        assert_eq!(with_dir(r"%USERPROFILE%\x;C:\y;", dir).as_deref(), Some(r"%USERPROFILE%\x;C:\y;C:\Users\me\.local\bin"));
+        assert_eq!(with_dir(r"C:\y;c:\users\ME\.local\bin\", dir), None);
+        assert_eq!(with_dir(r#"C:\y;"C:\Users\me\.local\bin""#, dir), None);
+        assert_eq!(without_dir(r"%USERPROFILE%\x;C:\Users\me\.local\bin;C:\y", dir).as_deref(), Some(r"%USERPROFILE%\x;C:\y"));
+        assert_eq!(without_dir(r"C:\Users\me\.local\bin", dir).as_deref(), Some(""));
+        assert_eq!(without_dir(r"C:\a;C:\Users\me\.local\bin2", dir), None);
+        // A %NAME% entry names the folder it expands to.
+        let profile = std::env::var("USERPROFILE").unwrap();
+        let mine = Path::new(&profile).join(".local").join("bin");
+        assert!(same_entry(r"%USERPROFILE%\.local\bin", &mine));
+        assert!(!same_entry(r"%NO_SUCH_VAR_MIDNA%\.local\bin", &mine));
+        assert!(!same_entry("", &mine));
+    }
+
+    /// Against scratch keys, never the real `HKCU\Environment`.
+    #[cfg(windows)]
+    #[test]
+    fn the_install_adds_the_folder_to_the_path_once_and_uninstall_takes_off_only_that() {
+        use crate::winreg;
+        use user_path::{Added, add, remove};
+        let pid = std::process::id();
+        let (env, record) = (format!(r"Software\midna-test-env-{pid}"), format!(r"Software\midna-test-record-{pid}"));
+        let dir = Path::new(r"C:\Users\me\.local\bin");
+        // No Path yet: a REG_EXPAND_SZ holding just the folder.
+        assert_eq!(add(&env, &record, dir, false), Ok(Added::Now));
+        assert_eq!(winreg::get_raw_string(&env, "Path").unwrap(), Some((r"C:\Users\me\.local\bin".into(), true)));
+        assert_eq!(remove(&env, &record), Ok(Some(dir.to_path_buf())));
+        assert_eq!(winreg::get_raw_string(&env, "Path").unwrap(), Some((String::new(), true)));
+        assert_eq!(remove(&env, &record), Ok(None), "nothing recorded any more");
+        // The human's Path keeps its type and its %NAME%s, and isn't given the folder twice.
+        winreg::set_expand_string(&env, "Path", r"%USERPROFILE%\go\bin;C:\tools").unwrap();
+        assert_eq!(add(&env, &record, dir, false), Ok(Added::Now));
+        assert_eq!(add(&env, &record, dir, false), Ok(Added::Already));
+        assert_eq!(winreg::get_raw_string(&env, "Path").unwrap(), Some((r"%USERPROFILE%\go\bin;C:\tools;C:\Users\me\.local\bin".into(), true)));
+        // Taken off by the human: left off, unless asked to put it back.
+        winreg::set_expand_string(&env, "Path", r"%USERPROFILE%\go\bin;C:\tools").unwrap();
+        assert_eq!(add(&env, &record, dir, false), Ok(Added::TakenOff));
+        assert_eq!(add(&env, &record, dir, true), Ok(Added::Now));
+        assert_eq!(remove(&env, &record), Ok(Some(dir.to_path_buf())));
+        assert_eq!(winreg::get_raw_string(&env, "Path").unwrap(), Some((r"%USERPROFILE%\go\bin;C:\tools".into(), true)));
+        // On the Path the human set already: not added, so uninstall leaves it.
+        winreg::set_string(&env, Some("Path"), r"C:\tools;C:\Users\me\.local\bin").unwrap();
+        assert_eq!(add(&env, &record, dir, false), Ok(Added::Already));
+        assert_eq!(remove(&env, &record), Ok(None));
+        assert_eq!(winreg::get_raw_string(&env, "Path").unwrap(), Some((r"C:\tools;C:\Users\me\.local\bin".into(), false)));
+        // A plain REG_SZ stays one.
+        winreg::set_string(&env, Some("Path"), r"C:\tools").unwrap();
+        assert_eq!(add(&env, &record, dir, false), Ok(Added::Now));
+        assert_eq!(winreg::get_raw_string(&env, "Path").unwrap(), Some((r"C:\tools;C:\Users\me\.local\bin".into(), false)));
+        // A Path that can't be read as a string is never taken for an empty one and replaced,
+        // and uninstall keeps its record to try again.
+        winreg::set_dword(&env, "Path", 7).unwrap();
+        assert!(add(&env, &record, dir, true).is_err());
+        assert_eq!(winreg::get_dword(&env, "Path"), Some(7));
+        assert!(remove(&env, &record).is_err());
+        assert_eq!(winreg::get_string(&record, "MidnaAddedToPath").as_deref(), Some(r"C:\Users\me\.local\bin"));
+        winreg::delete_key(&env).unwrap();
+        winreg::delete_key(&record).unwrap();
     }
 
     #[cfg(windows)]

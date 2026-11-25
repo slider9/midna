@@ -69,8 +69,8 @@ The installed copy then:
   button;
 - adds a login entry, so the daemon is already running when you sign in (Settings ▸ Apps ▸
   Startup, or Task Manager's Startup tab, switches it off; Midna leaves it off);
-- copies the `midna` command into `%USERPROFILE%\.local\bin`, if that folder is on your PATH (see
-  below).
+- copies the `midna` command into `%USERPROFILE%\.local\bin` and adds that folder to your user
+  Path (see below).
 
 A toast tells you where it installed. From now on, start Midna from the Start menu. The unzipped
 folder can be deleted.
@@ -87,17 +87,24 @@ starting Midna.
 ## 5. The `midna` command
 
 `midna.exe` is the command-line tool that agents, and you, use to drive Midna (`midna --help`,
-`midna ls`, …). Terminals that Midna opens already have it. For a terminal opened elsewhere,
-Midna copies it to `%USERPROFILE%\.local\bin\midna.exe` on a launch, but only when that folder is
-already on your PATH. Midna never edits your PATH itself. To put the folder on it, in PowerShell:
+`midna ls`, …). Terminals that Midna opens already have it. For a terminal opened elsewhere, the
+first run (and `midna-app.exe --install`) copies it to `%USERPROFILE%\.local\bin\midna.exe` and
+adds `%USERPROFILE%\.local\bin` to the end of your user Path, unless it's on your Path already.
+There's nothing to set up: open a new PowerShell window and run `midna --help`.
 
-```powershell
-[Environment]::SetEnvironmentVariable('Path', "$env:USERPROFILE\.local\bin;" + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')
-```
+- **Only new terminals have it.** A terminal that was already open when Midna installed keeps
+  the Path it started with: close it and open another. In Windows Terminal, open a new tab.
+- **Your Path is otherwise left as it is.** Only the user Path changes (the one under "Edit
+  environment variables for your account"), never the system one, and nothing needs administrator
+  rights. Midna adds the folder once, after your other entries.
+- **Taking it off is up to you.** If you remove the folder from your Path, Midna leaves it off;
+  Settings ▸ Agents ▸ **midna CLI** then says it's *not on Path*, and **Add to Path** puts it
+  back.
+- **Uninstall takes it away again** (section 7), but only when Midna was the one that added it.
+  A folder you had on your Path before stays.
 
-Then open a new terminal and run `midna --help`. (Or Start ▸ "Edit environment variables for your
-account" ▸ Path ▸ Edit ▸ New.) Midna copies the command in on its next launch. An existing
-`midna.exe` there that isn't Midna's is left alone.
+Settings ▸ Agents ▸ **midna CLI** shows where the command is, or what's wrong. An existing
+`midna.exe` there that isn't Midna's is left alone, and the row says so.
 
 The copy is made again whenever the installed one changes, so it stays current through updates.
 
@@ -130,11 +137,13 @@ Updates shows why.
 
 ## 7. Uninstall
 
-Settings ▸ Apps ▸ Installed apps ▸ **Midna** ▸ **Uninstall** (there is no Modify or Repair). It
-quits Midna, stops the daemon (**this closes every terminal in it**), and removes the login
-entry, the `midna.exe` copy in `.local\bin`, the Start menu entry, the Settings ▸ Apps entry and
-the files in `%LOCALAPPDATA%\Programs\Midna`. Anything else you put in that folder stays, and so
-does the folder if it isn't empty.
+On Windows 10: Settings ▸ Apps ▸ **Apps & features** ▸ **Midna** ▸ **Uninstall**. On Windows 11:
+Settings ▸ Apps ▸ **Installed apps** ▸ the **…** next to Midna ▸ **Uninstall**. There is no Modify
+or Repair. It quits Midna, stops the daemon (**this closes every terminal in it**), and removes
+the login entry, the `midna.exe` copy in `.local\bin`, the `.local\bin` entry it added to your
+Path (one you added yourself stays), the Start menu entry, the Settings ▸ Apps entry and the files
+in `%LOCALAPPDATA%\Programs\Midna`. Anything else you put in that folder stays, and so does the
+folder if it isn't empty.
 
 It leaves Midna's **home** (`%LOCALAPPDATA%\com.mrgnhnt.midna`): your projects, settings,
 terminal history, sounds and logs. Delete that folder yourself for a clean slate; installing again
@@ -148,7 +157,7 @@ Codex's settings stay too. `midna hooks uninstall` (run before you uninstall) re
 | The app | `%LOCALAPPDATA%\Programs\Midna` (`midna-app.exe`, `midnad.exe`, `midna.exe`, `Fonts`, …) |
 | The home: state, settings, logs (`app.log`, `midnad.log`), hooks, shims, the daemon's socket, staged updates (`updates\`) | `%LOCALAPPDATA%\com.mrgnhnt.midna` |
 | The daemon's installed builds (`midnad`, the ConPTY files and the terminal keeper, one folder per version) | `%LOCALAPPDATA%\com.mrgnhnt.midna\bin` |
-| The `midna` command | `%USERPROFILE%\.local\bin\midna.exe` |
+| The `midna` command | `%USERPROFILE%\.local\bin\midna.exe`, that folder on the user Path (`Path` under `HKCU\Environment`) |
 | Start menu entry | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Midna.lnk` |
 | Login entry | value `Midna` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` |
 | Settings ▸ Apps entry | `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\com.mrgnhnt.midna` |

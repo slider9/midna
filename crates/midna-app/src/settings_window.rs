@@ -2295,7 +2295,26 @@ fn lifecycle_rows(t: &Theme) -> LifeRows {
     let why_cli = "The midna command for agents outside midna (midna terminals already have it on PATH).";
     let cli = match snap.as_ref().map(|s| &s.cli) {
         _ if dev => row("midna CLI", t.dim, "Dev build: target/debug/midna".into(), t.dim, None, why_cli.into(), "midna --help", Who::Human, false),
-        Some(CliLink::Linked { link }) => row("midna CLI", t.ok, link.display().to_string(), t.fg, None, why_cli.into(), "midna --help", Who::Human, false),
+        Some(CliLink::Linked { link }) => {
+            let note = os(why_cli, "The midna command for agents outside Midna. Its folder is on your Path: a terminal opened before the install needs reopening to have it.");
+            row("midna CLI", t.ok, link.display().to_string(), t.fg, None, note.into(), "midna --help", Who::Human, false)
+        }
+        // Windows: midna.exe is copied there, and the button puts the folder back on the user's
+        // Path (the human took it off after the install added it).
+        Some(CliLink::NotOnPath { dir }) if cfg!(windows) => {
+            let installed = dir.join("midna.exe").is_file();
+            row(
+                "midna CLI",
+                t.need,
+                if installed { format!("In {} (not on Path)", dir.display()) } else { "Not installed".into() },
+                t.need,
+                Some(("Add to Path".into(), Act::Life(Cmd::InstallCli), false)),
+                format!("{} isn't on your user Path, so terminals outside Midna don't have the midna command. Add to Path puts it back; terminals opened after that have it.", dir.display()),
+                "midna --help",
+                Who::Human,
+                false,
+            )
+        }
         Some(CliLink::NotOnPath { dir }) => {
             let installed = std::fs::read_link(dir.join("midna")).is_ok();
             row(
@@ -2316,13 +2335,13 @@ fn lifecycle_rows(t: &Theme) -> LifeRows {
             format!("{} is something else", link.display()),
             t.need,
             None,
-            "Left alone. Remove it to let midna link its CLI there.".into(),
+            os("Left alone. Remove it to let midna link its CLI there.", "Left alone. Remove it and reopen Midna to let it copy its CLI there.").into(),
             "",
             Who::Human,
             false,
         ),
         Some(CliLink::Failed(e)) => {
-            row("midna CLI", t.err, "Couldn't link".into(), t.err, Some(("Retry".into(), Act::Life(Cmd::InstallCli), false)), e.clone(), "", Who::Human, false)
+            row("midna CLI", t.err, os("Couldn't link", "Couldn't install").into(), t.err, Some(("Retry".into(), Act::Life(Cmd::InstallCli), false)), e.clone(), "", Who::Human, false)
         }
         Some(CliLink::Dev) | None => row("midna CLI", t.dim, "Checking…".into(), t.dim, None, why_cli.into(), "", Who::Human, false),
     };
