@@ -95,8 +95,16 @@ if [ "$BUILD" = 1 ]; then
   fi
   # Shipped builds link with MSVC's link.exe; dev and test builds use rust-lld (.cargo/config.toml).
   # rustc finds MSVC's link.exe itself, not the coreutils `link` on Git Bash's PATH.
+  # They also link the C runtime statically (+crt-static): a clean Windows 10 has the Universal
+  # CRT but not VCRUNTIME140.dll, so a dynamically linked midna-app.exe wouldn't start without
+  # Microsoft's Visual C++ redistributable. Dev and test builds keep the DLL runtime, which every
+  # machine with Visual Studio's build tools has. RUSTFLAGS would replace these rustflags, so it's
+  # cleared here; check-windows-runtime.sh below catches a build that still imports the runtime.
+  unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
   MIDNA_DEV_HOME="$DEV_HOME" MIDNA_TEST_BUILD="$TEST" MIDNA_BUILD_VERSION="$VERSION" CARGO_TARGET_DIR="$TARGET_DIR" CARGO_BUILD_BUILD_DIR="$TARGET_DIR" \
-    cargo build --config 'target.x86_64-pc-windows-msvc.linker="link.exe"' --release -p midna-app -p midnad -p midna-cli -p midna-pty --bin midna-app --bin midnad --bin midna --bin midna-pty ${FEATURES[@]+"${FEATURES[@]}"}
+    cargo build --config 'target.x86_64-pc-windows-msvc.linker="link.exe"' \
+      --config 'target.x86_64-pc-windows-msvc.rustflags=["-C", "target-feature=+crt-static"]' \
+      --release -p midna-app -p midnad -p midna-cli -p midna-pty --bin midna-app --bin midnad --bin midna --bin midna-pty ${FEATURES[@]+"${FEATURES[@]}"}
 fi
 for b in midna-app midnad midna midna-pty; do [ -f "$BIN/$b.exe" ] || { echo "missing $BIN/$b.exe" >&2; exit 1; }; done
 
@@ -115,4 +123,5 @@ cat > "$DEST/midna-bundle.txt" <<EOF
 $NAME $VERSION. With this file next to it, midna-app.exe runs as an installed Midna: it
 installs midnad into its home, starts it at login and copies the midna CLI into ~\.local\bin.
 EOF
+packaging/check-windows-runtime.sh "$DEST"
 echo "==> built $DEST"
