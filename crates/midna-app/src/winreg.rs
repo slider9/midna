@@ -48,11 +48,12 @@ pub fn get_string(key: &str, value: &str) -> Option<String> {
     get(key, value, RRF_RT_REG_SZ).map(|b| text(&b))
 }
 
-/// A string value as stored, `%NAME%`s unexpanded, and whether it's a `REG_EXPAND_SZ`. None when
-/// it (or its key) isn't there or isn't a string.
-pub fn get_raw_string(key: &str, value: &str) -> Option<(String, bool)> {
-    let (buf, kind) = get_typed(key, value, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND)?;
-    Some((text(&buf), kind == REG_EXPAND_SZ))
+/// A string value as stored, `%NAME%`s unexpanded, and whether it's a `REG_EXPAND_SZ`.
+/// `Ok(None)` only when it (or its key) isn't there; one that isn't a string, or can't be read,
+/// is an error, so a caller rewriting it never takes it for empty.
+pub fn get_raw_string(key: &str, value: &str) -> std::io::Result<Option<(String, bool)>> {
+    let r = read(key, value, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND)?;
+    Ok(r.map(|(buf, kind)| (text(&buf), kind == REG_EXPAND_SZ)))
 }
 
 fn text(buf: &[u8]) -> String {
@@ -66,24 +67,39 @@ pub fn get_binary(key: &str, value: &str) -> Option<Vec<u8>> {
 }
 
 fn get(key: &str, value: &str, flags: u32) -> Option<Vec<u8>> {
-    get_typed(key, value, flags).map(|(b, _)| b)
+    read(key, value, flags).ok().flatten().map(|(b, _)| b)
 }
 
-/// The value's bytes and its type (`REG_SZ`, …), when it's one `flags` allows.
-fn get_typed(key: &str, value: &str, flags: u32) -> Option<(Vec<u8>, u32)> {
+/// The value's bytes and its type (`REG_SZ`, …). `Ok(None)` only when it (or its key) isn't
+/// there; any other failure, a type `flags` doesn't allow included, is an error.
+fn read(key: &str, value: &str, flags: u32) -> std::io::Result<Option<(Vec<u8>, u32)>> {
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    const ERROR_MORE_DATA: u32 = 234;
     let (k, v) = (wide(key), wide(value));
-    let (mut len, mut kind) = (0u32, 0u32);
-    // SAFETY: a size query (no buffer), then a read into a buffer of that size.
-    let err = unsafe { RegGetValueW(HKEY_CURRENT_USER, k.as_ptr(), v.as_ptr(), flags, &mut kind, std::ptr::null_mut(), &mut len) };
-    if err != 0 {
-        return None;
+    let mut kind = 0u32;
+    // SAFETY: a size query (no buffer), then reads into a buffer of the size it gave.
+    let mut len = 0u32;
+    let mut err = unsafe { RegGetValueW(HKEY_CURRENT_USER, k.as_ptr(), v.as_ptr(), flags, &mut kind, std::ptr::null_mut(), &mut len) };
+    // The value can grow between the size query and the read: ask again with the new size.
+    for _ in 0..4 {
+        if err != 0 {
+            break;
+        }
+        let mut buf = vec![0u8; len as usize];
+        err = unsafe { RegGetValueW(HKEY_CURRENT_USER, k.as_ptr(), v.as_ptr(), flags, &mut kind, buf.as_mut_ptr().cast(), &mut len) };
+        if err == 0 {
+            buf.truncate(len as usize);
+            return Ok(Some((buf, kind)));
+        }
+        if err == ERROR_MORE_DATA {
+            err = 0;
+        }
     }
-    let mut buf = vec![0u8; len as usize];
-    let err = unsafe { RegGetValueW(HKEY_CURRENT_USER, k.as_ptr(), v.as_ptr(), flags, &mut kind, buf.as_mut_ptr().cast(), &mut len) };
-    (err == 0).then(|| {
-        buf.truncate(len as usize);
-        (buf, kind)
-    })
+    match err {
+        ERROR_FILE_NOT_FOUND => Ok(None),
+        0 => Err(std::io::Error::other("the value kept changing size while being read")),
+        e => Err(std::io::Error::from_raw_os_error(e as i32)),
+    }
 }
 
 /// Delete a value; one that isn't there is fine.
@@ -129,14 +145,15 @@ mod tests {
     fn a_raw_string_keeps_its_names_and_says_whether_it_expands() {
         let key = format!(r"Software\midna-test-raw-{}", std::process::id());
         set_expand_string(&key, "Path", r"%USERPROFILE%\bin;C:\x").unwrap();
-        assert_eq!(get_raw_string(&key, "Path"), Some((r"%USERPROFILE%\bin;C:\x".into(), true)));
+        assert_eq!(get_raw_string(&key, "Path").unwrap(), Some((r"%USERPROFILE%\bin;C:\x".into(), true)));
         let profile = std::env::var("USERPROFILE").unwrap();
         assert_eq!(get_string(&key, "Path"), Some(format!(r"{profile}\bin;C:\x")), "get_string expands it");
         set_string(&key, Some("Plain"), "a;b").unwrap();
-        assert_eq!(get_raw_string(&key, "Plain"), Some(("a;b".into(), false)));
+        assert_eq!(get_raw_string(&key, "Plain").unwrap(), Some(("a;b".into(), false)));
         set_dword(&key, "n", 1).unwrap();
-        assert_eq!(get_raw_string(&key, "n"), None);
-        assert_eq!(get_raw_string(&key, "missing"), None);
+        assert!(get_raw_string(&key, "n").is_err(), "a DWORD is an error, not a missing value");
+        assert_eq!(get_raw_string(&key, "missing").unwrap(), None);
+        assert_eq!(get_raw_string(r"Software\midna-test-no-such-key", "Path").unwrap(), None);
         delete_key(&key).unwrap();
     }
 }

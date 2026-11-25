@@ -612,9 +612,10 @@ mod user_path {
 
     /// Put `dir` on the `Path` under `HKCU\<env>`, recording it under `HKCU\<record>`, unless it's
     /// there already or was [taken off](Added::TakenOff) (`force`: put it back anyway). The value
-    /// keeps its type, and a new one is a `REG_EXPAND_SZ`, as Windows makes it.
+    /// keeps its type, and a new one is a `REG_EXPAND_SZ`, as Windows makes it. A `Path` that
+    /// can't be read (or isn't a string) is an error, never taken for an empty one and replaced.
     pub fn add(env: &str, record: &str, dir: &Path, force: bool) -> Result<Added, String> {
-        let (path, expand) = winreg::get_raw_string(env, VALUE).unwrap_or((String::new(), true));
+        let (path, expand) = read_path(env)?.unwrap_or((String::new(), true));
         let Some(new) = with_dir(&path, dir) else { return Ok(Added::Already) };
         let ours = winreg::get_string(record, RECORD).is_some_and(|r| same_entry(&r, dir));
         if ours && !force {
@@ -626,10 +627,11 @@ mod user_path {
     }
 
     /// Take the folder [`add`] recorded under `HKCU\<record>` off the `Path` under `HKCU\<env>`
-    /// (its last entry naming it), and forget it. Returns the folder when it was on `Path`.
+    /// (its last entry naming it), and forget it. Returns the folder when it was on `Path`. A
+    /// `Path` that can't be read is an error, and the record stays for another try.
     pub fn remove(env: &str, record: &str) -> Result<Option<PathBuf>, String> {
         let Some(dir) = winreg::get_string(record, RECORD).map(PathBuf::from) else { return Ok(None) };
-        let had = match winreg::get_raw_string(env, VALUE) {
+        let had = match read_path(env)? {
             Some((path, expand)) => match without_dir(&path, &dir) {
                 Some(new) => write(env, &new, expand).map(|()| true)?,
                 None => false,
@@ -638,6 +640,12 @@ mod user_path {
         };
         winreg::delete(record, RECORD).map_err(|e| format!("{record}: {e}"))?;
         Ok(had.then_some(dir))
+    }
+
+    /// The `Path` under `HKCU\<env>` as stored, and whether it's a `REG_EXPAND_SZ`; None when
+    /// there's none.
+    fn read_path(env: &str) -> Result<Option<(String, bool)>, String> {
+        winreg::get_raw_string(env, VALUE).map_err(|e| format!(r"HKCU\{env}\{VALUE}: {e}"))
     }
 
     fn write(env: &str, path: &str, expand: bool) -> Result<(), String> {
@@ -1482,30 +1490,37 @@ mod tests {
         let dir = Path::new(r"C:\Users\me\.local\bin");
         // No Path yet: a REG_EXPAND_SZ holding just the folder.
         assert_eq!(add(&env, &record, dir, false), Ok(Added::Now));
-        assert_eq!(winreg::get_raw_string(&env, "Path"), Some((r"C:\Users\me\.local\bin".into(), true)));
+        assert_eq!(winreg::get_raw_string(&env, "Path").unwrap(), Some((r"C:\Users\me\.local\bin".into(), true)));
         assert_eq!(remove(&env, &record), Ok(Some(dir.to_path_buf())));
-        assert_eq!(winreg::get_raw_string(&env, "Path"), Some((String::new(), true)));
+        assert_eq!(winreg::get_raw_string(&env, "Path").unwrap(), Some((String::new(), true)));
         assert_eq!(remove(&env, &record), Ok(None), "nothing recorded any more");
         // The human's Path keeps its type and its %NAME%s, and isn't given the folder twice.
         winreg::set_expand_string(&env, "Path", r"%USERPROFILE%\go\bin;C:\tools").unwrap();
         assert_eq!(add(&env, &record, dir, false), Ok(Added::Now));
         assert_eq!(add(&env, &record, dir, false), Ok(Added::Already));
-        assert_eq!(winreg::get_raw_string(&env, "Path"), Some((r"%USERPROFILE%\go\bin;C:\tools;C:\Users\me\.local\bin".into(), true)));
+        assert_eq!(winreg::get_raw_string(&env, "Path").unwrap(), Some((r"%USERPROFILE%\go\bin;C:\tools;C:\Users\me\.local\bin".into(), true)));
         // Taken off by the human: left off, unless asked to put it back.
         winreg::set_expand_string(&env, "Path", r"%USERPROFILE%\go\bin;C:\tools").unwrap();
         assert_eq!(add(&env, &record, dir, false), Ok(Added::TakenOff));
         assert_eq!(add(&env, &record, dir, true), Ok(Added::Now));
         assert_eq!(remove(&env, &record), Ok(Some(dir.to_path_buf())));
-        assert_eq!(winreg::get_raw_string(&env, "Path"), Some((r"%USERPROFILE%\go\bin;C:\tools".into(), true)));
+        assert_eq!(winreg::get_raw_string(&env, "Path").unwrap(), Some((r"%USERPROFILE%\go\bin;C:\tools".into(), true)));
         // On the Path the human set already: not added, so uninstall leaves it.
         winreg::set_string(&env, Some("Path"), r"C:\tools;C:\Users\me\.local\bin").unwrap();
         assert_eq!(add(&env, &record, dir, false), Ok(Added::Already));
         assert_eq!(remove(&env, &record), Ok(None));
-        assert_eq!(winreg::get_raw_string(&env, "Path"), Some((r"C:\tools;C:\Users\me\.local\bin".into(), false)));
+        assert_eq!(winreg::get_raw_string(&env, "Path").unwrap(), Some((r"C:\tools;C:\Users\me\.local\bin".into(), false)));
         // A plain REG_SZ stays one.
         winreg::set_string(&env, Some("Path"), r"C:\tools").unwrap();
         assert_eq!(add(&env, &record, dir, false), Ok(Added::Now));
-        assert_eq!(winreg::get_raw_string(&env, "Path"), Some((r"C:\tools;C:\Users\me\.local\bin".into(), false)));
+        assert_eq!(winreg::get_raw_string(&env, "Path").unwrap(), Some((r"C:\tools;C:\Users\me\.local\bin".into(), false)));
+        // A Path that can't be read as a string is never taken for an empty one and replaced,
+        // and uninstall keeps its record to try again.
+        winreg::set_dword(&env, "Path", 7).unwrap();
+        assert!(add(&env, &record, dir, true).is_err());
+        assert_eq!(winreg::get_dword(&env, "Path"), Some(7));
+        assert!(remove(&env, &record).is_err());
+        assert_eq!(winreg::get_string(&record, "MidnaAddedToPath").as_deref(), Some(r"C:\Users\me\.local\bin"));
         winreg::delete_key(&env).unwrap();
         winreg::delete_key(&record).unwrap();
     }
