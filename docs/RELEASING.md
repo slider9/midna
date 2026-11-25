@@ -143,7 +143,10 @@ A `windows-v` tag runs `.github/workflows/release-windows.yml`; a bare `v` tag r
   2. sets up `.toolchain/`: Zig and Ghostty's source (`scripts/setup-toolchain.sh`, which on
      Windows fetches Zig's Windows build) and Microsoft's newer ConPTY (`scripts/setup-conpty.sh`)
   3. `packaging/build-windows.sh --version <v>` with `MIDNA_UPDATE_PUBKEY` compiled in (it
-     refuses to build without the variable) and checks `midnad.exe --version` says `<v>`
+     refuses to build without the variable) and checks `midnad.exe --version` says `<v>`; then
+     `packaging/check-windows-runtime.sh` checks no file in it needs the Visual C++
+     redistributable, which a clean Windows 10 doesn't have (midna's exes link the C runtime
+     statically)
   4. checks the secret's public half is one of `MIDNA_UPDATE_PUBKEY`'s keys, then
      `packaging/make-update.sh --windows`: `Midna-<v>-windows-x86_64.zip` and its signed v2 entry
      `windows-feed.json`, verified against the whole key list

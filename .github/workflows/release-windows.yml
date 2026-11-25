@@ -142,6 +142,12 @@ jobs:
               { echo "::error::$b.exe doesn't have the feed $MIDNA_DEFAULT_FEED_URL compiled in"; exit 1; }
           done
 
+      # A clean Windows 10 has no Visual C++ redistributable (VCRUNTIME140.dll): midna's exes link
+      # the C runtime statically, and nothing in the zip may import the redistributable's DLLs.
+      # build-windows.sh runs this too; here it gates the release on what ships.
+      - name: No Visual C++ runtime
+        run: packaging/check-windows-runtime.sh dist/release/Midna
+
       - name: Build release tool
         run: |
           cargo build --release -q --manifest-path packaging/release-tool/Cargo.toml --target-dir packaging/release-tool/target

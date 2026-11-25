@@ -35,6 +35,11 @@ and the tests' daemons use it.
 Dev and test builds link with `rust-lld.exe` (`.cargo/config.toml`), which comes with the
 toolchain and relinks a test-heavy crate about a third faster than MSVC's `link.exe`. Shipped
 builds keep `link.exe`: `packaging/build-windows.sh` overrides the linker with `--config`.
+It also links them with the static C runtime (`+crt-static`), since a clean Windows 10 has no
+`VCRUNTIME140.dll` (that comes with Microsoft's Visual C++ redistributable), and
+`packaging/check-windows-runtime.sh` fails the build if any of its files still import the
+redistributable's DLLs, or one of midna's own exes the Universal CRT. Dev and test builds keep the
+DLL runtime, which Visual Studio's build tools install.
 `scripts/test.sh` falls back to a lock directory (`/tmp/midna-tests.lock.d`) where there's no `lockf`.
 
 ### Terminals: which ConPTY
