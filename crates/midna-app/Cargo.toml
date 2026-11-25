@@ -44,8 +44,9 @@ ring = "0.17"
 base64 = "0.22"
 semver = "1"
 raw-window-handle = "0.6"
-# image annotations (src/annotate.rs): sniff formats and read dimensions; also the snapshot PNG writer
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# image annotations (src/annotate.rs): sniff formats, read dimensions, and off macOS convert BMP and
+# TIFF to PNG; also the snapshot PNG writer
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # install / auto-update (src/install.rs, src/updater.rs)

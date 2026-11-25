@@ -4175,6 +4175,7 @@ dependencies = [
  "core-foundation-sys",
  "ed25519-dalek",
  "hmac",
+ "image",
  "libc",
  "libghostty-vt",
  "lz4_flex",

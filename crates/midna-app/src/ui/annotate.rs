@@ -196,7 +196,7 @@ fn empty(a: &AnnotateView, t: &Theme, cx: &mut Context<AnnotateView>) -> impl In
                 .child(button(t, "annot-paste", "Paste image", false).child(kbd(t, crate::actions::glyph_keys("⌘V"), false)).on_click(cx.listener(|v, _, w, cx| v.paste(w, cx))))
                 .child(button(t, "annot-choose", "Choose file…", false).on_click(cx.listener(|v, _, w, cx| v.pick_files(w, cx)))),
         )
-        .child(div().text_size(px(12.)).text_color(t.dim).child(os("PNG, JPEG, HEIC, TIFF, and other macOS image formats", "PNG, JPEG, GIF and WebP")))
+        .child(div().text_size(px(12.)).text_color(t.dim).child(os("PNG, JPEG, HEIC, TIFF, and other macOS image formats", "PNG, JPEG, GIF, WebP, BMP and TIFF")))
 }
 
 // ------------------------------------------------------------------ left: the image strip
