@@ -125,11 +125,16 @@ On each launch from its install folder it:
   name, version, publisher, icon, folder and size. Its Uninstall button runs `midna-app.exe
   --uninstall`; there's no Modify or Repair;
 - registers the login entry and starts midnad if it isn't answering;
-- copies the `midna` CLI into `~\.local\bin` when that folder is on PATH.
+- copies the `midna` CLI into `~\.local\bin` and, unless it's on PATH already, adds that folder
+  to the user's `Path` (`HKCU\Environment`, kept a `REG_EXPAND_SZ`, then `WM_SETTINGCHANGE`),
+  noting it as `MidnaAddedToPath` under the Settings ▸ Apps key. A folder the human took off `Path`
+  since stays off until Settings ▸ Agents ▸ midna CLI ▸ Add to Path. Midna Dev and
+  `MIDNA_CLI_LINK_DIR` never touch `Path`.
 
 `midna-app.exe --uninstall` (also what Settings ▸ Apps' Uninstall
 runs) quits the running app (it would start midnad again), stops midnad (closing its terminals)
-and removes the login entry, the CLI copy, the Start menu entry and the Settings ▸ Apps entry.
+and removes the login entry, the CLI copy, the `Path` entry the install added (only that one),
+the Start menu entry and the Settings ▸ Apps entry.
 Once it has exited, a copy of it in `%TEMP%` (`--remove-install <folder> --wait <pid>`) removes
 the build's own files from the folder (`update_windows::remove_install`: the executables,
 ConPTY, `Fonts`, the marker last) and the folder once it's empty; anything else in it stays. The
@@ -220,7 +225,7 @@ would build them in with `\r\n`.
 | Daemon start | launchd, `--launchd` | `midnad` detaches with `CREATE_NO_WINDOW` (breakaway from the job when allowed) |
 | Installed app | `Midna.app` (found by its `Contents/MacOS` path) | a folder with `midna-bundle.txt` next to `midna-app.exe`, by default `%LOCALAPPDATA%\Programs\Midna` (see Installing) |
 | Start at login | SMAppService LaunchAgent; "Allow in the Background" in Login Items | a value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, "Midna" (Midna Dev: "Midna Dev"), runs `midna-app.exe --start-daemon`. That starts `bin\current`'s midnad with no window, unless it's already answering, and exits. Switching it off in Settings ▸ Apps ▸ Startup or Task Manager is kept in `…\Explorer\StartupApproved\Run` (first byte odd = off) and shows as needing approval, which opens `ms-settings:startupapps`. Registering it starts midnad at once, as launchd does |
-| `midna` CLI for agents | a symlink `~/.local/bin/midna` → `bin/current/midna` | a copy of `bin\current`'s `midna.exe` at `~\.local\bin\midna.exe` (a symlink needs a privilege), made again when that one changes size or time. A running copy is renamed aside and removed next time. A `midna.exe` that isn't midna's (it doesn't name the bundle id) is left alone |
+| `midna` CLI for agents | a symlink `~/.local/bin/midna` → `bin/current/midna` | a copy of `bin\current`'s `midna.exe` at `~\.local\bin\midna.exe` (a symlink needs a privilege), made again when that one changes size or time. A running copy is renamed aside and removed next time. A `midna.exe` that isn't midna's (it doesn't name the bundle id) is left alone. The folder goes on the user's `Path` (see Installing) |
 | Quit from a script | Apple Events (`osascript … quit`) | `midna-app.exe --quit` sets a named event (`Local\midna-app-quit-<hash of MIDNA_HOME>`) the app waits on, and it quits as the Quit action does. Closing its windows instead would ask about, or close, their terminals |
 | One copy | LaunchServices: one app per bundle | a named event per `MIDNA_HOME` (`Local\midna-app-show-<hash>`): a second launch sets it and exits, and the running app brings its window to the front (see Installing) |
 | Uninstall entry | none (the app is dragged to the Trash) | a key under `HKCU\…\CurrentVersion\Uninstall` named for the bundle id; Uninstall runs `--uninstall` (see Installing) |
